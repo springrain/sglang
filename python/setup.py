@@ -45,6 +45,12 @@ _BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
 _PYTHON_DIR = Path(__file__).resolve().parent
 _RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
 
+# KTransformers release builds inject their version from ktransformers/version.py.
+# Standalone builds keep using setuptools-scm from pyproject.toml.
+_SETUP_KWARGS = {}
+if kt_version := os.environ.get("SGLANG_KT_VERSION"):
+    _SETUP_KWARGS["version"] = kt_version
+
 
 def _cargo_workspace_metadata():
     """The rust/ cargo workspace as JSON, straight from cargo's own parser."""
@@ -198,6 +204,7 @@ if build_rust is not None:
     setup(
         cmdclass={"build_rust": BuildRust},
         rust_extensions=_declared_rust_extensions(),
+        **_SETUP_KWARGS,
     )
 else:
-    setup()
+    setup(**_SETUP_KWARGS)

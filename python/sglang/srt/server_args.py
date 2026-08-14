@@ -3016,7 +3016,7 @@ class ServerArgs:
     ] = "AMXINT4"
     kt_cpuinfer: A[
         Optional[int],
-        "[ktransformers parameter] The number of CPUInfer threads.",
+        "[ktransformers parameter] The number of CPUInfer threads; required when KT is enabled.",
         NS("exec.moe"),
     ] = None
     kt_threadpool_count: A[
@@ -3024,14 +3024,57 @@ class ServerArgs:
         "[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
         NS("exec.moe"),
     ] = 2
+    kt_numa_nodes: A[
+        Optional[List[int]],
+        "[ktransformers parameter] Explicit NUMA node IDs used by CPUInfer thread pools.",
+        NS("exec.moe"),
+    ] = None
     kt_num_gpu_experts: A[
         Optional[int],
-        "[ktransformers parameter] The number of GPU experts.",
+        "[ktransformers parameter] GPU experts per MoE layer; ratio overrides this value when both are set.",
+        NS("exec.moe"),
+    ] = None
+    kt_gpu_experts_ratio: A[
+        Optional[float],
+        "[ktransformers parameter] Fraction of routed experts kept on GPU; overrides --kt-num-gpu-experts when both are set.",
         NS("exec.moe"),
     ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        NS("exec.moe"),
+    ] = None
+    kt_gpu_prefill_token_threshold: A[
+        Optional[int],
+        "[ktransformers parameter] Token threshold for layerwise GPU prefill of CPU experts.",
+        NS("exec.moe"),
+    ] = None
+    record_kt_gpu_expert_distribution: A[
+        bool,
+        "[ktransformers parameter] Add KT GPU expert masks to the expert distribution recorder.",
+        NS("exec.moe"),
+    ] = False
+    kt_enable_dynamic_expert_update: A[
+        bool,
+        "[ktransformers parameter] Dynamically update GPU expert placement from runtime statistics.",
+        NS("exec.moe"),
+    ] = False
+    kt_expert_placement_strategy: A[
+        str,
+        Arg(
+            help="[ktransformers parameter] Initial GPU expert placement strategy.",
+            choices=["frequency", "front-loading", "uniform", "random"],
+        ),
+        NS("exec.moe"),
+    ] = "uniform"
+    kt_lora_path: A[
+        Optional[str],
+        "[ktransformers parameter] Legacy composite KT LoRA adapter path.",
+        NS("exec.moe"),
+    ] = None
+    kt_expert_lora_path: A[
+        Optional[str],
+        "[ktransformers parameter] KT CPU-expert LoRA adapter path.",
         NS("exec.moe"),
     ] = None
 
@@ -3584,6 +3627,8 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
+        self._handle_kt_args()
+
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
 
@@ -3603,6 +3648,7 @@ class ServerArgs:
         self._handle_dwdp()
 
         self._handle_cuda_graph_config()
+        self._enforce_kt_cuda_graph_compatibility()
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -4222,6 +4268,163 @@ class ServerArgs:
             self._quantization_explicitly_unset = False
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    def _enforce_kt_cuda_graph_compatibility(self) -> None:
+        """Apply hard CUDA-graph restrictions for KT's host-side LoRA path."""
+
+        if not (self.kt_lora_path or self.kt_expert_lora_path):
+            return
+        self.disable_cuda_graph = True
+        self.cuda_graph_config.decode.backend = Backend.DISABLED
+        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+    def _handle_kt_args(self) -> None:
+        """Normalize KT compatibility aliases before CUDA graph resolution."""
+
+        if self.kt_lora_path:
+            if (
+                self.kt_expert_lora_path
+                and self.kt_expert_lora_path != self.kt_lora_path
+            ):
+                raise ValueError(
+                    "--kt-lora-path and --kt-expert-lora-path cannot point to "
+                    "different adapters in the static single-adapter implementation."
+                )
+            self.kt_expert_lora_path = self.kt_lora_path
+            logger.warning(
+                "--kt-lora-path is treated as the KT CPU-expert adapter in this "
+                "forward-port; use --kt-expert-lora-path explicitly."
+            )
+
+        if (self.kt_lora_path or self.kt_expert_lora_path) and not self.disable_cuda_graph:
+            logger.warning(
+                "CUDA graph is disabled because KT expert LoRA uses host-side "
+                "input copies in the KT SFT path."
+            )
+            self.disable_cuda_graph = True
+
+    def _validate_kt_args(self) -> None:
+        """Validate the extended KT expert placement and CPU runtime options."""
+
+        if self.kt_threadpool_count <= 0:
+            raise ValueError("--kt-threadpool-count must be positive.")
+        if self.kt_numa_nodes is not None:
+            if len(self.kt_numa_nodes) != self.kt_threadpool_count:
+                raise ValueError(
+                    "--kt-numa-nodes must contain exactly --kt-threadpool-count "
+                    f"entries (got {len(self.kt_numa_nodes)} and "
+                    f"{self.kt_threadpool_count})."
+                )
+            if any(node < 0 for node in self.kt_numa_nodes):
+                raise ValueError("--kt-numa-nodes values must be non-negative.")
+
+        if self.kt_num_gpu_experts is not None and self.kt_num_gpu_experts < 0:
+            raise ValueError("--kt-num-gpu-experts must be non-negative.")
+        if self.kt_gpu_experts_ratio is not None and not (
+            0.0 <= self.kt_gpu_experts_ratio <= 1.0
+        ):
+            raise ValueError("--kt-gpu-experts-ratio must be between 0 and 1.")
+        if (
+            self.kt_max_deferred_experts_per_token is not None
+            and self.kt_max_deferred_experts_per_token < 0
+        ):
+            raise ValueError(
+                "--kt-max-deferred-experts-per-token must be non-negative."
+            )
+        if (
+            self.kt_gpu_prefill_token_threshold is not None
+            and self.kt_gpu_prefill_token_threshold < 0
+        ):
+            raise ValueError("--kt-gpu-prefill-token-threshold must be non-negative.")
+        if (
+            self.kt_method.upper() == "MXFP4"
+            and self.kt_gpu_prefill_token_threshold
+            and self.kt_gpu_prefill_token_threshold > 0
+        ):
+            raise ValueError(
+                "KT MXFP4 layerwise prefill is not available in this upstream "
+                "forward-port; omit --kt-gpu-prefill-token-threshold or set it to 0."
+            )
+
+        placement_strategies = {"frequency", "front-loading", "uniform", "random"}
+        if self.kt_expert_placement_strategy not in placement_strategies:
+            raise ValueError(
+                "--kt-expert-placement-strategy must be one of "
+                f"{sorted(placement_strategies)}, got "
+                f"{self.kt_expert_placement_strategy!r}."
+            )
+
+        if self.kt_weight_path is not None and (
+            self.kt_num_gpu_experts is None and self.kt_gpu_experts_ratio is None
+        ):
+            raise ValueError(
+                "--kt-weight-path requires --kt-num-gpu-experts or "
+                "--kt-gpu-experts-ratio."
+            )
+
+        if self.kt_weight_path is not None:
+            if self.moe_a2a_backend != "none":
+                raise ValueError(
+                    "--kt-weight-path currently requires "
+                    "--moe-a2a-backend none; KTEP needs the standard routed "
+                    "dispatch output and cannot consume A2A dispatcher outputs."
+                )
+            if self.kt_cpuinfer is None or self.kt_cpuinfer <= 0:
+                raise ValueError(
+                    "--kt-weight-path requires --kt-cpuinfer to be a positive integer."
+                )
+            if self.kt_cpuinfer < self.kt_threadpool_count:
+                raise ValueError(
+                    "--kt-cpuinfer must be at least --kt-threadpool-count "
+                    f"(got {self.kt_cpuinfer} and {self.kt_threadpool_count})."
+                )
+
+        if self.kt_enable_dynamic_expert_update and not (
+            self.kt_gpu_prefill_token_threshold and self.kt_gpu_prefill_token_threshold > 0
+        ):
+            raise ValueError(
+                "--kt-enable-dynamic-expert-update requires a positive "
+                "--kt-gpu-prefill-token-threshold."
+            )
+
+        if self.kt_lora_path or self.kt_expert_lora_path:
+            if self.kt_weight_path is None:
+                raise ValueError(
+                    "KT expert LoRA requires --kt-weight-path."
+                )
+            if self.kt_gpu_experts_ratio is not None or self.kt_num_gpu_experts != 0:
+                raise ValueError(
+                    "KT expert LoRA currently supports CPU experts only: set "
+                    "--kt-num-gpu-experts 0 and omit --kt-gpu-experts-ratio."
+                )
+            if self.kt_gpu_prefill_token_threshold:
+                raise ValueError(
+                    "KT expert LoRA cannot be combined with "
+                    "--kt-gpu-prefill-token-threshold."
+                )
+            if self.kt_enable_dynamic_expert_update:
+                raise ValueError(
+                    "KT expert LoRA cannot be combined with "
+                    "--kt-enable-dynamic-expert-update."
+                )
+            if self.kt_method.upper() not in {
+                "AMXBF16",
+                "BF16",
+                "AMXINT8",
+                "AMXINT4",
+            }:
+                raise ValueError(
+                    "KT expert LoRA supports only AMXBF16, BF16, AMXINT8, "
+                    f"or AMXINT4 CPU methods (got {self.kt_method!r})."
+                )
+
+        if (self.kt_lora_path or self.kt_expert_lora_path) and (
+            self.max_running_requests is not None and self.max_running_requests < 2
+        ):
+            raise ValueError(
+                "KT expert LoRA serving requires --max-running-requests >= 2 "
+                f"(got {self.max_running_requests})."
+            )
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local
@@ -9056,6 +9259,7 @@ class ServerArgs:
 
         # Check LoRA
         self.check_lora_server_args()
+        self._validate_kt_args()
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:

@@ -604,7 +604,9 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
-        n_hash_layers = getattr(config, "num_hash_layers", 0)
+        n_hash_layers = getattr(config, "num_hash_layers", None) or getattr(
+            config, "n_hash_layers", 0
+        )
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
         if self.tp_size > config.n_routed_experts:
@@ -873,6 +875,10 @@ class DeepseekV2MoE(nn.Module):
             and not self._fuse_shared_experts_inside_sbo
             and not getattr(self, "is_hash", False)
             and not get_exec().moe.enable_eplb
+            # KTEP owns the routed-expert dispatch and CPU/GPU merge.  The
+            # dual-stream graph calls the backend's forward_impl directly and
+            # would bypass that control plane.
+            and not isinstance(self.experts.quant_method, KTEPWrapperMethod)
         )
 
     def forward(
@@ -908,6 +914,7 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                and not isinstance(self.experts.quant_method, KTEPWrapperMethod)
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,

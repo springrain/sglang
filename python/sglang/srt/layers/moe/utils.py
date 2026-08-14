@@ -425,6 +425,17 @@ def draft_model_build_scope():
         moe.disable_shared_experts_fusion = original_fusion
 
 
+def is_kt_ep_wrapper_disabled() -> bool:
+    """Return whether the model under construction is a speculative draft.
+
+    KT CPU experts belong to the target model. Draft construction is already
+    bracketed by ``draft_model_build_scope`` in the current runtime, so reuse
+    that scoped flag instead of maintaining a second global switch.
+    """
+
+    return bool(get_flags().moe.in_speculative_scope)
+
+
 def install_shared_experts_fusion_decision(
     model_class, hf_config, quant_config
 ) -> None:

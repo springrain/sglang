@@ -2470,6 +2470,17 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
     fusion enabled; FlashInfer A2A requires it disabled."""
+    if view.kt_weight_path is not None and view.enable_waterfill:
+        raise ValueError(
+            "KTransformers expert offload is incompatible with Waterfill shared "
+            "expert fusion. Disable --enable-waterfill when using --kt-weight-path."
+        )
+    if view.kt_weight_path is not None:
+        logger.warning(
+            "KTransformers EP is enabled. --disable-shared-experts-fusion is "
+            "automatically set to keep shared experts on the GPU."
+        )
+        return {"disable_shared_experts_fusion": True}
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(

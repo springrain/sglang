@@ -364,7 +364,10 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_cuda and not _use_aiter:
+        if (
+            (not _is_cuda and not _use_aiter)
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(

@@ -776,6 +776,12 @@ class ModelConfigForExpertLocation:
             return None
 
 
+def _should_use_trivial_mapping_for_kt(server_args: ServerArgs) -> bool:
+    """Keep KT's GGUF expert ids aligned with their logical expert ids."""
+
+    return server_args.kt_weight_path is not None
+
+
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -806,6 +812,14 @@ def compute_initial_expert_location_metadata(
             moe_ep_rank=moe_ep_rank,
         )
     elif "logical_count" in data_dict:
+        if _should_use_trivial_mapping_for_kt(server_args):
+            logger.info(
+                "KT uses logical_count only for GPU expert placement; keeping "
+                "identity expert locations for CPU weight loading."
+            )
+            return ExpertLocationMetadata.init_trivial(
+                server_args, model_config, moe_ep_rank
+            )
         logger.info(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )

@@ -4,7 +4,10 @@ except ImportError:
     try:
         import importlib.metadata
 
-        __version__ = importlib.metadata.version("sglang")
+        try:
+            __version__ = importlib.metadata.version("sglang-kt")
+        except importlib.metadata.PackageNotFoundError:
+            __version__ = importlib.metadata.version("sglang")
         __version_tuple__ = tuple(__version__.split("."))
     except Exception:
         try:

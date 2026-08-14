@@ -369,7 +369,13 @@ class FusedMoE(torch.nn.Module):
             if quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
-                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+                gpu_method = None
+            if gpu_method is None:
+                gpu_method = UnquantizedFusedMoEMethod(
+                    self.use_triton_kernels,
+                    self.use_flashinfer_trtllm_moe,
+                    self.use_deep_gemm,
+                )
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
             if quant_config is not None:
@@ -1004,8 +1010,19 @@ class FusedMoE(torch.nn.Module):
             KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
+                if expert_id < 0 or expert_id >= len(
+                    self.quant_method.gpu_experts_mask
+                ):
                     return
+                if not bool(self.quant_method.gpu_experts_mask[expert_id].item()):
+                    return
+
+                mapped_expert_id = int(
+                    self.quant_method.logical_to_gpu_index[expert_id].item()
+                )
+                if mapped_expert_id < 0:
+                    return
+                expert_id = mapped_expert_id
 
         self._weight_loader_impl(
             param=param,
