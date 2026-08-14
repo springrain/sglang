@@ -46,8 +46,34 @@
 - [ ] 验证专家分布记录和 mask telemetry。
 - [ ] 验证 EPLB 与 KT 的组合。
 - [ ] 验证非 trivial expert mapping、物理专家映射和权重更新。
-- [ ] 增加 SGLang 端到端 Q8 回归脚本。
+- [x] 增加 SGLang 端到端 Q8 回归脚本。
+- [x] 增加 KT mask/remap、专家选择、动态映射和参数组合单元测试。
 - [ ] 增加 Q8 CPU/GPU 混合路径的持续集成或定期实机测试。
+
+### 测试入口
+
+黑盒矩阵脚本位于 test/manual/kt_q8_hybrid_e2e.py，需要在 ARM + CUDA
+服务器上执行。默认覆盖 GPU 专家数 0/64/256、TP 1/2、batch 1/16
+以及 CUDA_LAUNCH_BLOCKING 开关：
+
+~~~bash
+python test/manual/kt_q8_hybrid_e2e.py \
+  --model /data/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0 \
+  --trust-remote-code \
+  --kt-weight-path /data/ampere/data/Qwen3.6-35B-A3B-Q8_0.gguf \
+  --kt-method LLAMAFILE \
+  --kt-cpuinfer 128 \
+  --kt-threadpool-count 2
+~~~
+
+P1 配置可通过 --kt-numa-nodes、--max-deferred-experts-per-token、
+--gpu-prefill-token-threshold、--enable-dynamic-expert-update 和
+--record-expert-distribution 加入同一矩阵。日志和结果默认写入
+test-logs/kt-q8-hybrid/。单元测试可用：
+
+~~~bash
+python -m pytest -q test/registered/unit/layers/moe/test_kt_ep_helpers.py
+~~~
 
 ## P2：Composite KT LoRA
 
