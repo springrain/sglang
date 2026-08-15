@@ -82,7 +82,7 @@ dependencies = [
   "torchao==0.17.0",
   "torchaudio==2.11.0",
   "torchcodec==0.15.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # Not available on Linux ARM.
-  "torchvision",
+  "torchvision==0.28.0",
   "tqdm",
   "transformers @ git+https://github.com/springrain/transformers.git@c4cda8e3061b0b6e08e8965b3ce3efa4dd23af98",
   "uvicorn",
