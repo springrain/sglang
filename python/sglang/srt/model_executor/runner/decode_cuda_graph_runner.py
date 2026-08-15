@@ -290,7 +290,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner, self.captured_req_width
         )
         if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+            # KT's CPU buffer is keyed by the flattened token count, not by
+            # the number of requests.  This matters for verification and
+            # other decode modes whose capture width is greater than one.
+            num_tokens_bs = [bs * self.captured_req_width for bs in self.capture_bs]
+            existing = {
+                int(batch_tokens)
+                for batch_tokens in KTMoEWrapper.get_capture_batch_sizes()
+                if int(batch_tokens) > 0
+            }
+            KTMoEWrapper.set_capture_batch_sizes(
+                sorted(existing | set(num_tokens_bs))
+            )
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)

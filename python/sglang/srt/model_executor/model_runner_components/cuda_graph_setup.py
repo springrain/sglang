@@ -51,6 +51,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _register_kt_capture_token_buckets(model_runner: "ModelRunner") -> None:
+    """Preallocate KT CPU buffers for every configured graph token shape.
+
+    KT's pinned-buffer cache is shared by the prefill and decode runners and
+    is keyed by flattened token count.  The split runners are initialized in
+    sequence, so registration must merge both phases instead of allowing the
+    later runner to overwrite the earlier phase's buckets.  This also matters
+    when prefill CUDA graphs are disabled: eager prefill still uses the same
+    CPU expert buffers.
+    """
+    server_args = model_runner.server_args
+    if not getattr(server_args, "kt_weight_path", None):
+        return
+
+    prefill_buckets = getattr(
+        getattr(server_args, "cuda_graph_config", None), "prefill", None
+    )
+    prefill_buckets = getattr(prefill_buckets, "bs", None)
+    if not prefill_buckets:
+        return
+
+    try:
+        from kt_kernel import KTMoEWrapper
+    except ImportError:
+        return
+
+    existing = {
+        int(batch_tokens)
+        for batch_tokens in KTMoEWrapper.get_capture_batch_sizes()
+        if int(batch_tokens) > 0
+    }
+    merged = sorted(
+        existing | {int(batch_tokens) for batch_tokens in prefill_buckets}
+    )
+    KTMoEWrapper.set_capture_batch_sizes(merged)
+    logger.info(
+        "KT CPU buffer capture token buckets: %s",
+        merged,
+    )
+
+
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
     runner: Optional[BaseRunner]
     memory_phase: str
@@ -159,6 +200,8 @@ def capture_cuda_graphs(
             budget_bytes / (1 << 30),
             available_memory_gb,
         )
+
+    _register_kt_capture_token_buckets(model_runner)
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill

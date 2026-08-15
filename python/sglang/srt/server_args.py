@@ -4270,7 +4270,26 @@ class ServerArgs:
             self.speculative_draft_model_quantization = None
 
     def _enforce_kt_cuda_graph_compatibility(self) -> None:
-        """Apply hard CUDA-graph restrictions for KT's host-side LoRA path."""
+        """Apply CUDA-graph restrictions for KT's host-side expert path.
+
+        The KT expert wrapper submits CPU work and copies its results through a
+        host-side staging path.  The legacy KT branch never captured decoder
+        prefill in a CUDA graph; current upstream SGLang defaults to the
+        breakable prefill graph on CUDA.  Capturing a multimodal Qwen forward
+        through that path can leave the graph with invalid host-side state and
+        crash on replay.  Decode graphs remain compatible and are intentionally
+        kept enabled.
+        """
+
+        if self.kt_weight_path and (
+            self.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            logger.warning(
+                "Prefill CUDA graph is disabled for KT CPU experts; the KT "
+                "host-side expert path is not safe to capture. Decode CUDA "
+                "graph remains enabled."
+            )
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if not (self.kt_lora_path or self.kt_expert_lora_path):
             return
