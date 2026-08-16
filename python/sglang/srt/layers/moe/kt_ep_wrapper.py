@@ -350,6 +350,11 @@ class SharedFullContext:
         moe_runner_config: "MoeRunnerConfig",
         defer_cpu_buffers: bool = False,
     ):
+        _kt_config = getattr(getattr(layer, "quant_method", None), "kt_config", None)
+        self._kt_mxfp4_requested = bool(
+            _kt_config is not None
+            and (getattr(_kt_config, "method", "") or "").upper() == "MXFP4"
+        )
         self._build_layers(layer, init_args, global_num_experts, moe_runner_config)
 
         # Capture original tensors to support restoration before loading
@@ -424,10 +429,17 @@ class SharedFullContext:
                 self.gpu_layer.use_flashinfer_trtllm_moe,
                 self.gpu_layer.use_deep_gemm,
             )
-        # Current upstream quantization configs select the native MXFP4
-        # backend directly. Reusing that method keeps this shadow full-GPU
-        # layer aligned with the real layer without the removed fork-only
-        # mxfp4_deepseek shim.
+        # The layerwise shadow must use the same deterministic Marlin
+        # representation as the resident KT method, even when the global
+        # upstream default is FlashInfer CUTLASS.
+        if getattr(self, "_kt_mxfp4_requested", False):
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                make_kt_mxfp4_marlin_method,
+            )
+
+            self.gpu_method = make_kt_mxfp4_marlin_method(
+                self.gpu_method, prefix=getattr(self.gpu_method, "prefix", "")
+            )
         self.gpu_layer.quant_method = self.gpu_method
 
         self.gpu_method.create_weights(
@@ -514,7 +526,13 @@ class SharedFullContext:
         # quant method's class name as discriminator to avoid a circular import
         # of DeepSeekMxfp4MoEMethod. Origin: sglang 本身 (V4-Flash full-GPU
         # prefill fallback compat).
-        if "mxfp4" in self.gpu_method.__class__.__name__.lower():
+        if (
+            "mxfp4" in self.gpu_method.__class__.__name__.lower()
+            and all(
+                hasattr(layer, name)
+                for name in _Mxfp4PrefillSlot.RAW_NAMES
+            )
+        ):
             self.is_mxfp4_quant = True
             self.is_mxfp8_quant = False
             self.is_fp8_quant = False
@@ -1174,13 +1192,42 @@ class SharedFullContext:
             # Fallback: all experts from CPU
             cpu_expert_ids = list(range(num_experts))
 
+        # A native FlashInfer MXFP4 layer may have reordered its resident
+        # tensors during post-load processing.  When the layerwise allocation
+        # falls back to the serialized full-GPU path, use the canonical raw
+        # snapshot captured before that mutation for resident experts.
+        raw_source = getattr(original_layer, "_kt_mxfp4_raw_weights", None)
+        raw_w13_up_first = bool(
+            getattr(original_layer, "_kt_mxfp4_raw_w13_up_first", False)
+        )
+
         # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
         if gpu_expert_ids:
             for e in gpu_expert_ids:
                 gpu_idx = logical_to_gpu_index[e].item()
                 for name, _, dst in weight_infos:
-                    src = getattr(original_layer, name)  # [num_gpu_experts, ...]
-                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+                    src = (
+                        raw_source[name]
+                        if raw_source is not None and name in raw_source
+                        else getattr(original_layer, name)
+                    )
+                    source_expert = src[gpu_idx]
+                    destination_expert = dst[e]
+                    if raw_w13_up_first and name in (
+                        "w13_weight",
+                        "w13_weight_scale_inv",
+                    ):
+                        split = source_expert.shape[0] // 2
+                        destination_expert[:split].copy_(
+                            source_expert[split:], non_blocking=True
+                        )
+                        destination_expert[split:].copy_(
+                            source_expert[:split], non_blocking=True
+                        )
+                    else:
+                        destination_expert.copy_(
+                            source_expert, non_blocking=True
+                        )
 
         # --- Phase 2: Transfer CPU experts via KT pipeline ---
         if not cpu_expert_ids:
@@ -1937,6 +1984,10 @@ class _Mxfp4LayerwisePrefillManager:
         layer._v4_marlin_weights = slot.marlin_prepared
         layer._v4_marlin_path = True
         layer._v4_tk_path = False
+        # The current native Marlin method consumes this marker to dispatch to
+        # the prepared slot instead of reading the shadow layer's stale raw
+        # tensors.  Keep it local to the shadow context.
+        self.context.gpu_method._kt_layerwise_enabled = True
 
     def _tp_phase_succeeded(self, local_success: bool) -> bool:
         if (
@@ -2137,10 +2188,40 @@ class _Mxfp4LayerwisePrefillManager:
                     for expert_id in gpu_expert_ids:
                         gpu_index = method.logical_to_gpu_index[expert_id].item()
                         for name, _, destination in weight_infos:
-                            source = getattr(original_layer, name)
-                            destination[expert_id].copy_(
-                                source[gpu_index], non_blocking=True
+                            raw_source = getattr(
+                                original_layer, "_kt_mxfp4_raw_weights", None
                             )
+                            source = (
+                                raw_source[name]
+                                if raw_source is not None
+                                else getattr(original_layer, name)
+                            )
+                            source_expert = source[gpu_index]
+                            destination_expert = destination[expert_id]
+                            if (
+                                getattr(
+                                    original_layer,
+                                    "_kt_mxfp4_raw_w13_up_first",
+                                    False,
+                                )
+                                and name
+                                in ("w13_weight", "w13_weight_scale_inv")
+                            ):
+                                # FlashInfer loads W13 as [up; gate], whereas
+                                # the KT/Marlin prepared image and CPU writer
+                                # use [gate; up].  Normalize only while copying
+                                # into the full-expert shadow.
+                                split = source_expert.shape[0] // 2
+                                destination_expert[:split].copy_(
+                                    source_expert[split:], non_blocking=True
+                                )
+                                destination_expert[split:].copy_(
+                                    source_expert[:split], non_blocking=True
+                                )
+                            else:
+                                destination_expert.copy_(
+                                    source_expert, non_blocking=True
+                                )
             except Exception as exc:
                 gpu_copy_error = exc
             self._commit_tp_runtime_phase(
@@ -2411,19 +2492,7 @@ def _mxfp4_pipeline_requested(method) -> bool:
     if not requested:
         return False
 
-    # The old KT layerwise path depends on v4_marlin_moe helpers that are not
-    # part of current upstream SGLang.  Keep the normal hybrid/full-GPU path
-    # available instead of deferring this import until the first request.
-    if not _mxfp4_v4_helpers_available():
-        global _MXFP4_V4_HELPERS_WARNING_EMITTED
-        if not _MXFP4_V4_HELPERS_WARNING_EMITTED:
-            logger.warning(
-                "KT MXFP4 layerwise prefill is unavailable in this SGLang "
-                "version; falling back to the regular hybrid/full-GPU path."
-            )
-            _MXFP4_V4_HELPERS_WARNING_EMITTED = True
-        return False
-    return True
+    return _mxfp4_v4_helpers_available()
 
 
 _MXFP4_V4_HELPERS_AVAILABLE: Optional[bool] = None
@@ -2431,7 +2500,7 @@ _MXFP4_V4_HELPERS_WARNING_EMITTED = False
 
 
 def _mxfp4_v4_helpers_available() -> bool:
-    """Whether the legacy KT layerwise MXFP4 helper module is installed."""
+    """Whether the current KT MXFP4 prepared-weight helpers are available."""
 
     global _MXFP4_V4_HELPERS_AVAILABLE
     if _MXFP4_V4_HELPERS_AVAILABLE is not None:
@@ -2455,7 +2524,41 @@ def _mxfp4_v4_helpers_available() -> bool:
 def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
     if not _mxfp4_pipeline_requested(method) or not torch.cuda.is_available():
         return False
-    if method.gpu_method.__class__.__name__ != "DeepSeekMxfp4MoEMethod":
+    gpu_method = method.gpu_method
+    is_mxfp4_method = (
+        "mxfp4" in gpu_method.__class__.__name__.lower()
+        or getattr(gpu_method, "is_fp4_expert", False)
+        or getattr(getattr(gpu_method, "_fp8", None), "is_fp4_expert", False)
+    )
+    if not is_mxfp4_method:
+        return False
+    # The prepared KT path targets the DeepSeek V4 checkpoint contract.  The
+    # generic MXFP4 quantization method in current SGLang uses
+    # ``w13_weight_scale``/``w2_weight_scale`` and a different runner; it must
+    # remain on its native backend instead of entering this `_inv`-tensor path.
+    if not all(hasattr(layer, name) for name in _Mxfp4PrefillSlot.RAW_NAMES):
+        return False
+    # The shadow Marlin method pads hidden/intermediate dimensions to
+    # 256/128 respectively.  The layerwise copier intentionally performs
+    # whole-expert copies, so only the already-aligned DSV4 layout is safe.
+    w13 = getattr(layer, "w13_weight", None)
+    w2 = getattr(layer, "w2_weight", None)
+    if (
+        w13 is None
+        or w2 is None
+        or w13.ndim != 3
+        or w2.ndim != 3
+        or w13.shape[2] * 2 % 256 != 0
+        or w2.shape[2] * 2 % 128 != 0
+    ):
+        return False
+    runner_config = getattr(method, "moe_runner_config", None)
+    if runner_config is not None and (
+        getattr(runner_config, "gemm1_alpha", None) not in (None, 0, 0.0)
+        or getattr(runner_config, "gemm1_beta", None) not in (None, 0, 0.0)
+    ):
+        # The V4 helper implements plain SiLU/SwiGLU (with the optional
+        # V4 clamp), not the GPT-OSS alpha/beta activation variant.
         return False
     # Respect both diagnostic overrides.  The default capability-driven path
     # uses the prepared Marlin backend on Ada and Blackwell consumer GPUs.
@@ -2466,11 +2569,11 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
 
 
 def _mxfp4_pipeline_runtime_supported(method, layer: torch.nn.Module) -> bool:
+    raw_source = getattr(layer, "_kt_mxfp4_raw_weights", None)
     return (
         _mxfp4_pipeline_backend_supported(method, layer)
-        and all(
-            hasattr(layer, name) for name in _Mxfp4PrefillSlot.RAW_NAMES
-        )
+        and raw_source is not None
+        and all(name in raw_source for name in _Mxfp4PrefillSlot.RAW_NAMES)
     )
 
 
@@ -2484,18 +2587,22 @@ def _mxfp4_raw_slot_storage_nbytes(
     the actual full-expert slot remains lazy.
     """
     int8_size = torch.tensor([], dtype=torch.int8).element_size()
-    float32_size = torch.tensor([], dtype=torch.float32).element_size()
+    # The layerwise shadow method deliberately keeps raw E8M0 scales as
+    # float32 so CPU BF16 staging can be copied into the slot without relying
+    # on a backend-specific BF16 -> float8 CUDA conversion.  The prepared
+    # Marlin image below is the compact float8 form; raw slots are not.
+    scale_size = torch.tensor([], dtype=torch.float32).element_size()
     return (
         num_experts * (2 * intermediate_size) * (hidden_size // 2) * int8_size
         + num_experts * hidden_size * (intermediate_size // 2) * int8_size
         + num_experts
         * (2 * intermediate_size)
         * (hidden_size // 32)
-        * float32_size
+        * scale_size
         + num_experts
         * hidden_size
         * (intermediate_size // 32)
-        * float32_size
+        * scale_size
     )
 
 
@@ -2521,11 +2628,15 @@ def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
         if not _mxfp4_pipeline_runtime_supported(method, layer):
             continue
 
-        init_args = getattr(method, "_full_init_args", None)
         num_experts = getattr(method, "global_num_experts", None)
-        if init_args is None or num_experts is None:
+        raw_source = getattr(layer, "_kt_mxfp4_raw_weights", None)
+        if raw_source is None or num_experts is None:
             continue
-        hidden_size, intermediate_size, _ = init_args
+        # Use the tensors created by the active quant method.  MXFP4 Marlin
+        # rounds hidden/intermediate dimensions during create_weights; using
+        # the unpadded model config here could under-reserve the lazy slots.
+        hidden_size = raw_source["w13_weight"].shape[2] * 2
+        intermediate_size = raw_source["w2_weight"].shape[2] * 2
 
         from sglang.srt.layers.quantization.v4_marlin_moe import (
             get_v4_mxfp4_marlin_storage_nbytes,
@@ -3762,6 +3873,27 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Args:
             layer: The MoE layer module
         """
+        # Preserve the checkpoint-native resident expert image before the
+        # selected current backend performs an in-place scale/weight shuffle.
+        # The hot hybrid/decode path keeps that backend (FlashInfer on SM120),
+        # while the layerwise full-expert shadow consumes this canonical source
+        # and prepares its own Marlin slots.  This mirrors the old KT split
+        # between the resident partial image and the full prefill shadow.
+        if _mxfp4_pipeline_backend_supported(self, layer):
+            raw_names = _Mxfp4PrefillSlot.RAW_NAMES
+            missing = [name for name in raw_names if not hasattr(layer, name)]
+            if missing:
+                raise RuntimeError(
+                    "KT MXFP4 layerwise prefill requires checkpoint-native "
+                    f"resident tensors; missing {missing}"
+                )
+            layer._kt_mxfp4_raw_weights = {
+                name: getattr(layer, name).detach().clone() for name in raw_names
+            }
+            layer._kt_mxfp4_raw_w13_up_first = bool(
+                getattr(self.gpu_method, "load_up_proj_weight_first", False)
+            )
+
         # 1. Process GPU weights
         if hasattr(self.gpu_method, "process_weights_after_loading"):
             self.gpu_method.process_weights_after_loading(layer)
@@ -4046,6 +4178,44 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
         )
+        # Do not construct the V4 shadow context for SGLang's generic MXFP4
+        # contract (`w13_weight_scale`) or for dimensions that would require
+        # padding.  That context only understands the DSV4 `_scale_inv`
+        # layout and whole-expert copies; unsupported variants stay on their
+        # native/hybrid path instead of failing during initialization.
+        if "mxfp4" in self.gpu_method.__class__.__name__.lower() or getattr(
+            self.gpu_method, "is_fp4_expert", False
+        ):
+            _runner_config = getattr(self, "moe_runner_config", None)
+            _v4_plain_silu = (
+                _runner_config is None
+                or (
+                    getattr(_runner_config, "gemm1_alpha", None) in (None, 0, 0.0)
+                    and getattr(_runner_config, "gemm1_beta", None)
+                    in (None, 0, 0.0)
+                )
+            )
+            _v4_raw_contract = all(
+                hasattr(layer, name) for name in _Mxfp4PrefillSlot.RAW_NAMES
+            )
+            _v4_aligned = False
+            if _v4_raw_contract:
+                _w13 = getattr(layer, "w13_weight", None)
+                _w2 = getattr(layer, "w2_weight", None)
+                _v4_aligned = (
+                    _w13 is not None
+                    and _w2 is not None
+                    and _w13.ndim == 3
+                    and _w2.ndim == 3
+                    and _w13.shape[2] * 2 % 256 == 0
+                    and _w2.shape[2] * 2 % 128 == 0
+                )
+            _full_gpu_fallback_supported = (
+                _full_gpu_fallback_supported
+                and _v4_plain_silu
+                and _v4_raw_contract
+                and _v4_aligned
+            )
         _full_gpu_gate = (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold

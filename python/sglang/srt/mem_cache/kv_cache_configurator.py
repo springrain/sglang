@@ -1791,7 +1791,30 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=self.server_args.mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        mxfp4_layerwise_reservation_gb = 0.0
+        if (
+            (self.server_args.kt_method or "").upper() == "MXFP4"
+            and (self.server_args.kt_gpu_prefill_token_threshold or 0) > 0
+        ):
+            from sglang.srt.layers.moe.kt_ep_wrapper import (
+                get_mxfp4_layerwise_prefill_reservation_bytes,
+            )
+
+            mxfp4_layerwise_reservation_gb = (
+                get_mxfp4_layerwise_prefill_reservation_bytes() / (1 << 30)
+            )
+            if mxfp4_layerwise_reservation_gb > 0:
+                logger.info(
+                    "Reserving %.2f GB of the KV budget for lazy KT MXFP4 "
+                    "layerwise prefill slots.",
+                    mxfp4_layerwise_reservation_gb,
+                )
+        rest_memory = (
+            available_gpu_memory
+            - slack_gb
+            - mm_reservation_gb
+            - mxfp4_layerwise_reservation_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

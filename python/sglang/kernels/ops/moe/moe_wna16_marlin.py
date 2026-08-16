@@ -67,6 +67,10 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    a_tmp_or_none: Optional[torch.Tensor] = None,
+    c_tmp_or_none: Optional[torch.Tensor] = None,
+    empty_tensor_or_none: Optional[torch.Tensor] = None,
+    initialize_output: bool = False,
 ) -> torch.Tensor:
     device = a.device
 
@@ -94,7 +98,7 @@ def moe_wna16_marlin_gemm(
     has_zp = b_zeros_or_none is not None and b_zeros_or_none.numel() > 0
 
     # Determine has_bias
-    has_bias = b_bias_or_none is not None
+    has_bias = b_bias_or_none is not None and b_bias_or_none.numel() > 0
 
     # Derive num_groups and group_size from b_scales
     num_groups = b_scales.size(1)
@@ -110,13 +114,21 @@ def moe_wna16_marlin_gemm(
             group_size = -1
 
     # Allocate a_tmp for act_order column permutation
-    if has_act_order:
+    if a_tmp_or_none is not None:
+        a_tmp = a_tmp_or_none
+    elif has_act_order:
         a_tmp = torch.empty((size_m * top_k, size_k), dtype=a.dtype, device=device)
     else:
-        a_tmp = torch.empty(0, dtype=a.dtype, device=device)
+        a_tmp = (
+            empty_tensor_or_none
+            if empty_tensor_or_none is not None
+            else torch.empty(0, dtype=a.dtype, device=device)
+        )
 
     # Allocate c_tmp for fp32 reduce
-    if use_fp32_reduce and not use_atomic_add:
+    if c_tmp_or_none is not None:
+        c_tmp = c_tmp_or_none
+    elif use_fp32_reduce and not use_atomic_add:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         # max num of threadblocks is sms * 4
         max_c_tmp_size = min(
@@ -130,11 +142,25 @@ def moe_wna16_marlin_gemm(
         c_tmp = torch.empty(0, dtype=torch.float32, device=device)
 
     # Convert Optional tensors to empty tensors
-    g_idx_t = _or_empty(g_idx_or_none, device, torch.int32)
-    perm_t = _or_empty(perm_or_none, device, torch.int32)
-    b_zeros_t = _or_empty(b_zeros_or_none, device, a.dtype)
-    b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
-    global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
+    def or_cached_empty(t: Optional[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
+        if t is not None:
+            return t
+        if empty_tensor_or_none is not None:
+            return empty_tensor_or_none
+        return _or_empty(None, device, dtype)
+
+    g_idx_t = or_cached_empty(g_idx_or_none, torch.int32)
+    perm_t = or_cached_empty(perm_or_none, torch.int32)
+    b_zeros_t = or_cached_empty(b_zeros_or_none, a.dtype)
+    b_bias_t = or_cached_empty(b_bias_or_none, a.dtype)
+    global_scale_t = or_cached_empty(global_scale_or_none, a.dtype)
+
+    # The deterministic MXFP4 path accumulates partial tiles into caller-owned
+    # buffers. Clear them on the current stream before each launch.
+    if initialize_output:
+        c.zero_()
+        if c_tmp.numel() > 0:
+            c_tmp.zero_()
 
     module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
     module.moe_wna16_marlin_gemm(
