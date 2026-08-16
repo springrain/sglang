@@ -80,7 +80,11 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         self.moe_runner_config = moe_runner_config
 
-        E = layer.num_local_experts
+        # KTEP can replace the layer's full expert set with a compact GPU
+        # resident subset.  The weight tensors already reflect that subset;
+        # use their leading dimension for per-expert auxiliary tensors rather
+        # than the logical model-wide count kept on the layer.
+        E = int(layer.w13_weight.shape[0])
         device = layer.w13_weight.device
         if self._use_mxfp8_act_scaling:
             # FlashInfer's MXFP4 ABI requires a neutral per-expert global scale.
