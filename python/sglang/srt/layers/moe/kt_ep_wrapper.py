@@ -4310,9 +4310,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # full-GPU fallback re-loads all 256 experts on every fire anyway,
             # so the dynamic-promote optimization is a no-op for MXFP4. Origin:
             # sglang 本身 (V4-Flash full-GPU prefill fallback compat).
-            _mxfp4_skip_dyn_update = getattr(ctx, "_is_mxfp4_quant", False)
-            if (self.kt_config.kt_enable_dynamic_expert_update
-                    and not _mxfp4_skip_dyn_update):
+            # MXFP8 has its own weight/scale layout as well; it must not fall
+            # through to copy_experts_weights_int4 during a dynamic update.
+            _quant_skip_dyn_update = (
+                getattr(ctx, "_is_mxfp4_quant", False)
+                or getattr(ctx, "_is_mxfp8_quant", False)
+            )
+            if (
+                self.kt_config.kt_enable_dynamic_expert_update
+                and not _quant_skip_dyn_update
+            ):
                 t_update = time.perf_counter()
                 self._update_gpu_experts_from_batch(
                     layer=layer,

@@ -99,6 +99,14 @@ python -m pytest -q test/registered/unit/layers/moe/test_kt_ep_helpers.py
 - [ ] 增加 MXFP4 layerwise 单元测试和端到端测试。
 - [ ] 单独评估 ARM CPU MXFP4 内核需求，避免将 GPU layerwise 与 ARM CPU 支持混为一谈。
 
+## P3：SM120 MXFP8 MoE（暂缓）
+
+- [ ] 跟踪 upstream SGLang 对 SM120（RTX PRO 6000）原生 W8A8 MXFP8 MoE 的支持状态；PR #33208 仅覆盖 MXFP8 dense GEMM，不包含 MoE。
+- [ ] upstream 完成 SM120 MXFP8 MoE 权重处理和 runner 集成后，再评估接入 custom FlashInfer 与 KT GPU experts 路径。
+- [ ] 接入时验证 TP、GPU expert remap、prefill/decode、CUDA graph 和数值一致性。
+
+当前暂不修改运行代码，也不将 SM120 MXFP8 dense 支持视为 MXFP8 MoE 已支持。
+
 ## P3：通用模型和依赖维护
 
 - [ ] 以通用 `FusedMoE`/`quant_method` 接口适配新模型。
