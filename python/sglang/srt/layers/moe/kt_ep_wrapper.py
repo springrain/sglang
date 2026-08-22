@@ -3893,10 +3893,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # the full resident GPU image once per layer.  SM120 CUTLASS
             # shuffles E8M0 scales in place, so retain an independent scale
             # snapshot for the canonical source used by the slot manager.
+            weight_ref_methods = {
+                "Mxfp4MarlinMoEMethod",
+                "Mxfp4FlashinferCutlassMoEMethod",
+                "Mxfp4FlashinferTrtllmMoEMethod",
+                "Mxfp4HummingMoEMethod",
+            }
+            use_weight_refs = (
+                self.gpu_method.__class__.__name__ in weight_ref_methods
+            )
             layer._kt_mxfp4_raw_weights = {
                 name: (
                     getattr(layer, name).detach().clone()
-                    if name.endswith("scale_inv")
+                    if name.endswith("scale_inv") or not use_weight_refs
                     else getattr(layer, name).detach()
                 )
                 for name in raw_names

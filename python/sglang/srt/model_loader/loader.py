@@ -598,7 +598,12 @@ class DefaultModelLoader(BaseModelLoader):
         # large startup RSS/NUMA spike for DeepSeek MoE checkpoints. Preserve
         # upstream's multi-thread default for ordinary SGLang loads, but use
         # the old KT single-thread default unless explicitly opted in.
-        kt_weight_path = getattr(get_server_args(), "kt_weight_path", None)
+        try:
+            kt_weight_path = getattr(get_server_args(), "kt_weight_path", None)
+        except ValueError:
+            # Standalone loader/unit-test callers may construct a loader before
+            # the scheduler publishes ServerArgs; retain upstream defaults there.
+            kt_weight_path = None
         default_multithread = not kt_weight_path
         use_multithread = extra_config.get(
             "enable_multithread_load",
