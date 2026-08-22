@@ -4355,16 +4355,6 @@ class ServerArgs:
             and self.kt_gpu_prefill_token_threshold < 0
         ):
             raise ValueError("--kt-gpu-prefill-token-threshold must be non-negative.")
-        if (
-            self.kt_method.upper() == "MXFP4"
-            and self.kt_gpu_prefill_token_threshold
-            and self.kt_gpu_prefill_token_threshold > 0
-        ):
-            raise ValueError(
-                "KT MXFP4 layerwise prefill is not available in this upstream "
-                "forward-port; omit --kt-gpu-prefill-token-threshold or set it to 0."
-            )
-
         placement_strategies = {"frequency", "front-loading", "uniform", "random"}
         if self.kt_expert_placement_strategy not in placement_strategies:
             raise ValueError(
