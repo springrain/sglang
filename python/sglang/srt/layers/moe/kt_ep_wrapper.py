@@ -3899,13 +3899,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "Mxfp4FlashinferTrtllmMoEMethod",
                 "Mxfp4HummingMoEMethod",
             }
-            use_weight_refs = (
-                self.gpu_method.__class__.__name__ in weight_ref_methods
-            )
+            gpu_method_name = self.gpu_method.__class__.__name__
+            if gpu_method_name not in weight_ref_methods:
+                supported = ", ".join(sorted(weight_ref_methods))
+                raise RuntimeError(
+                    "KT MXFP4 layerwise prefill does not support the active "
+                    f"GPU backend {gpu_method_name!r}; refusing to clone the "
+                    "full resident raw-weight image. Use a supported backend "
+                    f"({supported}) or set --kt-gpu-prefill-token-threshold 0."
+                )
             layer._kt_mxfp4_raw_weights = {
                 name: (
                     getattr(layer, name).detach().clone()
-                    if name.endswith("scale_inv") or not use_weight_refs
+                    if name.endswith("scale_inv")
                     else getattr(layer, name).detach()
                 )
                 for name in raw_names
