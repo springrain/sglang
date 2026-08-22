@@ -592,7 +592,18 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
-        use_multithread = extra_config.get("enable_multithread_load", True)
+        # KT keeps a large mmap-backed CPU expert image and registers pinned
+        # shared-memory staging buffers. The multi-thread iterator can retain
+        # up to (workers + 1) complete safetensors shards, which creates a
+        # large startup RSS/NUMA spike for DeepSeek MoE checkpoints. Preserve
+        # upstream's multi-thread default for ordinary SGLang loads, but use
+        # the old KT single-thread default unless explicitly opted in.
+        kt_weight_path = getattr(get_server_args(), "kt_weight_path", None)
+        default_multithread = not kt_weight_path
+        use_multithread = extra_config.get(
+            "enable_multithread_load",
+            default_multithread or "num_threads" in extra_config,
+        )
         if resolved_source is None:
             hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
                 source.model_or_path, source.revision, source.fall_back_to_pt
