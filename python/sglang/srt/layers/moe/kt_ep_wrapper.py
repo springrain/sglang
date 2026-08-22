@@ -3887,8 +3887,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     "KT MXFP4 layerwise prefill requires checkpoint-native "
                     f"resident tensors; missing {missing}"
                 )
+            # Keep the original weight storage alive for the layerwise shadow.
+            # Marlin/CUTLASS post-processing rebinds the weight tensors, so a
+            # detached reference is sufficient for w13/w2 and avoids copying
+            # the full resident GPU image once per layer.  SM120 CUTLASS
+            # shuffles E8M0 scales in place, so retain an independent scale
+            # snapshot for the canonical source used by the slot manager.
             layer._kt_mxfp4_raw_weights = {
-                name: getattr(layer, name).detach().clone() for name in raw_names
+                name: (
+                    getattr(layer, name).detach().clone()
+                    if name.endswith("scale_inv")
+                    else getattr(layer, name).detach()
+                )
+                for name in raw_names
             }
             layer._kt_mxfp4_raw_w13_up_first = bool(
                 getattr(self.gpu_method, "load_up_proj_weight_first", False)
