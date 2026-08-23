@@ -2459,6 +2459,28 @@ class _Mxfp4LayerwisePrefillManager:
             compute_error, f"compute launch for layer {layer_idx}"
         )
 
+        # Dynamic MXFP4 placement must consume the raw image for the slot just
+        # executed.  Run it before successor prefetch can overwrite the shared
+        # shadow context's raw tensors.
+        if method.kt_config.kt_enable_dynamic_expert_update:
+            dynamic_error = None
+            try:
+                torch.cuda.synchronize(self.device)
+                method._update_gpu_experts_from_batch(
+                    layer=layer,
+                    ctx=self.context,
+                    dispatch_output=dispatch_output,
+                    mxfp4_raw_source={
+                        name: getattr(slot, name)
+                        for name in _Mxfp4PrefillSlot.RAW_NAMES
+                    },
+                )
+            except Exception as exc:
+                dynamic_error = exc
+            self._commit_tp_runtime_phase(
+                dynamic_error, f"dynamic expert update for layer {layer_idx}"
+            )
+
         # GPU compute is now enqueued.  Host KT writes and successor transfer
         # scheduling can overlap it without requiring an async kt-kernel API.
         self._prefetch_successor(slot)
@@ -3550,6 +3572,73 @@ def copy_experts_weights_bf16(
             dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
 
 
+def copy_experts_weights_mxfp4(
+    src_layer: torch.nn.Module,
+    dst_layer: torch.nn.Module,
+    selected_experts: torch.Tensor,
+    raw_source: Optional[Dict[str, torch.Tensor]] = None,
+) -> None:
+    """Copy canonical packed MXFP4 experts and rebuild the resident Marlin image.
+
+    This path is intentionally limited to KT's V4 Marlin contract.  The
+    FlashInfer/TRT-LLM/Humming backends reorder packed bytes and/or scales in
+    backend-specific layouts, so copying their tensors as if they were Marlin
+    data would silently corrupt expert results.
+    """
+    raw_names = (
+        "w13_weight",
+        "w13_weight_scale_inv",
+        "w2_weight",
+        "w2_weight_scale_inv",
+    )
+    source = raw_source or {
+        name: getattr(src_layer, name).data for name in raw_names
+    }
+    if not all(name in source for name in raw_names) or not all(
+        hasattr(dst_layer, name) for name in raw_names
+    ):
+        raise RuntimeError(
+            "MXFP4 dynamic update requires canonical w13/w2 packed weights "
+            "and _scale_inv tensors."
+        )
+
+    logical_to_dst_index = {
+        int(selected_experts[i].item()): i
+        for i in range(len(selected_experts))
+    }
+    for name in raw_names:
+        src_weight = source[name]
+        dst_weight = getattr(dst_layer, name).data
+        if src_weight.ndim != dst_weight.ndim or src_weight.shape[1:] != dst_weight.shape[1:]:
+            raise RuntimeError(
+                f"MXFP4 dynamic update shape mismatch for {name}: "
+                f"source={tuple(src_weight.shape)} destination={tuple(dst_weight.shape)}"
+            )
+        for logical_id, dst_idx in logical_to_dst_index.items():
+            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+
+    from sglang.srt.layers.quantization.v4_marlin_moe import (
+        prepare_v4_mxfp4_marlin,
+    )
+
+    prepared = getattr(dst_layer, "_v4_marlin_weights", None)
+    dst_layer._v4_marlin_weights = prepare_v4_mxfp4_marlin(
+        dst_layer.w13_weight.data,
+        dst_layer.w13_weight_scale_inv.data,
+        dst_layer.w2_weight.data,
+        dst_layer.w2_weight_scale_inv.data,
+        out=prepared,
+    )
+    dst_layer._v4_marlin_path = True
+    # Subsequent layerwise slot loads use this canonical resident snapshot for
+    # GPU experts. Refresh it after a placement change so a later prefetch does
+    # not restore the pre-update expert image.
+    dst_layer._kt_mxfp4_raw_weights = {
+        name: getattr(dst_layer, name).detach()
+        for name in raw_names
+    }
+
+
 def update_gpu_expert_mappings(
     selected_experts: torch.Tensor,
     num_experts: int,
@@ -3651,6 +3740,40 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             raise ImportError(
                 "kt_kernel is not installed. To use KTransformers EP wrapper, please install kt_kernel."
             )
+
+        if (
+            (kt_config.method or "").upper() == "MXFP4"
+            and kt_config.kt_enable_dynamic_expert_update
+        ):
+            if not torch.cuda.is_available():
+                raise ValueError(
+                    "MXFP4 dynamic expert update requires a CUDA GPU; "
+                    "pure CPU/NEON execution cannot update GPU expert placement."
+                )
+            if int(kt_config.gpu_experts_mask.sum().item()) <= 0:
+                raise ValueError(
+                    "MXFP4 dynamic expert update requires at least one GPU expert; "
+                    "set --kt-num-gpu-experts to a positive value."
+                )
+            if not kt_config.gpu_prefill_token_threshold or kt_config.gpu_prefill_token_threshold <= 0:
+                raise ValueError(
+                    "MXFP4 dynamic expert update requires a positive "
+                    "--kt-gpu-prefill-token-threshold."
+                )
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                make_kt_mxfp4_marlin_method,
+            )
+
+            dynamic_gpu_method = make_kt_mxfp4_marlin_method(
+                gpu_method, prefix=getattr(gpu_method, "prefix", "")
+            )
+            if dynamic_gpu_method.__class__.__name__ != "Mxfp4MarlinMoEMethod":
+                raise ValueError(
+                    "MXFP4 dynamic expert update currently supports only the "
+                    "KT Marlin backend on SM89/SM120; FlashInfer, TRT-LLM, "
+                    "Humming, generic MXFP4, and CPU-only ARM paths are not supported."
+                )
+            gpu_method = dynamic_gpu_method
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
@@ -3873,6 +3996,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Args:
             layer: The MoE layer module
         """
+        if (
+            (self.kt_config.method or "").upper() == "MXFP4"
+            and self.kt_config.kt_enable_dynamic_expert_update
+            and not _mxfp4_pipeline_backend_supported(self, layer)
+        ):
+            raise ValueError(
+                "MXFP4 dynamic expert update requires the supported KT Marlin "
+                "V4 layerwise contract: CUDA SM89/SM120, native _scale_inv "
+                "weights, aligned dimensions, and plain SiLU activation."
+            )
+
         # Preserve the checkpoint-native resident expert image before the
         # selected current backend performs an in-place scale/weight shuffle.
         # The hot hybrid/decode path keeps that backend (FlashInfer on SM120),
@@ -4330,18 +4464,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Marlin repack changes weight shapes/dtypes, and
             # _restore_raw_attrs() creates empty tensors (torch.empty) to
             # restore the raw fp8 format, destroying the weight data.
-            # Skip for V4-Flash MXFP4 — `_update_gpu_experts_from_batch` →
-            # `copy_experts_weights_int4` hardcodes int4 weight names
-            # (`w13_weight_packed` etc.) and crashes on MXFP4 layouts. The
-            # full-GPU fallback re-loads all 256 experts on every fire anyway,
-            # so the dynamic-promote optimization is a no-op for MXFP4. Origin:
-            # sglang 本身 (V4-Flash full-GPU prefill fallback compat).
-            # MXFP8 has its own weight/scale layout as well; it must not fall
-            # through to copy_experts_weights_int4 during a dynamic update.
-            _quant_skip_dyn_update = (
-                getattr(ctx, "_is_mxfp4_quant", False)
-                or getattr(ctx, "_is_mxfp8_quant", False)
-            )
+            # MXFP4 has a dedicated canonical packed-weight copy path below.
+            # MXFP8 still has no matching dynamic-copy implementation and must
+            # not fall through to the INT4 helper.
+            _quant_skip_dyn_update = getattr(ctx, "_is_mxfp8_quant", False)
             if (
                 self.kt_config.kt_enable_dynamic_expert_update
                 and not _quant_skip_dyn_update
@@ -4532,12 +4658,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         ctx: "SharedFullContext",
         dispatch_output: "StandardDispatchOutput",
+        mxfp4_raw_source: Optional[Dict[str, torch.Tensor]] = None,
     ) -> None:
         """Update original layer's GPU experts based on current batch statistics.
 
         This method:
         1. Analyzes topk_ids to find most frequently activated experts
         2. Copies selected expert weights from ctx.gpu_layer to layer
+           (canonical packed MXFP4 raw tensors on the MXFP4 path)
         3. Updates all mapping tables (gpu_experts_mask, logical_to_gpu_index, etc.)
         4. Broadcasts changes across TP ranks for consistency
 
@@ -4573,7 +4701,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Copy selected expert weights from ctx.gpu_layer to layer.
         # Both are already in inference format: apply() already called
         # process_weights_after_loading() which handles Marlin repack.
-        if ctx._is_fp8_quant:
+        if ctx._is_mxfp4_quant:
+            copy_experts_weights_mxfp4(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+                raw_source=mxfp4_raw_source,
+            )
+        elif ctx._is_fp8_quant:
             # Ampere Marlin vs native FP8 block quant: Marlin repack renames
             # w13_weight_scale_inv → w13_weight_scale and changes w13_weight
             # dtype fp8→int32.  Use gpu_method class name (invariant) to pick
