@@ -1815,19 +1815,36 @@ class KVCacheConfigurator:
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
+            # Include all extra reservations in the diagnostic.  In
+            # particular, the lazy MXFP4 layerwise path reserves raw and
+            # prepared slots from the KV budget; omitting that amount can
+            # report a misleading threshold that is already below the user's
+            # current mem_fraction_static.
+            reserved_gb = mm_reservation_gb + mxfp4_layerwise_reservation_gb
             minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
+                1 - (available_gpu_memory - reserved_gb) / pre_model_load_memory
             )
             suggested_mem_fraction_static = (
                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
             )
+            if suggested_mem_fraction_static <= 1.0:
+                memory_hint = (
+                    f"Raise --mem-fraction-static above "
+                    f"{suggested_mem_fraction_static:.3f} "
+                )
+            else:
+                memory_hint = (
+                    "There is not enough GPU memory for the requested static "
+                    "allocations; disable the MXFP4 layerwise threshold or use "
+                    "a GPU with more memory. "
+                )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
                 f"--mem-fraction-static={get_schedule().mem_fraction_static}. "
-                f"Raise --mem-fraction-static above "
-                f"{suggested_mem_fraction_static:.3f} "
-                f"(minimum viable = 1 - available/pre = "
-                f"{minimum_mem_fraction_static:.4f}). If using speculative "
+                f"{memory_hint}"
+                f"(minimum viable = 1 - (available - reservations)/pre = "
+                f"{minimum_mem_fraction_static:.4f}; extra reservations="
+                f"{reserved_gb:.2f} GB. If using speculative "
                 f"decoding, draft weights are now counted."
             )
 
