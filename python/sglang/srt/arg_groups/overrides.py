@@ -1923,16 +1923,36 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_v4_sm120_moe(view: Any) -> dict:
-    """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
+    """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120.
+
+    Also pin an unset/"auto" speculative MoE runner backend to the resolved
+    target one. The draft (nextn) layers hold the same MXFP4-packed expert
+    tensors, and a speculative backend left at "auto" resolves to the
+    fp4-unaware triton fallback in Fp8Config.get_quant_method, which crashes
+    the draft forward with a hidden-size mismatch.
+    """
     hf_config = view.get_model_config().hf_config
     if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
         return {}
-    if is_sm120_supported() and view.moe_runner_backend == "auto":
+    updates = {}
+    moe_runner_backend = view.moe_runner_backend
+    if is_sm120_supported() and moe_runner_backend == "auto":
         logger.info(
             "Use flashinfer_mxfp4 as MoE runner backend on SM120 for DeepseekV4"
         )
-        return {"moe_runner_backend": "flashinfer_mxfp4"}
-    return {}
+        moe_runner_backend = "flashinfer_mxfp4"
+        updates["moe_runner_backend"] = moe_runner_backend
+    if (
+        moe_runner_backend != "auto"
+        and view.speculative_algorithm is not None
+        and view.speculative_moe_runner_backend in (None, "auto")
+    ):
+        logger.info(
+            f"Use {moe_runner_backend} as speculative MoE runner backend for "
+            f"DeepseekV4, matching the target MoE runner backend."
+        )
+        updates["speculative_moe_runner_backend"] = moe_runner_backend
+    return updates
 
 
 @_register_for("MuseGlimmerForConditionalGeneration", "MuseGlimmerForCausalLM")
