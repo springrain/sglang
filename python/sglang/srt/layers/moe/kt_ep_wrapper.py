@@ -4160,6 +4160,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Delegate to GPU method to create its runner
         self.gpu_method.create_moe_runner(layer, gpu_runner_config)
+        # FusedMoEMethodBase declares a class-level `runner = None`, which
+        # shadows this class's __getattr__ delegation to gpu_method; FusedMoE
+        # reads the runner off the quant method for TBO overlap args, so it
+        # must see the real runner here.
+        self.runner = self.gpu_method.runner
 
     def get_triton_quant_info(self, layer: torch.nn.Module):
         """Expose the wrapped GPU method's Triton quantization metadata."""

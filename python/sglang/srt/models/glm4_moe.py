@@ -578,7 +578,12 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            if not _is_cuda or (
+                isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                and not getattr(
+                    self.experts, "should_fuse_routed_scaling_factor_in_topk", False
+                )
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -605,7 +610,12 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             (not _is_cuda and not _use_aiter)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or (
+                isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                and not getattr(
+                    self.experts, "should_fuse_routed_scaling_factor_in_topk", False
+                )
+            )
         ):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:

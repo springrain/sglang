@@ -3744,6 +3744,7 @@ class ServerArgs:
             # graph resolution reads them (pre-pipeline, so the writes land in
             # the raw-input snapshot and the hooks see them).
             self._handle_kt_args()
+            self._map_k3_attn_tp_env_compat()
             run_resolution_pipeline(self)
             # ktransformers: restrict CUDA graph capture for the KT host-side
             # expert path on the resolved configuration (post-pipeline, so it
@@ -4208,6 +4209,30 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+    def _map_k3_attn_tp_env_compat(self) -> None:
+        # The SGLANG_K3_*_ATTN_TP env vars predate the CLI flags; keep them
+        # working when the flags were not passed, then retire the vars.
+        for env_name, env_field, arg_name in (
+            (
+                "SGLANG_K3_SHARED_EXPERTS_ATTN_TP",
+                envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP,
+                "enable_shared_experts_attn_tp",
+            ),
+            (
+                "SGLANG_K3_DENSE_MLP_ATTN_TP",
+                envs.SGLANG_K3_DENSE_MLP_ATTN_TP,
+                "enable_dense_mlp_attn_tp",
+            ),
+        ):
+            if not env_field.is_set():
+                continue
+            logger.warning(
+                f"{env_name} is deprecated; use "
+                f"--{arg_name.replace('_', '-')} instead."
+            )
+            if env_field.get() and not getattr(self, arg_name):
+                setattr(self, arg_name, True)
+
     def _enforce_kt_cuda_graph_compatibility(self) -> None:
         """Apply CUDA-graph restrictions for KT's host-side expert path.
 
@@ -4257,7 +4282,8 @@ class ServerArgs:
 
         declared_fields: Dict[str, Any] = {}
         if self.kt_lora_path or self.kt_expert_lora_path:
-            self.disable_cuda_graph = True
+            # declare_resolution path only: a direct write here hits the
+            # post-resolution frozen-record guard.
             declared_fields["disable_cuda_graph"] = True
             if new_config.decode.backend != Backend.DISABLED:
                 new_config = with_phase(

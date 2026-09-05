@@ -1029,7 +1029,10 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _is_musa
             and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or (
+                isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            )
         ):
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1176,7 +1179,10 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not _is_xpu
             and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or (
+                isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            )
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
