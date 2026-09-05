@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -51,6 +52,10 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_schedule,
+)
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
 if is_cuda():
@@ -3061,7 +3066,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         return _KT_GPU_EXPERTS_MASKS
 
     # Get model config (unwrap VL configs that nest the text model config)
-    hf_config = server_args.get_model_config().hf_config
+    hf_config = model_config_of(server_args).hf_config
 
     # fix for kimi-k2.5 models where text_config holds the actual config
     if getattr(hf_config, "text_config", None) is not None:
@@ -3320,7 +3325,7 @@ def create_kt_config_from_server_args(
     if is_kt_ep_wrapper_disabled():
         return None
 
-    if server_args.kt_weight_path is None:
+    if get_exec().moe.kt_weight_path is None:
         return None
 
     # Get GPU experts masks (initializes if needed)
@@ -3329,7 +3334,7 @@ def create_kt_config_from_server_args(
         return None
 
     # Get num_layers from model config (unwrap VL configs)
-    hf_config = server_args.get_model_config().hf_config
+    hf_config = model_config_of(server_args).hf_config
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
@@ -3345,16 +3350,16 @@ def create_kt_config_from_server_args(
     return KTConfig(
         layer_idx=layer_idx,
         gpu_experts_mask=gpu_experts_mask,
-        cpuinfer_threads=server_args.kt_cpuinfer,
-        threadpool_count=server_args.kt_threadpool_count,
-        numa_nodes=server_args.kt_numa_nodes,
-        weight_path=server_args.kt_weight_path,
-        chunked_prefill_size=server_args.chunked_prefill_size,
-        method=server_args.kt_method,
-        max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
+        cpuinfer_threads=get_exec().moe.kt_cpuinfer,
+        threadpool_count=get_exec().moe.kt_threadpool_count,
+        numa_nodes=get_exec().moe.kt_numa_nodes,
+        weight_path=get_exec().moe.kt_weight_path,
+        chunked_prefill_size=get_schedule().chunked_prefill_size,
+        method=get_exec().moe.kt_method,
+        max_deferred_experts_per_token=get_exec().moe.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
-        gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
-        kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        gpu_prefill_token_threshold=get_exec().moe.kt_gpu_prefill_token_threshold,
+        kt_enable_dynamic_expert_update=get_exec().moe.kt_enable_dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
     )
 

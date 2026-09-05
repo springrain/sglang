@@ -9,8 +9,8 @@ from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -45,6 +45,8 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
 
 class Mxfp4MarlinMoEMethod:
     """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
+
+    fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -201,7 +203,7 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not is_sm90_supported() and not is_sm120_supported():
+        if not get_platform().is_sm90 and not get_platform().is_sm120:
             raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
@@ -256,9 +258,14 @@ class Mxfp4MarlinMoEMethod:
             runner_config = getattr(runner_config, "config", None)
             if runner_config is None:
                 runner_config = getattr(self, "moe_runner_config", None)
-            routed_scale = getattr(runner_config, "routed_scaling_factor", None)
-            if routed_scale is None:
+            if getattr(layer, "should_fuse_routed_scaling_factor_in_topk", False):
+                # topk_weights already carry routed_scaling_factor (fused into
+                # topk by upstream); applying it again here would scale twice.
                 routed_scale = 1.0
+            else:
+                routed_scale = getattr(runner_config, "routed_scaling_factor", None)
+                if routed_scale is None:
+                    routed_scale = 1.0
             target_hidden_size = layer.w13_weight.shape[2] * 2
             if hidden_states.shape[-1] > target_hidden_size:
                 raise ValueError(
