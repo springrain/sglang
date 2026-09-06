@@ -4216,6 +4216,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
+
         if self.tp_rank != 0 or self.wrapper is None:
             return
 

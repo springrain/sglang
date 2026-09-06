@@ -242,7 +242,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # "Missing TRTLLM-GEN kernel" error during CUDA-graph capture.
         # XQA (SM90/SM120 decode) has native page-128 kernels; no check needed.
         if self.page_size >= 128 and not self.is_xqa_impl:
-
             attn_tp_size = get_parallel().attn_tp_size
             num_q_heads = config.num_attention_heads // attn_tp_size
             num_kv_heads = config.get_num_kv_heads(attn_tp_size)
@@ -469,9 +468,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
-        self.kv_read_tables = self.kv_index_translator.make_capture_tables(
-            max_bs=max_bs, max_context_len=self.max_context_len
-        )
         max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -902,21 +898,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         if self.kv_index_translator.is_translating:
-            # Unified pool: refresh the capture-stable read table (this runs
+            # Unified pool: refill this mode's own page table (this runs
             # out-of-graph on BOTH capture and every replay-prep; the recorded
             # fused kernel skips its page-table writes so the graph reads the
             # refreshed content through pointers baked at capture).
-            kv_view = self.kv_index_translator.build_index_table(
-                req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=forward_batch.seq_lens[:bs],
-                into=self.kv_read_tables,
-            )
             metadata = self.forward_metadata
-            if in_capture:
-                # Bind ONCE: the attention kernels bake these pointers at capture.
-                metadata.page_table = kv_view.ids[:bs]
-                if kv_view.sliding_window_ids is not None:
-                    metadata.swa_page_table = kv_view.sliding_window_ids[:bs]
+            # `cache_seqlens_int32` is what the attention kernels bound their
+            # page-table reads by, and the fused metadata call above wrote it.
+            # A target verify reads `draft_token_num` further than `seq_lens`
+            # goes, so filling to `seq_lens` leaves those columns untranslated.
+            self.kv_index_translator.fill_read_table(
+                out=metadata.page_table,
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=metadata.cache_seqlens_int32,
+                sliding_window_out=metadata.swa_page_table,
+            )
             # A capture batch carries no prepared write loc; zeros are the
             # page-0 sink.
             if (
@@ -1217,7 +1213,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         return output_by_request.view(-1, query.shape[-2], query.shape[-1])
 
-    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
+    def _get_nvfp4_decode_kv_cache(
+        self, layer: RadixAttention
+    ) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -1429,8 +1427,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # run bs*L single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
-                    "ENCODER_ONLY target_verify does not support ragged "
-                    "verify layouts"
+                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 )
                 assert self.forward_metadata.encoder_cache_seqlens is not None, (
                     "ENCODER_ONLY target_verify requires the expanded decode "
