@@ -768,10 +768,16 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = default
     else:
         # Set prefill/decode backends based on hardware architecture.
+        # SM12x: trtllm-gen FMHA and flash_mla_sparse_fwd ship no SM12 kernels
+        # (trtllm aborts with 'Unsupported architecture'); tilelang covers SM120/121.
         if not user_set_prefill:
-            declared["dsa_prefill_backend"] = "flashmla_sparse"
+            declared["dsa_prefill_backend"] = (
+                "tilelang" if major == 12 else "flashmla_sparse"
+            )
         if not user_set_decode:
-            declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+            declared["dsa_decode_backend"] = (
+                "tilelang" if major == 12 else ("trtllm" if major >= 10 else "fa3")
+            )
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)

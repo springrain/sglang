@@ -1322,6 +1322,20 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main
 
 
+def _sparse_fwd_smem_budget() -> float:
+    # SM120/121 caps dynamic shared memory per block at ~99 KB while SM90/SM100
+    # allow 227 KB. The estimate aliasing this budget over-counts: TVM merges
+    # shared buffers with disjoint lifetimes (default (64, 2) config: 200704 B
+    # estimated vs 169984 B actually requested), so the full opt-in limit is safe.
+    try:
+        optin = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).shared_memory_per_block_optin
+    except (AttributeError, RuntimeError):
+        return float("inf")
+    return optin
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1388,12 +1402,55 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
-        kernel_factory = (
-            sparse_attention_fwd_kernel_v1
-            if tail_dim == 0
-            else sparse_attention_fwd_kernel_v2
-        )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        if tail_dim == 0:
+            h_per_block = (
+                64
+                if num_heads > 64
+                else max(tilelang.math.next_power_of_2(num_heads), 16)
+            )
+            budget = _sparse_fwd_smem_budget()
+            # Step the tile down until the estimated shared memory fits: the
+            # default (64, 2) needs ~166 KB at padded_h=32, d_v=512, which
+            # cannot launch on SM120/121 (~99 KB per-block cap).
+            # block_I is the reduction dim of the PV gemm; values below 32 trip
+            # tilelang's warp_row_tiles >= 16 layout assert (16 -> 8).
+            # block_I=32 rungs must run at 128 threads: at 256 threads their
+            # softmax fragments fail LayoutInference with an m_i/alpha conflict
+            # (tilelang 0.1.12-0.1.14, SM120/121).
+            for block_I, num_stages, threads in (
+                (64, 2, 256),
+                (64, 1, 256),
+                (32, 2, 128),
+                (32, 1, 128),
+            ):
+                if topk % block_I != 0:
+                    continue
+                est = (
+                    h_per_block * d_v * 4  # bf16 Q and O shared buffers
+                    + h_per_block * block_I * 2  # bf16 S shared buffer
+                    + block_I * d_v * 2 * num_stages  # multi-buffered KV tiles
+                )
+                if est <= budget:
+                    break
+            else:
+                raise RuntimeError(
+                    "tilelang sparse fwd: no tile config fits the device shared "
+                    f"memory (h_per_block={h_per_block}, d_v={d_v}, budget={budget:.0f} B)"
+                )
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=block_I,
+                num_stages=num_stages,
+                threads=threads,
+            )
+        else:
+            kernel = sparse_attention_fwd_kernel_v2(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+            )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
