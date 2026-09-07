@@ -69,6 +69,11 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.glm5_next_sparse_attention import (
+    GLM5_NEXT_MODEL_ARCHS,
+    glm5_next_sparse_mla_decode,
+    glm5_next_sparse_mla_extend,
+)
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
@@ -537,6 +542,18 @@ class DeepseekSparseAttnBackend(
             decode_impl=self.dsa_decode_impl,
         )
 
+        # GLM-5-Next on SM120: flashinfer's H512 kernel does not run there and
+        # every other DSA impl is rejected by the index_kpool>1 tail gate, so
+        # both phases route to the model-local graph-safe sparse MLA instead.
+        self.use_glm5_native_backend = (
+            model_runner.model_config.hf_config.architectures[0]
+            in GLM5_NEXT_MODEL_ARCHS
+            and self.device_sm_major == 12
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+            and self.use_fused_topk
+            and self.hisparse_coordinator is None
+        )
+
         if uses_flashinfer_sparse_mla:
             self.workspace_buffer = get_buffer(
                 "dsa_flashinfer_sparse_mla_workspace",
@@ -795,6 +812,61 @@ class DeepseekSparseAttnBackend(
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
+
+    def _forward_glm5_native(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: Optional[torch.Tensor],
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        topk_indices: torch.Tensor,
+        *,
+        is_extend: bool,
+    ) -> torch.Tensor:
+        if k is not None and save_kv_cache:
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not layer.is_cross_attention
+                else forward_batch.encoder_out_cache_loc
+            )
+            self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                layer,
+                cache_loc,
+                k,
+                k_rope,
+            )
+
+        # Zero-RoPE GLM: q is exactly the 512-wide latent; the fp8 DSA pool row
+        # is [512 fp8 latent] with no descales (plain .to(fp8) cast on write).
+        kv_fp8 = self.token_to_kv_pool.get_key_buffer(layer.layer_id).reshape(
+            -1, layer.v_head_dim
+        )
+        kv_scale = None
+        q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+        physical_indices = self._get_fused_topk_page_table(topk_indices)
+
+        if is_extend:
+            out = glm5_next_sparse_mla_extend(
+                q_nope,
+                kv_fp8,
+                kv_scale,
+                physical_indices,
+                sm_scale=layer.scaling,
+                current_chunk_kv=k.reshape(-1, layer.v_head_dim),
+                current_chunk_locs=forward_batch.out_cache_loc,
+            )
+        else:
+            out = glm5_next_sparse_mla_decode(
+                q_nope,
+                kv_fp8,
+                kv_scale,
+                physical_indices,
+                sm_scale=layer.scaling,
+            )
+        return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
@@ -2003,6 +2075,22 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        if (
+            self.use_glm5_native_backend
+            and topk_indices is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return self._forward_glm5_native(
+                q,
+                k,
+                k_rope,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                topk_indices,
+                is_extend=True,
+            )
+
         dsa_impl = (
             self.dsa_decode_impl
             if (
@@ -2331,6 +2419,18 @@ class DeepseekSparseAttnBackend(
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
+
+        if self.use_glm5_native_backend and topk_indices is not None:
+            return self._forward_glm5_native(
+                q,
+                k,
+                k_rope,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                topk_indices,
+                is_extend=False,
+            )
 
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
