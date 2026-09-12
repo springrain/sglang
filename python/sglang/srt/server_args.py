@@ -3157,6 +3157,11 @@ class ServerArgs:
         "[ktransformers parameter] Fraction of routed experts kept on GPU; overrides --kt-num-gpu-experts when both are set.",
         NS("exec.moe"),
     ] = None
+    kt_num_gpu_layers: A[
+        Optional[int],
+        "[ktransformers parameter] First N layers (by global layer index, 0-based) run routed experts entirely on GPU, bypassing the KT CPU path.",
+        NS("exec.moe"),
+    ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
@@ -4322,6 +4327,8 @@ class ServerArgs:
             0.0 <= self.kt_gpu_experts_ratio <= 1.0
         ):
             raise ValueError("--kt-gpu-experts-ratio must be between 0 and 1.")
+        if self.kt_num_gpu_layers is not None and self.kt_num_gpu_layers < 0:
+            raise ValueError("--kt-num-gpu-layers must be non-negative.")
         if (
             self.kt_max_deferred_experts_per_token is not None
             and self.kt_max_deferred_experts_per_token < 0

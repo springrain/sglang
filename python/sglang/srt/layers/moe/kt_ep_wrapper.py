@@ -3115,6 +3115,12 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         first_k_dense_replace = max(first_k_dense_replace or 0, first_moe)
         moe_layer_freq = 1
 
+    # Layers pinned by --kt-num-gpu-layers bypass KT and never read their
+    # mask rows; exclude them from the MoE range and GPU-expert budget.
+    num_gpu_layers = server_args.kt_num_gpu_layers or 0
+    if num_gpu_layers > 0:
+        first_k_dense_replace = max(first_k_dense_replace, num_gpu_layers)
+
     # Count actual MoE layers
     num_moe_layers = sum(
         1 for i in range(num_layers)
@@ -3133,6 +3139,12 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         getattr(hf_config, 'num_hash_layers', '<missing>'),
         getattr(hf_config, 'n_hash_layers', '<missing>'),
     )
+    if num_gpu_layers > 0:
+        logger.debug(
+            "[kt-mask] kt_num_gpu_layers=%d: first %d layers pinned on GPU, "
+            "MoE range starts at layer %d",
+            num_gpu_layers, num_gpu_layers, first_k_dense_replace,
+        )
 
     # Determine num_gpu_experts (total across all layers)
     if server_args.kt_gpu_experts_ratio is not None:
@@ -3207,6 +3219,9 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                 )
             # Sum across buffer_size (dim0) to get total activation counts per expert
             activation_freq = activation_counts.sum(dim=0).float()  # [num_layers, num_experts]
+            if num_gpu_layers > 0:
+                # Pinned layers bypass KT; their experts must not win budget slots.
+                activation_freq[:num_gpu_layers, :] = 0.0
             logger.info("Using frequency-based strategy with activation frequency data")
         else:
             # No activation frequency file, use zeros (uniform distribution)
@@ -3299,9 +3314,11 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             if i >= first_k_dense_replace and i % moe_layer_freq == 0
         )
         logger.info(
-            "Generated KT GPU experts masks using '%s' strategy: %d MoE layers (out of %d total layers) x %d experts, "
-            "total GPU experts in MoE layers = %d",
-            strategy, num_moe_layers, num_layers, num_experts, total_moe_gpu_experts
+            "Generated KT GPU experts masks using '%s' strategy: %d MoE layers "
+            "(out of %d total layers, %d pinned on GPU by --kt-num-gpu-layers) "
+            "x %d experts, total GPU experts in MoE layers = %d",
+            strategy, num_moe_layers, num_layers, num_gpu_layers, num_experts,
+            total_moe_gpu_experts,
         )
 
     return _KT_GPU_EXPERTS_MASKS
@@ -3326,6 +3343,12 @@ def create_kt_config_from_server_args(
         return None
 
     if get_exec().moe.kt_weight_path is None:
+        return None
+
+    num_gpu_layers = get_exec().moe.kt_num_gpu_layers or 0
+    if 0 < num_gpu_layers and layer_idx < num_gpu_layers:
+        # Leading layers keep the native fused-MoE path with all routed
+        # experts on GPU; KT CPU weights are not loaded for them.
         return None
 
     # Get GPU experts masks (initializes if needed)
