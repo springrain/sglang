@@ -25,15 +25,68 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
         Force GPU-experts apply() to a zero return; routed expert output
         comes purely from the CPU side. "Plan-C" fallback for diagnosing
         whether a regression sits in the GPU MoE path or the merge math.
+
+MXFP4 layerwise prefill gate diagnostics (warn-once per reason, rank 0 only;
+zero CUDA ops, safe to leave enabled in production):
+
+    SGLANG_KT_SUPPRESS_DEGRADE_WARN=1
+        Suppress the [KT-DEGRADE] warnings emitted when a requested MXFP4
+        layerwise prefill layer falls back to the hybrid CPU/GPU path.
+
+    SGLANG_KT_V4_TRITON_STRICT_OPTOUT=1
+        Treat only SGLANG_V4_USE_TRITON_KERNELS=1 (not =0) as opting out of
+        the prepared V4 Marlin path.  Default keeps the legacy behavior where
+        any set value opts out.  The env is latched once at import.
+
+MXFP4 layerwise prefill per-chunk stats ledger (host-only perf_counter
+brackets plus CPU-bool churn arithmetic; off is bit-identical, on adds no
+CUDA op, collective, or D2H, so ranks may toggle it independently and a
+mid-run setenv takes effect on the next chunk):
+
+    SGLANG_KT_PREFILL_STATS=1
+        Enable per-chunk JSON accounting of the MXFP4 layerwise prefill
+        pipeline (host write / consensus / H2D enqueue+stall / D2D repack /
+        hot update / churn).  Default off.
+
+    SGLANG_KT_PREFILL_STATS_PATH=<file>
+        Append one JSONL row per rank per chunk to <file>.  {date} expands
+        to YYYYMMDD; {rank} expands to the TP rank (a .rank<N> suffix is
+        auto-added when TP>1 and {rank} is absent).  Rows rotate into
+        .1 ... .99 at SGLANG_KT_PREFILL_STATS_MAX_BYTES (default 64 MiB,
+        unparseable or non-positive values fall back to the default).
+        Unset: rank 0 logs a one-line summary per chunk instead.
+
+    Production invariants guard (env governance table):
+
+      SGLANG_KT_PREFILL_STATS=1
+        Per-chunk prefill stats ledger, default off.  Read inline at each
+        round begin, so it may be flipped at runtime; every bracket is a
+        failed None-check when off.
+      SGLANG_KT_PREFILL_STATS_PATH=<file>
+        JSONL sink template for the ledger; read inline at each flush.
+      SGLANG_KT_PREFILL_STATS_MAX_BYTES=<int>
+        Rotation threshold (default 64 MiB); read inline at each flush.
+      SGLANG_KT_SLOT_OWNERSHIP_ASSERT=0|1|2
+        0=off, 1=enforce (rank-symmetric consensus raise), 2=warn-only
+        (default).  Read ONCE in the layerwise manager __init__ and cached:
+        deliberately unlike the inline-read stats envs above, because both
+        ranks must always evaluate the same level (structural constraint,
+        not an oversight).  Changing it requires a restart.  Unparseable or
+        out-of-range values warn once and fall back to 2.  Assert D covers
+        the guard automaton from each round's first update window onward;
+        the round's prime (first) loads carry guard=None and are outside
+        D's scope by design.
 """
 
 import bisect
+import contextlib
 import copy
 import ctypes
 import gc
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -41,6 +94,7 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed as dist
 
@@ -1820,7 +1874,7 @@ class SharedFullContext:
 
         if tp_rank == 0:
             logger.info(
-                "KT layerwise prefill: layer %d prepare weight = %.2f ms",
+                "KT full-GPU fallback: layer %d prepare weight = %.2f ms",
                 layer_idx,
                 total_time,
             )
@@ -1866,6 +1920,178 @@ class _Mxfp4PrefillSlot:
         self.state = "EMPTY"
         self.layer_idx = None
         self.epoch = -1
+
+
+# ---------------------------------------------------------------------------
+# Prefill stats ledger (SGLANG_KT_PREFILL_STATS)
+#
+# Off by default: the manager then holds _stats_chunk=None and every bracket
+# below is a single failed None-check on the off path.  Field name strings
+# are the JSONL schema; keep them aligned with
+# doc/ft-kt-phase1-plan-observability.md.
+# ---------------------------------------------------------------------------
+
+_PREFILL_STATS_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+_PREFILL_STATS_FIELDS_MS = (
+    "host_write_ms",
+    "consensus_gloo_ms",
+    "consensus_device_ms",
+    "h2d_stall_ms",
+    "gpu_expert_d2d_enqueue_ms",
+    "h2d_enqueue_ms",
+    "postprocess_ms",
+    "hotupdate_ms",
+)
+_prefill_stats_io_warn_budget = 8
+
+
+class _PrefillLayerStats(msgspec.Struct):
+    host_write_ms: float = 0.0
+    consensus_gloo_ms: float = 0.0
+    consensus_gloo_count: int = 0
+    consensus_device_ms: float = 0.0
+    consensus_device_count: int = 0
+    h2d_stall_ms: float = 0.0
+    gpu_expert_d2d_enqueue_ms: float = 0.0
+    h2d_enqueue_ms: float = 0.0
+    postprocess_ms: float = 0.0
+    hotupdate_ms: float = 0.0
+    experts_cpu: int = 0
+    bytes_h2d: int = 0
+    bytes_expected: int = 0
+    churn_in: int = 0
+    churn_out: int = 0
+
+
+class _PrefillChunkStats(msgspec.Struct):
+    epoch: int = 0
+    tp_rank: int = 0
+    tp_size: int = 1
+    t_start_ns: int = 0
+    layers: Dict[int, _PrefillLayerStats] = {}
+
+    def layer_bucket(self, layer_idx: int) -> _PrefillLayerStats:
+        bucket = self.layers.get(layer_idx)
+        if bucket is None:
+            bucket = self.layers[layer_idx] = _PrefillLayerStats()
+        return bucket
+
+
+def _kt_prefill_stats_enabled() -> bool:
+    return os.environ.get("SGLANG_KT_PREFILL_STATS", "") == "1"
+
+
+def _kt_prefill_stats_max_bytes() -> int:
+    raw = os.environ.get("SGLANG_KT_PREFILL_STATS_MAX_BYTES")
+    if raw is None:
+        return _PREFILL_STATS_DEFAULT_MAX_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return _PREFILL_STATS_DEFAULT_MAX_BYTES
+    return value if value > 0 else _PREFILL_STATS_DEFAULT_MAX_BYTES
+
+
+def _kt_prefill_stats_path(tp_rank: int, tp_size: int) -> Optional[str]:
+    template = os.environ.get("SGLANG_KT_PREFILL_STATS_PATH")
+    if template is None:
+        return None
+    resolved = template.replace("{date}", time.strftime("%Y%m%d"))
+    resolved = resolved.replace("{rank}", str(tp_rank))
+    if tp_size > 1 and "{rank}" not in template:
+        stem, dot, suffix = resolved.rpartition(".")
+        if dot and "/" not in suffix and "\\" not in suffix:
+            resolved = f"{stem}.rank{tp_rank}.{suffix}"
+        else:
+            resolved = f"{resolved}.rank{tp_rank}"
+    return resolved
+
+
+def _prefill_stats_io_warn(action: str, exc: Exception) -> None:
+    global _prefill_stats_io_warn_budget
+    if _prefill_stats_io_warn_budget <= 0:
+        return
+    _prefill_stats_io_warn_budget -= 1
+    logger.warning("KT prefill stats %s failed: %r", action, exc)
+
+
+def _kt_prefill_stats_rotate(path: str, max_bytes: int) -> None:
+    if not os.path.exists(path) or os.path.getsize(path) < max_bytes:
+        return
+    # Walk high-to-low so os.replace never clobbers a slot the next
+    # iteration still needs; backups cap at .99.
+    for suffix in range(98, 0, -1):
+        older, newer = f"{path}.{suffix}", f"{path}.{suffix + 1}"
+        if os.path.exists(older):
+            os.replace(older, newer)
+    os.replace(path, f"{path}.1")
+
+
+def _stats_now(chunk: Optional[_PrefillChunkStats]) -> int:
+    return time.perf_counter_ns() if chunk is not None else 0
+
+
+def _stats_note_ms(
+    chunk: Optional[_PrefillChunkStats],
+    layer_idx: Optional[int],
+    field: str,
+    t0_ns: int,
+) -> None:
+    if chunk is None or layer_idx is None or t0_ns == 0:
+        return
+    bucket = chunk.layer_bucket(layer_idx)
+    setattr(
+        bucket,
+        field,
+        getattr(bucket, field) + (time.perf_counter_ns() - t0_ns) / 1e6,
+    )
+
+
+@contextlib.contextmanager
+def _stats_span(
+    chunk: Optional[_PrefillChunkStats], layer_idx: Optional[int], field: str
+):
+    if chunk is None or layer_idx is None:
+        yield
+        return
+    t0_ns = time.perf_counter_ns()
+    try:
+        yield
+    finally:
+        _stats_note_ms(chunk, layer_idx, field, t0_ns)
+
+
+def _mxfp4_prefill_expert_bytes(cpu_buffers) -> int:
+    # Each SHM buffer holds two host slots; one slot carries exactly one
+    # expert's payload for the H2D fan-out.
+    return sum(
+        cpu_buffers[name].numel() // 2 * cpu_buffers[name].element_size()
+        for name in _Mxfp4PrefillSlot.RAW_NAMES
+    )
+
+
+_ownership_env_warned = False
+
+
+def _kt_ownership_assert_level() -> int:
+    global _ownership_env_warned
+    raw = os.environ.get("SGLANG_KT_SLOT_OWNERSHIP_ASSERT")
+    if raw is None:
+        return 2
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value not in (0, 1, 2):
+        if not _ownership_env_warned:
+            _ownership_env_warned = True
+            logger.warning(
+                "Invalid SGLANG_KT_SLOT_OWNERSHIP_ASSERT=%r; "
+                "falling back to 2 (warn-only)",
+                raw,
+            )
+        return 2
+    return value
 
 
 class _Mxfp4LayerwisePrefillManager:
@@ -1915,6 +2141,25 @@ class _Mxfp4LayerwisePrefillManager:
         self.current_slot_index: Optional[int] = None
         self.round_active = False
 
+        # Chunk-scoped stats ledger; None means SGLANG_KT_PREFILL_STATS is off,
+        # so every bracket below is a single failed None-check off-path.
+        self._stats_chunk: Optional["_PrefillChunkStats"] = None
+        self._stats_span_layer: Optional[int] = None
+
+        # Ownership sentinel state.  The level is cached ONCE here (see the
+        # docstring governance table): both ranks must always evaluate the
+        # same level, so runtime env edits cannot take effect.  Shadow cells
+        # hold (epoch, layer_idx, position); the freed twin tracks whether
+        # the host-slot sync covering the current owner already ran.
+        self._ownership_level = _kt_ownership_assert_level()
+        self._host_slot_owner: List[Optional[Tuple[int, int, int]]] = [
+            None,
+            None,
+        ]
+        self._host_slot_freed = [True, True]
+        self._ownership_warned: set = set()
+        self._ownership_prime_logged = False
+
     @property
     def registry(self):
         return _MXFP4_PREFILL_LAYER_REGISTRY.get(self.signature, {})
@@ -1929,8 +2174,17 @@ class _Mxfp4LayerwisePrefillManager:
         return order[pos] if pos < len(order) else None
 
     def abort_round(self) -> None:
+        # Round-scoped shadow evidence is dropped even when the round
+        # already ended, before the early return.  An epoch mismatch on
+        # reuse is then the only legitimate overwrite path in
+        # _ownership_record_host_slot.
+        self._host_slot_owner = [None, None]
+        self._host_slot_freed = [True, True]
         if not self.round_active:
             return
+        # Flush before the epoch bump: the row must carry the epoch that was
+        # current while the aborted chunk accumulated, not the next one.
+        self._stats_abort_chunk()
         self.epoch += 1
         self.last_layer_position = None
         self.current_slot_index = None
@@ -1957,7 +2211,245 @@ class _Mxfp4LayerwisePrefillManager:
             for slot in self.slots:
                 if slot.epoch != self.epoch:
                     slot.invalidate()
+            self._stats_begin_chunk()
         self.last_layer_position = pos
+
+    def _stats_begin_chunk(self) -> None:
+        # Runs right after the epoch bump in _advance_round; the chunk then
+        # carries the new epoch.  A pending chunk means the previous round
+        # never reached a clean finalize, so close it out as partial first.
+        if self._stats_chunk is not None:
+            self._flush_stats_chunk(partial=True)
+        if not _kt_prefill_stats_enabled():
+            self._stats_span_layer = None
+            return
+        self._stats_chunk = _PrefillChunkStats(
+            epoch=self.epoch,
+            tp_rank=get_tensor_model_parallel_rank(),
+            tp_size=get_tensor_model_parallel_world_size(),
+            t_start_ns=time.perf_counter_ns(),
+        )
+
+    def _stats_abort_chunk(self) -> None:
+        if self._stats_chunk is not None:
+            self._flush_stats_chunk(partial=True)
+
+    def _stats_finalize_chunk(self) -> None:
+        if self._stats_chunk is not None:
+            self._flush_stats_chunk(partial=False)
+
+    @contextlib.contextmanager
+    def _stats_consensus_span(self, device: bool):
+        chunk = self._stats_chunk
+        layer_idx = self._stats_span_layer
+        if chunk is None or layer_idx is None:
+            yield
+            return
+        t0_ns = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            # Gloo and device consensuses are booked under separate sub-keys;
+            # the count tracks the per-layer consensus call sequence.
+            bucket = chunk.layer_bucket(layer_idx)
+            elapsed_ms = (time.perf_counter_ns() - t0_ns) / 1e6
+            if device:
+                bucket.consensus_device_ms += elapsed_ms
+                bucket.consensus_device_count += 1
+            else:
+                bucket.consensus_gloo_ms += elapsed_ms
+                bucket.consensus_gloo_count += 1
+
+    def _ownership_emit(
+        self, code: str, layer_idx: int, slot: int, detail: str
+    ) -> Optional[Exception]:
+        # The exception object is merged by the caller into the existing TP
+        # consensus error channel; no new collective is ever added.
+        if self._ownership_level == 0:
+            return None
+        message = (
+            f"KT slot ownership invariant {code} violated: {detail} "
+            f"(layer={layer_idx} slot={slot} epoch={self.epoch})"
+        )
+        key = (code, layer_idx, slot, self.epoch)
+        if key not in self._ownership_warned:
+            self._ownership_warned.add(key)
+            logger.warning(message)
+        if self._ownership_level == 1:
+            return RuntimeError(message)
+        return None
+
+    def _ownership_state_check(self, slot, layer_idx) -> Optional[Exception]:
+        # Assert D: reuse_guard automaton + epoch monotonicity at the start
+        # of a load generation.  Prime loads carry no guard and are out of
+        # scope; the skip reason is logged once per process.
+        if self._ownership_level == 0:
+            return None
+        guard = getattr(slot, "reuse_guard", None)
+        if guard is None:
+            if not self._ownership_prime_logged:
+                self._ownership_prime_logged = True
+                logger.debug(
+                    "KT slot ownership D covers the first update window "
+                    "onward; prime loads carry no reuse_guard"
+                )
+        elif guard not in ("consumed", "ready", "raw", "synchronized"):
+            return self._ownership_emit(
+                "D",
+                layer_idx,
+                slot.index,
+                f"unexpected reuse_guard={guard!r} at load start",
+            )
+        if self.epoch < slot.epoch:
+            return self._ownership_emit(
+                "D",
+                layer_idx,
+                slot.index,
+                f"epoch rewound from {slot.epoch} to {self.epoch}",
+            )
+        return None
+
+    def _ownership_record_host_slot(
+        self, layer_idx: int, position: int, host_slot: int
+    ) -> Optional[Exception]:
+        # Asserts A + B/E, called after this position's host-slot sync and
+        # before TP0's SHM overwrite.  A violation leaves the shadow
+        # untouched because its coordinates are themselves suspect.
+        if self._ownership_level == 0:
+            return None
+        if host_slot not in (0, 1) or host_slot != position % 2:
+            return self._ownership_emit(
+                "A",
+                layer_idx,
+                host_slot if host_slot in (0, 1) else -1,
+                f"host_slot={host_slot} does not match position {position}",
+            )
+        owner = self._host_slot_owner[host_slot]
+        if (
+            owner is not None
+            and owner[0] == self.epoch
+            and not self._host_slot_freed[host_slot]
+        ):
+            return self._ownership_emit(
+                "B",
+                layer_idx,
+                host_slot,
+                f"host slot still owned by layer={owner[1]} "
+                f"position={owner[2]} without a free-sync",
+            )
+        self._host_slot_owner[host_slot] = (self.epoch, layer_idx, position)
+        self._host_slot_freed[host_slot] = False
+        return None
+
+    def _flush_stats_chunk(self, partial: bool) -> None:
+        chunk = self._stats_chunk
+        if chunk is None:
+            return
+        self._stats_chunk = None
+        self._stats_span_layer = None
+        try:
+            self._write_stats_chunk(chunk, partial)
+        except Exception as exc:
+            # Stats must never break the hot path; throttle repeat failures.
+            _prefill_stats_io_warn("flush", exc)
+
+    def _write_stats_chunk(self, chunk: _PrefillChunkStats, partial: bool) -> None:
+        wall_ms = (time.perf_counter_ns() - chunk.t_start_ns) / 1e6
+        totals_ms = {name: 0.0 for name in _PREFILL_STATS_FIELDS_MS}
+        totals_count = {
+            "consensus_gloo_count": 0,
+            "consensus_device_count": 0,
+            "churn_in": 0,
+            "churn_out": 0,
+        }
+        bytes_h2d = 0
+        bytes_expected = 0
+        for bucket in chunk.layers.values():
+            for name in _PREFILL_STATS_FIELDS_MS:
+                totals_ms[name] += getattr(bucket, name)
+            for name in totals_count:
+                totals_count[name] += getattr(bucket, name)
+            bytes_h2d += bucket.bytes_h2d
+            bytes_expected += bucket.bytes_expected
+        accounted_ms = sum(totals_ms.values())
+        unaccounted_ms = wall_ms - accounted_ms
+        warnings: List[str] = []
+        if bytes_h2d != bytes_expected:
+            warnings.append(
+                f"bytes_h2d={bytes_h2d} != bytes_expected={bytes_expected}"
+            )
+        if wall_ms > 0 and unaccounted_ms > 0.1 * wall_ms:
+            warnings.append(
+                f"unaccounted_ms={unaccounted_ms:.1f} > 10% of "
+                f"wall_ms={wall_ms:.1f}"
+            )
+        gbytes = bytes_h2d / 1e9
+        stall_s = totals_ms["h2d_stall_ms"] / 1e3
+        enqueue_s = totals_ms["h2d_enqueue_ms"] / 1e3
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "host": socket.gethostname(),
+            "tp_rank": chunk.tp_rank,
+            "epoch": chunk.epoch,
+            "path": "manager",
+            "wall_ms": round(wall_ms, 3),
+            "partial": partial,
+            "totals_ms": {
+                name: round(totals_ms[name], 3)
+                for name in _PREFILL_STATS_FIELDS_MS
+            },
+            "totals_count": totals_count,
+            "layers": {
+                str(layer_idx): msgspec.structs.asdict(bucket)
+                for layer_idx, bucket in sorted(chunk.layers.items())
+            },
+            "bytes_h2d": bytes_h2d,
+            "bytes_expected": bytes_expected,
+            "effective_pcie_gbps_stall": (
+                gbytes / stall_s if stall_s > 0 else None
+            ),
+            "effective_pcie_gbps_enqueue_upper_bound": (
+                gbytes / enqueue_s if enqueue_s > 0 else None
+            ),
+            "unaccounted_ms": round(unaccounted_ms, 3),
+            # Known unaccounted members; re-verify when brackets move.
+            "unaccounted_declared": [
+                "gpu_experts_mask .item() scan loop",
+                "consensus control overhead outside the span body",
+                "small runtime primitives and Python launch gaps",
+            ],
+            "warnings": warnings,
+        }
+        path = _kt_prefill_stats_path(chunk.tp_rank, chunk.tp_size)
+        if path is None:
+            if chunk.tp_rank == 0:
+                logger.info(
+                    "KT prefill stats: epoch=%d partial=%d wall_ms=%.3f "
+                    "host_write_ms=%.3f gloo_ms=%.3f device_ms=%.3f "
+                    "h2d_stall_ms=%.3f d2d_enqueue_ms=%.3f "
+                    "h2d_enqueue_ms=%.3f postprocess_ms=%.3f "
+                    "hotupdate_ms=%.3f bytes_h2d=%d bytes_expected=%d "
+                    "unaccounted_ms=%.3f warnings=%s",
+                    chunk.epoch,
+                    int(partial),
+                    wall_ms,
+                    totals_ms["host_write_ms"],
+                    totals_ms["consensus_gloo_ms"],
+                    totals_ms["consensus_device_ms"],
+                    totals_ms["h2d_stall_ms"],
+                    totals_ms["gpu_expert_d2d_enqueue_ms"],
+                    totals_ms["h2d_enqueue_ms"],
+                    totals_ms["postprocess_ms"],
+                    totals_ms["hotupdate_ms"],
+                    bytes_h2d,
+                    bytes_expected,
+                    unaccounted_ms,
+                    warnings,
+                )
+            return
+        _kt_prefill_stats_rotate(path, _kt_prefill_stats_max_bytes())
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=True) + "\n")
 
     def _find_ready_slot(self, layer_idx: int) -> Optional[_Mxfp4PrefillSlot]:
         for slot in self.slots:
@@ -2015,12 +2507,13 @@ class _Mxfp4LayerwisePrefillManager:
     def _commit_tp_runtime_phase(
         self, local_error: Optional[Exception], phase: str
     ) -> None:
-        if self._tp_phase_succeeded(local_error is None):
-            return
-        message = f"MXFP4 {phase} failed on at least one TP rank"
-        if local_error is not None:
-            raise RuntimeError(message) from local_error
-        raise RuntimeError(message)
+        with self._stats_consensus_span(device=False):
+            if self._tp_phase_succeeded(local_error is None):
+                return
+            message = f"MXFP4 {phase} failed on at least one TP rank"
+            if local_error is not None:
+                raise RuntimeError(message) from local_error
+            raise RuntimeError(message)
 
     def _tp_device_phase_succeeded(self, local_success: bool) -> bool:
         """Fast TP consensus for the per-expert transport control plane.
@@ -2052,12 +2545,13 @@ class _Mxfp4LayerwisePrefillManager:
     def _commit_tp_device_runtime_phase(
         self, local_error: Optional[Exception], phase: str
     ) -> None:
-        if self._tp_device_phase_succeeded(local_error is None):
-            return
-        message = f"MXFP4 {phase} failed on at least one TP rank"
-        if local_error is not None:
-            raise RuntimeError(message) from local_error
-        raise RuntimeError(message)
+        with self._stats_consensus_span(device=True):
+            if self._tp_device_phase_succeeded(local_error is None):
+                return
+            message = f"MXFP4 {phase} failed on at least one TP rank"
+            if local_error is not None:
+                raise RuntimeError(message) from local_error
+            raise RuntimeError(message)
 
     def _submit_host_write(self, method, expert_id: int, host_slot: int) -> None:
         buffers = self.context.cpu_buffers
@@ -2075,21 +2569,25 @@ class _Mxfp4LayerwisePrefillManager:
         def rank_pointers(name: str) -> List[int]:
             return [ptr + offsets[name] for ptr in pointers[name]]
 
-        method.wrapper.submit_write_weight_scale_to_buffer(
-            get_tensor_model_parallel_world_size(),
-            expert_id,
-            rank_pointers("w13_weight"),
-            rank_pointers("w13_weight_scale_inv"),
-            rank_pointers("w2_weight"),
-            rank_pointers("w2_weight_scale_inv"),
-        )
-        method.wrapper.sync_write_weight_scale_to_buffer()
+        with _stats_span(
+            self._stats_chunk, self._stats_span_layer, "host_write_ms"
+        ):
+            method.wrapper.submit_write_weight_scale_to_buffer(
+                get_tensor_model_parallel_world_size(),
+                expert_id,
+                rank_pointers("w13_weight"),
+                rank_pointers("w13_weight_scale_inv"),
+                rank_pointers("w2_weight"),
+                rank_pointers("w2_weight_scale_inv"),
+            )
+            method.wrapper.sync_write_weight_scale_to_buffer()
 
     def _postprocess_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         from sglang.srt.layers.quantization.v4_marlin_moe import (
             prepare_v4_mxfp4_marlin,
         )
 
+        stats_t0 = _stats_now(self._stats_chunk)
         with torch.cuda.stream(self.postprocess_stream):
             self.postprocess_stream.wait_event(slot.raw_ready_event)
             try:
@@ -2113,6 +2611,9 @@ class _Mxfp4LayerwisePrefillManager:
                     self.postprocess_stream.synchronize()
                     slot.reuse_guard = "synchronized"
                     raise
+        _stats_note_ms(
+            self._stats_chunk, self._stats_span_layer, "postprocess_ms", stats_t0
+        )
 
     def _load_slot(
         self,
@@ -2142,10 +2643,23 @@ class _Mxfp4LayerwisePrefillManager:
         # prior generation only in the local variable above so an exception
         # after partially enqueueing this load cannot mistake an old ready
         # fence for protection of the new DMA.
+        # Assert D reads the previous generation's guard, so it must run
+        # before the "loading" overwrite below.
+        ownership_error = self._ownership_state_check(slot, layer_idx)
         slot.reuse_guard = "loading"
         slot.state = "LOADING"
         slot.layer_idx = layer_idx
         slot.epoch = self.epoch
+
+        # Successor prefetch runs under the previous layer's apply: own the
+        # span attribution inside the load, not at the apply callsite.
+        self._stats_span_layer = layer_idx
+        stats_chunk = self._stats_chunk
+        stats_expert_bytes = (
+            _mxfp4_prefill_expert_bytes(self.context.cpu_buffers)
+            if stats_chunk is not None
+            else 0
+        )
 
         saved_affinity = None
         try:
@@ -2167,6 +2681,13 @@ class _Mxfp4LayerwisePrefillManager:
                     else:
                         cpu_expert_ids.append(expert_id)
 
+                if stats_chunk is not None:
+                    stats_bucket = stats_chunk.layer_bucket(layer_idx)
+                    stats_bucket.experts_cpu = len(cpu_expert_ids)
+                    stats_bucket.bytes_expected = (
+                        len(cpu_expert_ids) * stats_expert_bytes
+                    )
+
                 if hasattr(os, "sched_getaffinity"):
                     saved_affinity = os.sched_getaffinity(0)
                     available_cpus = sorted(saved_affinity)
@@ -2177,6 +2698,8 @@ class _Mxfp4LayerwisePrefillManager:
                         os.sched_setaffinity(0, {target})
             except Exception as exc:
                 setup_error = exc
+            if setup_error is None:
+                setup_error = ownership_error
             self._commit_tp_runtime_phase(
                 setup_error, f"transport setup for layer {layer_idx}"
             )
@@ -2184,12 +2707,17 @@ class _Mxfp4LayerwisePrefillManager:
             gpu_copy_error = None
             try:
                 with torch.cuda.stream(self.transfer_stream):
+                    stall_t0 = _stats_now(stats_chunk)
                     if reuse_guard == "consumed":
                         self.transfer_stream.wait_event(slot.consumed_event)
                     elif reuse_guard == "ready":
                         self.transfer_stream.wait_event(slot.ready_event)
                     elif reuse_guard == "raw":
                         self.transfer_stream.wait_event(slot.raw_ready_event)
+                    _stats_note_ms(
+                        stats_chunk, layer_idx, "h2d_stall_ms", stall_t0
+                    )
+                    d2d_t0 = _stats_now(stats_chunk)
                     for expert_id in gpu_expert_ids:
                         gpu_index = method.logical_to_gpu_index[expert_id].item()
                         for name, _, destination in weight_infos:
@@ -2227,6 +2755,12 @@ class _Mxfp4LayerwisePrefillManager:
                                 destination_expert.copy_(
                                     source_expert, non_blocking=True
                                 )
+                    _stats_note_ms(
+                        stats_chunk,
+                        layer_idx,
+                        "gpu_expert_d2d_enqueue_ms",
+                        d2d_t0,
+                    )
             except Exception as exc:
                 gpu_copy_error = exc
             self._commit_tp_runtime_phase(
@@ -2245,8 +2779,15 @@ class _Mxfp4LayerwisePrefillManager:
                 host_free_error = pending_h2d_error
                 pending_h2d_error = None
                 try:
+                    stall_t0 = _stats_now(stats_chunk)
                     if self.host_slot_was_used[host_slot]:
                         self.host_slot_free_events[host_slot].synchronize()
+                        _stats_note_ms(
+                            stats_chunk, layer_idx, "h2d_stall_ms", stall_t0
+                        )
+                        # The previous owner's DMA is complete; release it
+                        # for the ownership record below.
+                        self._host_slot_freed[host_slot] = True
                 except Exception as exc:
                     if host_free_error is None:
                         host_free_error = exc
@@ -2255,8 +2796,14 @@ class _Mxfp4LayerwisePrefillManager:
                     f"host-slot {host_slot} reuse for expert {expert_id}",
                 )
 
-                write_error = None
-                if method.tp_rank == 0:
+                # Asserts A + B/E: the host-slot sync above released the
+                # previous owner, so the record runs before TP0 may
+                # overwrite the SHM slot (and gates that overwrite at
+                # enforce level).
+                write_error = self._ownership_record_host_slot(
+                    layer_idx, position, host_slot
+                )
+                if method.tp_rank == 0 and write_error is None:
                     try:
                         if method.wrapper is None:
                             raise RuntimeError(
@@ -2275,6 +2822,7 @@ class _Mxfp4LayerwisePrefillManager:
                 )
 
                 host_free_recorded = False
+                enqueue_t0 = _stats_now(stats_chunk)
                 try:
                     with torch.cuda.stream(self.transfer_stream):
                         try:
@@ -2282,6 +2830,19 @@ class _Mxfp4LayerwisePrefillManager:
                                 destination[expert_id].copy_(
                                     cpu_buffer[host_slot], non_blocking=True
                                 )
+                            _stats_note_ms(
+                                stats_chunk,
+                                layer_idx,
+                                "h2d_enqueue_ms",
+                                enqueue_t0,
+                            )
+                            # Book per-expert payload only after this expert's
+                            # enqueue succeeded; a failed expert leaves
+                            # bytes_h2d below bytes_expected.
+                            if stats_chunk is not None:
+                                stats_chunk.layer_bucket(
+                                    layer_idx
+                                ).bytes_h2d += stats_expert_bytes
                         finally:
                             # Once any DMA may have been enqueued, a peer's
                             # failure must not make this rank forget the local
@@ -2307,10 +2868,14 @@ class _Mxfp4LayerwisePrefillManager:
             # The final expert has no successor, so combine its sticky status
             # with raw-fence publication and commit it once per layer.
             raw_ready_error = pending_h2d_error
+            fence_t0 = _stats_now(stats_chunk)
             try:
                 with torch.cuda.stream(self.transfer_stream):
                     slot.raw_ready_event.record(self.transfer_stream)
                 slot.reuse_guard = "raw"
+                _stats_note_ms(
+                    stats_chunk, layer_idx, "h2d_enqueue_ms", fence_t0
+                )
             except Exception as exc:
                 if raw_ready_error is None:
                     raw_ready_error = exc
@@ -2469,6 +3034,7 @@ class _Mxfp4LayerwisePrefillManager:
         # shadow context's raw tensors.
         if method.kt_config.kt_enable_dynamic_expert_update:
             dynamic_error = None
+            stats_t0 = _stats_now(self._stats_chunk)
             try:
                 torch.cuda.synchronize(self.device)
                 method._update_gpu_experts_from_batch(
@@ -2482,6 +3048,29 @@ class _Mxfp4LayerwisePrefillManager:
                 )
             except Exception as exc:
                 dynamic_error = exc
+            else:
+                _stats_note_ms(
+                    self._stats_chunk,
+                    self._stats_span_layer,
+                    "hotupdate_ms",
+                    stats_t0,
+                )
+                # Merge the churn tuple stashed by the update into this
+                # layer's bucket, then always clear: a stale tuple must not
+                # leak into a later epoch's attribution.
+                stats_chunk = self._stats_chunk
+                if (
+                    stats_chunk is not None
+                    and self._stats_span_layer is not None
+                    and method._kt_stats_pending_churn is not None
+                ):
+                    churn_in, churn_out = method._kt_stats_pending_churn
+                    churn_bucket = stats_chunk.layer_bucket(
+                        self._stats_span_layer
+                    )
+                    churn_bucket.churn_in += churn_in
+                    churn_bucket.churn_out += churn_out
+                method._kt_stats_pending_churn = None
             self._commit_tp_runtime_phase(
                 dynamic_error, f"dynamic expert update for layer {layer_idx}"
             )
@@ -2497,7 +3086,83 @@ class _Mxfp4LayerwisePrefillManager:
                 slot.index,
                 "prefetch-hit" if prefetch_hit else "prime",
             )
+        # The last registered layer closes the chunk: finalize AFTER the
+        # successor prefetch attempt so its spans are never lost.
+        if self.successor_layer_idx(layer_idx) is None:
+            self._stats_finalize_chunk()
         return result
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 layerwise prefill gate reasons
+#
+# Every silent gate between "user requested layerwise prefill" and the hybrid
+# fallback reports once per (family, code) via _kt_degrade_emit.  The boolean
+# wrappers stay bit-identical; only the warn-once reason chain is new.
+# ---------------------------------------------------------------------------
+
+_KT_DEGRADE_FAMILY = "mxfp4_layerwise_prefill"
+_KT_DEGRADE_FAMILY_KV_BUDGET = "mxfp4_kv_budget"
+
+# Reason codes returned by the *_reasoned gate twins.
+_KT_DEGRADE_NOT_REQUESTED = "not_requested"
+_KT_DEGRADE_V4_HELPERS_MISSING = "v4_helpers_missing"
+_KT_DEGRADE_CUDA_UNAVAILABLE = "cuda_unavailable"
+_KT_DEGRADE_GPU_METHOD_NOT_MXFP4 = "gpu_method_not_mxfp4"
+_KT_DEGRADE_RAW_NAMES_MISSING = "raw_names_missing"
+_KT_DEGRADE_RAW_SHAPE_UNALIGNED = "raw_shape_unaligned"
+_KT_DEGRADE_GPTOSS_ACTIVATION = "gptoss_activation"
+_KT_DEGRADE_TRITON_ENV_OVERRIDE = "triton_env_override"
+_KT_DEGRADE_DEVICE_CAPABILITY = "device_capability"
+_KT_DEGRADE_RAW_SOURCE_ABSENT = "raw_source_absent"
+_KT_DEGRADE_RAW_SOURCE_INCOMPLETE = "raw_source_incomplete"
+_KT_DEGRADE_KV_BUDGET_SKIPPED = "kv_budget_skipped"
+
+# Codes that describe a normal configuration outcome, not a degradation.
+_KT_DEGRADE_SILENT_CODES = frozenset({_KT_DEGRADE_NOT_REQUESTED})
+
+_KT_DEGRADE_MESSAGES = {
+    _KT_DEGRADE_NOT_REQUESTED: "layerwise prefill not requested",
+    _KT_DEGRADE_V4_HELPERS_MISSING: "v4_marlin_moe prepared-weight helpers are unavailable",
+    _KT_DEGRADE_CUDA_UNAVAILABLE: "CUDA is not available on this host",
+    _KT_DEGRADE_GPU_METHOD_NOT_MXFP4: "active GPU MoE method is not MXFP4",
+    _KT_DEGRADE_RAW_NAMES_MISSING: "layer lacks the DeepSeek V4 _inv raw weight contract",
+    _KT_DEGRADE_RAW_SHAPE_UNALIGNED: "raw MXFP4 dims are not 256/128 aligned whole-expert safe",
+    _KT_DEGRADE_GPTOSS_ACTIVATION: "GPT-OSS alpha/beta activation is unsupported by the V4 Marlin path",
+    _KT_DEGRADE_TRITON_ENV_OVERRIDE: "SGLANG_V4_USE_TRITON_KERNELS override active",
+    _KT_DEGRADE_DEVICE_CAPABILITY: "GPU compute capability is not SM89/SM120",
+    _KT_DEGRADE_RAW_SOURCE_ABSENT: "canonical raw MXFP4 weights were not preserved for this layer",
+    _KT_DEGRADE_RAW_SOURCE_INCOMPLETE: "canonical raw MXFP4 weights are incomplete",
+    _KT_DEGRADE_KV_BUDGET_SKIPPED: "KV-cache reservation for the lazy layerwise slots was skipped",
+}
+
+_KT_DEGRADE_EMITTED = set()
+
+# Latch once at import: a mid-run env flip must not change gate behavior
+# between layer registrations.
+_V4_TRITON_ENV_LATCHED = os.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
+_V4_TRITON_STRICT_OPTOUT = (
+    os.environ.get("SGLANG_KT_V4_TRITON_STRICT_OPTOUT") == "1"
+)
+
+
+def _kt_degrade_emit(family: str, code: str, detail: str = "") -> None:
+    """Warn once per (family, code) on rank 0; a no-op for silent codes."""
+    if code in _KT_DEGRADE_SILENT_CODES:
+        return
+    if os.environ.get("SGLANG_KT_SUPPRESS_DEGRADE_WARN") == "1":
+        return
+    key = (family, code)
+    if key in _KT_DEGRADE_EMITTED:
+        return
+    _KT_DEGRADE_EMITTED.add(key)
+    if dist.is_initialized() and get_tensor_model_parallel_rank() != 0:
+        return
+    message = _KT_DEGRADE_MESSAGES.get(code, code)
+    first_line = detail.splitlines()[0] if detail else ""
+    if first_line:
+        message = f"{message} ({first_line})"
+    logger.warning("[KT-DEGRADE] %s.%s: %s", family, code, message)
 
 
 def _mxfp4_pipeline_signature(method, layer: torch.nn.Module) -> tuple:
@@ -2511,19 +3176,28 @@ def _mxfp4_pipeline_signature(method, layer: torch.nn.Module) -> tuple:
     )
 
 
-def _mxfp4_pipeline_requested(method) -> bool:
+def _mxfp4_pipeline_requested_reasoned(method):
+    """(ok, reason) twin of _mxfp4_pipeline_requested."""
     requested = (
         method.gpu_prefill_token_threshold > 0
         and (method.kt_config.method or "").upper() == "MXFP4"
     )
     if not requested:
-        return False
+        return False, (_KT_DEGRADE_NOT_REQUESTED, "")
+    helpers_ok, helpers_reason = _mxfp4_v4_helpers_available_reasoned()
+    if not helpers_ok:
+        return False, helpers_reason
+    return True, None
 
-    return _mxfp4_v4_helpers_available()
+
+def _mxfp4_pipeline_requested(method) -> bool:
+    ok, reason = _mxfp4_pipeline_requested_reasoned(method)
+    if not ok:
+        _kt_degrade_emit(_KT_DEGRADE_FAMILY, reason[0], reason[1])
+    return ok
 
 
 _MXFP4_V4_HELPERS_AVAILABLE: Optional[bool] = None
-_MXFP4_V4_HELPERS_WARNING_EMITTED = False
 
 
 def _mxfp4_v4_helpers_available() -> bool:
@@ -2548,9 +3222,25 @@ def _mxfp4_v4_helpers_available() -> bool:
     return _MXFP4_V4_HELPERS_AVAILABLE
 
 
-def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
-    if not _mxfp4_pipeline_requested(method) or not torch.cuda.is_available():
-        return False
+def _mxfp4_v4_helpers_available_reasoned():
+    """(ok, reason) twin of _mxfp4_v4_helpers_available."""
+    if _mxfp4_v4_helpers_available():
+        return True, None
+    return False, (
+        _KT_DEGRADE_V4_HELPERS_MISSING,
+        "prepare_v4_mxfp4_marlin/get_v4_mxfp4_marlin_storage_nbytes/"
+        "allocate_v4_mxfp4_marlin",
+    )
+
+
+def _mxfp4_pipeline_backend_supported_reasoned(method, layer: torch.nn.Module):
+    """(ok, reason) twin of _mxfp4_pipeline_backend_supported."""
+    layer_idx = method.kt_config.layer_idx
+    requested_ok, requested_reason = _mxfp4_pipeline_requested_reasoned(method)
+    if not requested_ok:
+        return False, requested_reason
+    if not torch.cuda.is_available():
+        return False, (_KT_DEGRADE_CUDA_UNAVAILABLE, f"layer {layer_idx}")
     gpu_method = method.gpu_method
     is_mxfp4_method = (
         "mxfp4" in gpu_method.__class__.__name__.lower()
@@ -2558,13 +3248,22 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
         or getattr(getattr(gpu_method, "_fp8", None), "is_fp4_expert", False)
     )
     if not is_mxfp4_method:
-        return False
+        return False, (
+            _KT_DEGRADE_GPU_METHOD_NOT_MXFP4,
+            f"layer {layer_idx}: {gpu_method.__class__.__name__}",
+        )
     # The prepared KT path targets the DeepSeek V4 checkpoint contract.  The
     # generic MXFP4 quantization method in current SGLang uses
     # ``w13_weight_scale``/``w2_weight_scale`` and a different runner; it must
     # remain on its native backend instead of entering this `_inv`-tensor path.
-    if not all(hasattr(layer, name) for name in _Mxfp4PrefillSlot.RAW_NAMES):
-        return False
+    raw_missing = [
+        name for name in _Mxfp4PrefillSlot.RAW_NAMES if not hasattr(layer, name)
+    ]
+    if raw_missing:
+        return False, (
+            _KT_DEGRADE_RAW_NAMES_MISSING,
+            f"layer {layer_idx}: missing {raw_missing}",
+        )
     # The shadow Marlin method pads hidden/intermediate dimensions to
     # 256/128 respectively.  The layerwise copier intentionally performs
     # whole-expert copies, so only the already-aligned DSV4 layout is safe.
@@ -2578,7 +3277,12 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
         or w13.shape[2] * 2 % 256 != 0
         or w2.shape[2] * 2 % 128 != 0
     ):
-        return False
+        w13_shape = None if w13 is None else tuple(w13.shape)
+        w2_shape = None if w2 is None else tuple(w2.shape)
+        return False, (
+            _KT_DEGRADE_RAW_SHAPE_UNALIGNED,
+            f"layer {layer_idx}: w13{w13_shape} w2{w2_shape}",
+        )
     runner_config = getattr(method, "moe_runner_config", None)
     if runner_config is not None and (
         getattr(runner_config, "gemm1_alpha", None) not in (None, 0, 0.0)
@@ -2586,22 +3290,65 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
     ):
         # The V4 helper implements plain SiLU/SwiGLU (with the optional
         # V4 clamp), not the GPT-OSS alpha/beta activation variant.
-        return False
+        return False, (_KT_DEGRADE_GPTOSS_ACTIVATION, f"layer {layer_idx}")
     # Respect both diagnostic overrides.  The default capability-driven path
     # uses the prepared Marlin backend on Ada and Blackwell consumer GPUs.
-    if os.environ.get("SGLANG_V4_USE_TRITON_KERNELS") in ("0", "1"):
-        return False
+    # SGLANG_KT_V4_TRITON_STRICT_OPTOUT=1 narrows the opt-out to "=1" only;
+    # default keeps the legacy "any set value opts out" behavior.
+    if _V4_TRITON_STRICT_OPTOUT:
+        triton_override = _V4_TRITON_ENV_LATCHED == "1"
+    else:
+        triton_override = _V4_TRITON_ENV_LATCHED in ("0", "1")
+    if triton_override:
+        return False, (
+            _KT_DEGRADE_TRITON_ENV_OVERRIDE,
+            f"layer {layer_idx}: SGLANG_V4_USE_TRITON_KERNELS="
+            f"{_V4_TRITON_ENV_LATCHED!r}",
+        )
     device = next(layer.parameters()).device
-    return torch.cuda.get_device_capability(device) in ((8, 9), (12, 0))
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((8, 9), (12, 0)):
+        return False, (
+            _KT_DEGRADE_DEVICE_CAPABILITY,
+            f"layer {layer_idx}: sm{capability[0]}{capability[1]}",
+        )
+    return True, None
+
+
+def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
+    ok, reason = _mxfp4_pipeline_backend_supported_reasoned(method, layer)
+    if not ok:
+        _kt_degrade_emit(_KT_DEGRADE_FAMILY, reason[0], reason[1])
+    return ok
+
+
+def _mxfp4_pipeline_runtime_supported_reasoned(method, layer: torch.nn.Module):
+    """(ok, reason) twin of _mxfp4_pipeline_runtime_supported."""
+    backend_ok, backend_reason = _mxfp4_pipeline_backend_supported_reasoned(
+        method, layer
+    )
+    if not backend_ok:
+        return False, backend_reason
+    raw_source = getattr(layer, "_kt_mxfp4_raw_weights", None)
+    layer_idx = method.kt_config.layer_idx
+    if raw_source is None:
+        return False, (_KT_DEGRADE_RAW_SOURCE_ABSENT, f"layer {layer_idx}")
+    source_missing = [
+        name for name in _Mxfp4PrefillSlot.RAW_NAMES if name not in raw_source
+    ]
+    if source_missing:
+        return False, (
+            _KT_DEGRADE_RAW_SOURCE_INCOMPLETE,
+            f"layer {layer_idx}: missing {source_missing}",
+        )
+    return True, None
 
 
 def _mxfp4_pipeline_runtime_supported(method, layer: torch.nn.Module) -> bool:
-    raw_source = getattr(layer, "_kt_mxfp4_raw_weights", None)
-    return (
-        _mxfp4_pipeline_backend_supported(method, layer)
-        and raw_source is not None
-        and all(name in raw_source for name in _Mxfp4PrefillSlot.RAW_NAMES)
-    )
+    ok, reason = _mxfp4_pipeline_runtime_supported_reasoned(method, layer)
+    if not ok:
+        _kt_degrade_emit(_KT_DEGRADE_FAMILY, reason[0], reason[1])
+    return ok
 
 
 def _mxfp4_raw_slot_storage_nbytes(
@@ -2652,7 +3399,18 @@ def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
 
         first_layer_idx = min(registry)
         method, layer = registry[first_layer_idx]
-        if not _mxfp4_pipeline_runtime_supported(method, layer):
+        runtime_ok, runtime_reason = _mxfp4_pipeline_runtime_supported_reasoned(
+            method, layer
+        )
+        if not runtime_ok:
+            detail = f"layer {first_layer_idx}: {runtime_reason[0]}"
+            if runtime_reason[1]:
+                detail = f"{detail}; {runtime_reason[1]}"
+            _kt_degrade_emit(
+                _KT_DEGRADE_FAMILY_KV_BUDGET,
+                _KT_DEGRADE_KV_BUDGET_SKIPPED,
+                detail,
+            )
             continue
 
         num_experts = getattr(method, "global_num_experts", None)
@@ -3813,6 +4571,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
+        # Churn tuple stashed by the dynamic update; the layerwise manager's
+        # apply merges it into the chunk ledger and clears it.  None = none.
+        self._kt_stats_pending_churn: Optional[Tuple[int, int]] = None
         if self.kt_expert_lora_enabled:
             if self.num_gpu_experts != 0:
                 raise ValueError(
@@ -4024,16 +4785,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Args:
             layer: The MoE layer module
         """
-        if (
-            (self.kt_config.method or "").upper() == "MXFP4"
-            and self.kt_config.kt_enable_dynamic_expert_update
-            and not _mxfp4_pipeline_backend_supported(self, layer)
+        if (self.kt_config.method or "").upper() == "MXFP4" and (
+            self.kt_config.kt_enable_dynamic_expert_update
         ):
-            raise ValueError(
-                "MXFP4 dynamic expert update requires the supported KT Marlin "
-                "V4 layerwise contract: CUDA SM89/SM120, native _scale_inv "
-                "weights, aligned dimensions, and plain SiLU activation."
+            backend_ok, backend_reason = _mxfp4_pipeline_backend_supported_reasoned(
+                self, layer
             )
+            if not backend_ok:
+                raise ValueError(
+                    "MXFP4 dynamic expert update requires the supported KT Marlin "
+                    "V4 layerwise contract: CUDA SM89/SM120, native _scale_inv "
+                    "weights, aligned dimensions, and plain SiLU activation. "
+                    f"Gate reason: {_KT_DEGRADE_FAMILY}.{backend_reason[0]}"
+                    + (f" ({backend_reason[1]})" if backend_reason[1] else "")
+                )
 
         # Preserve the checkpoint-native resident expert image before the
         # selected current backend performs an in-place scale/weight shuffle.
@@ -4517,7 +5282,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
                 if self.tp_rank == 0:
                     logger.info(
-                        "KT layerwise prefill: layer %d compute = %.2f ms, expert update = %.2f ms",
+                        "KT full-GPU fallback: layer %d compute = %.2f ms, expert update = %.2f ms",
                         self.kt_config.layer_idx,
                         compute_time,
                         update_time,
@@ -4525,7 +5290,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             else:
                 if self.tp_rank == 0:
                     logger.info(
-                        "KT layerwise prefill: layer %d compute = %.2f ms",
+                        "KT full-GPU fallback: layer %d compute = %.2f ms",
                         self.kt_config.layer_idx,
                         compute_time,
                     )
@@ -4788,6 +5553,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # CRITICAL: Use .copy_() for CUDA tensors to maintain same buffer for CUDA graph compatibility
         # CUDA graph captures tensor memory addresses during decode phase, so we must update
         # in-place rather than replacing the tensor reference
+        if _kt_prefill_stats_enabled():
+            # Both masks are CPU bool tensors; diff them BEFORE the rebind.
+            # Hamming distance is kept decomposed (in/out) per the plan so a
+            # direction-skewed churn stays visible.
+            self._kt_stats_pending_churn = (
+                int((gpu_experts_mask_cpu & ~self.gpu_experts_mask).sum()),
+                int((self.gpu_experts_mask & ~gpu_experts_mask_cpu).sum()),
+            )
         self.gpu_experts_mask = gpu_experts_mask_cpu  # CPU tensor, safe to replace
         self.gpu_experts_mask_cuda.copy_(gpu_experts_mask_cpu)  # In-place update for CUDA graph
         self.logical_to_gpu_index = logical_to_gpu_index_cuda.cpu()  # CPU version for weight loading
