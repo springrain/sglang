@@ -76,6 +76,26 @@ mid-run setenv takes effect on the next chunk):
         the guard automaton from each round's first update window onward;
         the round's prime (first) loads carry guard=None and are outside
         D's scope by design.
+      SGLANG_KT_PREFILL_BATCH_DMA=0|1
+        Route the per-expert H2D enqueue through the run planner
+        (default off).  Read inline at each _load_slot.  Zero new
+        consensus sites and zero new DRAM; the legacy path is the
+        rollback surface.
+      SGLANG_KT_PREFILL_STAGE_LAYER_WINDOW=0|1|2
+        Whole-layer staging windows: 0=off (default), 1=single window,
+        2=double window pipeline.  Read ONCE at init and frozen via an
+        all-rank MIN; changing it requires a restart (runtime flips warn
+        once and keep the frozen value).
+      SGLANG_KT_PREFILL_BATCH_DMA_DEBUG=0|1
+        Debug hooks for the window load path (default off).  Frozen into
+        the staging geometry at init via an all-rank MAX so ranks can
+        never disagree inside collectives.
+      SGLANG_KT_PREFILL_BYTE_CANARY=0|1
+        Registration alias of *_BATCH_DMA_DEBUG; both feed the same
+        frozen debug flag, so either one enables the hooks.
+      SGLANG_KT_PREFILL_NO_BATCH_MEMCPY=0|1
+        Reserved for a later batched-cudaMemcpy phase; inert today.
+        Registered so the name cannot be reused with another meaning.
 """
 
 import bisect
@@ -83,10 +103,12 @@ import contextlib
 import copy
 import ctypes
 import gc
+import hashlib
 import json
 import logging
 import os
 import socket
+import sys
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -428,6 +450,17 @@ class SharedFullContext:
         # has successfully allocated both GPU layer slots.  This keeps an OOM
         # on one rank from stranding peers inside an SHM collective.
         self._cpu_buffers_initialized = False
+
+        # Frozen after successful staging-window setup; None means the
+        # legacy dual-slot path.  Built by _create_staging_windows.
+        self._staging_geometry: Optional["_StagingWindowGeometry"] = None
+        # Staging-window twin of the SHM bank state above; empty/None until
+        # _create_staging_windows succeeds.
+        self.staging_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self.all_rank_staging_ptrs: Optional[Dict[str, List[int]]] = None
+        self._staging_shm_handles: Dict[str, shared_memory.SharedMemory] = {}
+        self._staging_opened_shm_refs: Dict[str, shared_memory.SharedMemory] = {}
+        self._staging_registered_host_buffers: List[torch.Tensor] = []
         if not defer_cpu_buffers:
             self.initialize_cpu_buffers()
 
@@ -442,6 +475,8 @@ class SharedFullContext:
         if self._cpu_buffers_initialized:
             return
         self._create_cpu_buffers()
+        if getattr(self, "_is_mxfp4_quant", False):
+            self._create_staging_windows()
         self._cpu_buffers_initialized = True
 
     def _init_mxfp8_aux(self) -> None:
@@ -918,15 +953,14 @@ class SharedFullContext:
                 gpu_tensor = getattr(self.gpu_layer, name)
                 # Only allocate 2 experts worth of buffer (double buffering)
                 expert_shape = gpu_tensor.shape[1:]  # Shape per expert
-                if (
-                    getattr(self, "_is_mxfp4_quant", False)
-                    and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
-                ):
-                    buf_dtype = torch.bfloat16
-                else:
-                    buf_dtype = gpu_tensor.dtype
-                element_size = torch.empty((), dtype=buf_dtype).element_size()
-                expert_nbytes = gpu_tensor.numel() // num_experts * element_size
+                buf_dtype = _shm_bank_buf_dtype(
+                    getattr(self, "_is_mxfp4_quant", False),
+                    name,
+                    gpu_tensor.dtype,
+                )
+                expert_nbytes = _shm_bank_expert_nbytes(
+                    buf_dtype, gpu_tensor.numel() // num_experts
+                )
                 double_buf_nbytes = expert_nbytes * 2
 
                 shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
@@ -1012,6 +1046,299 @@ class SharedFullContext:
                 all_rank_ptrs[name].append(ptr)
 
         return all_rank_ptrs
+
+    def _commit_staging_phase(
+        self, local_error: Optional[Exception], phase: str
+    ) -> bool:
+        # Soft-degrade twin of _commit_cpu_buffer_phase: identical MIN
+        # verdict, but a window failure falls back to the legacy dual-slot
+        # path with one warning instead of raising.
+        if _all_tp_ranks_succeeded(local_error is None):
+            return True
+        self._cleanup_staging_after_failure()
+        logger.warning(
+            "KT staging-window %s failed on at least one TP rank; "
+            "falling back to the legacy dual-slot path",
+            phase,
+            exc_info=local_error,
+        )
+        return False
+
+    def _cleanup_staging_after_failure(self) -> None:
+        """Best-effort symmetric cleanup for a failed staging setup phase."""
+        if torch.cuda.is_available():
+            for tensor in self._staging_registered_host_buffers:
+                try:
+                    torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+                except Exception:
+                    pass
+        self._staging_registered_host_buffers = []
+
+        # Drop exported torch buffers before closing their SharedMemory maps.
+        self.staging_buffers = None
+        gc.collect()
+
+        for shm in self._staging_opened_shm_refs.values():
+            try:
+                shm.close()
+            except Exception:
+                pass
+        self._staging_opened_shm_refs = {}
+
+        for shm in self._staging_shm_handles.values():
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            try:
+                shm.close()
+            except Exception:
+                pass
+        self._staging_shm_handles = {}
+        self.all_rank_staging_ptrs = None
+
+    def _negotiate_staging_window_mode(self) -> int:
+        # Restart-required: read once, frozen across ranks via MIN so no
+        # collective site can ever observe a mode mismatch.
+        mode = _stage_window_env_mode()
+        if (
+            not dist.is_initialized()
+            or get_tensor_model_parallel_world_size() == 1
+        ):
+            return mode
+        mode_tensor = torch.tensor([mode], dtype=torch.int32, device="cpu")
+        dist.all_reduce(
+            mode_tensor, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group
+        )
+        negotiated = int(mode_tensor.item())
+        if negotiated != mode:
+            logger.warning(
+                "SGLANG_KT_PREFILL_STAGE_LAYER_WINDOW=%d negotiated down to "
+                "%d to match every TP rank",
+                mode,
+                negotiated,
+            )
+        return negotiated
+
+    def _build_staging_geometry(self, mode: int) -> "_StagingWindowGeometry":
+        # The debug-flag freeze is a collective, so it must run before any
+        # local hard assertion below can skip it on one rank only.
+        debug_rows = _any_tp_rank_true(
+            os.environ.get("SGLANG_KT_PREFILL_BATCH_DMA_DEBUG", "0") == "1"
+            or os.environ.get("SGLANG_KT_PREFILL_BYTE_CANARY", "0") == "1"
+        )
+        num_experts = self.gpu_layer.num_experts
+        num_windows = mode
+        is_mxfp4 = getattr(self, "_is_mxfp4_quant", False)
+        strides: List[int] = []
+        expert_nbytes_list: List[int] = []
+        for name in _Mxfp4PrefillSlot.RAW_NAMES:
+            gpu_tensor = getattr(self.gpu_layer, name)
+            buf_dtype = _shm_bank_buf_dtype(is_mxfp4, name, gpu_tensor.dtype)
+            expert_numel = gpu_tensor.numel() // num_experts
+            expert_nbytes = _shm_bank_expert_nbytes(buf_dtype, expert_numel)
+            # Hard assert: the shared helper must reproduce the hand-written
+            # allocation formula byte for byte, bf16 scale tables included.
+            expected_dtype = (
+                torch.bfloat16
+                if is_mxfp4 and name in _SCALE_INV_BANKS
+                else gpu_tensor.dtype
+            )
+            expected_nbytes = (
+                expert_numel * torch.empty((), dtype=expected_dtype).element_size()
+            )
+            if expert_nbytes != expected_nbytes:
+                raise RuntimeError(
+                    f"staging stride mismatch for {name}: helper "
+                    f"{expert_nbytes} != formula {expected_nbytes}"
+                )
+            # Hard assert: 16-byte alignment is a run-merged DMA requirement.
+            if expert_nbytes % 16 != 0:
+                raise RuntimeError(
+                    f"staging expert size for {name} is {expert_nbytes} B, "
+                    "not 16-byte aligned"
+                )
+            strides.append(num_experts * expert_nbytes)
+            expert_nbytes_list.append(expert_nbytes)
+        # Banks below the run threshold stay in singleton mode; one warning
+        # per process regardless of how many banks are undersized.
+        undersized = [
+            name
+            for name, nbytes in zip(
+                _Mxfp4PrefillSlot.RAW_NAMES, expert_nbytes_list
+            )
+            if nbytes < _MIN_RUN_ENTRY_BYTES
+        ]
+        if undersized:
+            logger.warning(
+                "KT staging banks below the %d B run threshold stay "
+                "unmerged: %s",
+                _MIN_RUN_ENTRY_BYTES,
+                undersized,
+            )
+        total_rows = num_windows * num_experts
+        # Hard assert: the window row space must tile windows x experts
+        # exactly on every bank (recomputed from strides, not copied).
+        for name, stride, nbytes in zip(
+            _Mxfp4PrefillSlot.RAW_NAMES, strides, expert_nbytes_list
+        ):
+            if num_windows * stride != total_rows * nbytes:
+                raise RuntimeError(
+                    f"staging window rows for {name} do not tile "
+                    f"{num_windows} windows x {num_experts} experts"
+                )
+        total_nbytes = num_windows * sum(strides)
+        # Hard assert: every capacity source must fit the whole allocation.
+        sources = _staging_capacity_sources()
+        if sources is None:
+            raise RuntimeError(
+                "staging capacity probe failed; refusing window mode"
+            )
+        if not _staging_window_capacity_ok(total_nbytes, *sources):
+            raise RuntimeError(
+                f"staging windows need {total_nbytes} B but capacity "
+                f"sources are {sources}"
+            )
+        return _StagingWindowGeometry(
+            mode=mode,
+            num_windows=num_windows,
+            num_experts=num_experts,
+            bank_strides=tuple(strides),
+            bank_expert_nbytes=tuple(expert_nbytes_list),
+            bank_merge_ok=tuple(
+                nbytes >= _MIN_RUN_ENTRY_BYTES for nbytes in expert_nbytes_list
+            ),
+            total_nbytes=total_nbytes,
+            debug_rows=debug_rows,
+        )
+
+    def _allocate_staging_buffers(
+        self, geometry: "_StagingWindowGeometry"
+    ) -> Dict[str, torch.Tensor]:
+        tp_rank = get_tensor_model_parallel_rank()
+        buffers: Dict[str, torch.Tensor] = {}
+        total_rows = geometry.num_windows * geometry.num_experts
+        is_mxfp4 = getattr(self, "_is_mxfp4_quant", False)
+        for index, name in enumerate(_Mxfp4PrefillSlot.RAW_NAMES):
+            gpu_tensor = getattr(self.gpu_layer, name)
+            buf_dtype = _shm_bank_buf_dtype(is_mxfp4, name, gpu_tensor.dtype)
+            expert_shape = gpu_tensor.shape[1:]
+            alloc_nbytes = geometry.num_windows * geometry.bank_strides[index]
+            shm_name = f"kt_stage_{name}_r{tp_rank}_{self.shm_unique_id}"
+            shm = shared_memory.SharedMemory(
+                name=shm_name, create=True, size=alloc_nbytes
+            )
+            self._staging_shm_handles[name] = shm
+
+            # Shape: [num_windows * num_experts, ...expert_shape...]
+            cpu_buffer = torch.frombuffer(shm.buf, dtype=buf_dtype).reshape(
+                (total_rows,) + expert_shape
+            )
+
+            if torch.cuda.is_available():
+                register_result = torch.cuda.cudart().cudaHostRegister(
+                    cpu_buffer.data_ptr(), alloc_nbytes, 0
+                )
+                if int(register_result) != 0:
+                    raise RuntimeError(
+                        "cudaHostRegister failed for staging "
+                        f"{name} with error code {int(register_result)}"
+                    )
+                self._staging_registered_host_buffers.append(cpu_buffer)
+
+            buffers[name] = cpu_buffer
+        return buffers
+
+    def _collect_all_rank_staging_pointers(self) -> Dict[str, List[int]]:
+        """Collect staging buffer pointers from all ranks (TP0 maps peers)."""
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+        buffer_names = list(self.staging_buffers.keys())
+        all_rank_ptrs: Dict[str, List[int]] = {name: [] for name in buffer_names}
+        self._staging_opened_shm_refs = {}
+
+        for rank in range(tp_world_size):
+            for name in buffer_names:
+                if rank == tp_rank:
+                    ptr = self.staging_buffers[name].data_ptr()
+                elif tp_rank == 0:
+                    shm_name = f"kt_stage_{name}_r{rank}_{self.shm_unique_id}"
+                    try:
+                        shm = shared_memory.SharedMemory(name=shm_name)
+                        self._staging_opened_shm_refs[f"{name}_r{rank}"] = shm
+                        ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+                    except Exception:
+                        logger.error(
+                            "Rank %d: Failed to open staging shared memory '%s'",
+                            tp_rank,
+                            shm_name,
+                        )
+                        ptr = 0
+                else:
+                    ptr = 0
+                all_rank_ptrs[name].append(ptr)
+
+        return all_rank_ptrs
+
+    def _create_staging_windows(self) -> None:
+        """Negotiate and allocate whole-layer staging windows (mode >= 1).
+
+        Any setup failure degrades every rank uniformly to the legacy
+        dual-slot path: geometry stays None and exactly one warning is
+        emitted per process.
+        """
+        mode = self._negotiate_staging_window_mode()
+        if mode == 0:
+            return
+
+        geometry: Optional["_StagingWindowGeometry"] = None
+        geometry_error = None
+        try:
+            geometry = self._build_staging_geometry(mode)
+        except Exception as exc:
+            geometry_error = exc
+        if not self._commit_staging_phase(geometry_error, "geometry"):
+            return
+
+        allocation_error = None
+        try:
+            self.staging_buffers = self._allocate_staging_buffers(geometry)
+        except Exception as exc:
+            allocation_error = exc
+        if not self._commit_staging_phase(allocation_error, "allocation"):
+            return
+
+        pointer_error = None
+        try:
+            self.all_rank_staging_ptrs = (
+                self._collect_all_rank_staging_pointers()
+            )
+            if get_tensor_model_parallel_rank() == 0:
+                valid = all(
+                    len(ptrs) == get_tensor_model_parallel_world_size()
+                    and all(ptr > 0 for ptr in ptrs)
+                    for ptrs in self.all_rank_staging_ptrs.values()
+                )
+                if not valid:
+                    raise RuntimeError(
+                        "TP0 could not map every rank's staging buffer"
+                    )
+        except Exception as exc:
+            pointer_error = exc
+        if not self._commit_staging_phase(pointer_error, "pointer collection"):
+            return
+
+        # Unlink shared memory after all ranks have collected pointers.
+        # The memory remains accessible via the held mmap references.
+        for shm in self._staging_shm_handles.values():
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+
+        self._staging_geometry = geometry
 
     def _prepare_weight_int4(self, wrapper):
         """Prepare INT4 Marlin weights by writing from KT, copying to GPU, and postprocessing.
@@ -1880,6 +2207,112 @@ class SharedFullContext:
             )
 
 
+_MIN_RUN_ENTRY_BYTES = 1 << 18
+
+_SCALE_INV_BANKS = ("w13_weight_scale_inv", "w2_weight_scale_inv")
+
+
+def _shm_bank_buf_dtype(is_mxfp4_quant: bool, name: str, gpu_dtype):
+    # Same formula as the allocation site: MXFP4 scale tables are stored
+    # bf16 in SHM regardless of the GPU tensor dtype.
+    if is_mxfp4_quant and name in _SCALE_INV_BANKS:
+        return torch.bfloat16
+    return gpu_dtype
+
+
+def _shm_bank_expert_nbytes(buf_dtype, expert_numel: int) -> int:
+    return expert_numel * torch.empty((), dtype=buf_dtype).element_size()
+
+
+class _Mxfp4H2DCopyEntry(msgspec.Struct, frozen=True):
+    bank: int
+    src_row: int
+    dst_row: int
+    rows: int
+
+
+class _StagingWindowGeometry(msgspec.Struct, frozen=True):
+    # Frozen staging-window layout negotiated across ranks at init;
+    # changing it requires a restart.  Per-bank tuples follow RAW_NAMES.
+    mode: int
+    num_windows: int
+    num_experts: int
+    bank_strides: Tuple[int, ...]
+    bank_expert_nbytes: Tuple[int, ...]
+    bank_merge_ok: Tuple[bool, ...]
+    total_nbytes: int
+    # DEBUG/CANARY flags frozen via all-rank MAX at setup; ranks can never
+    # disagree about whether the per-window digest hook runs.
+    debug_rows: bool
+
+
+class _Mxfp4H2DBatchPlanner:
+    """Merges per-row H2D copies into contiguous runs when the bank allows it.
+
+    A run grows only while source and destination rows both stay
+    consecutive, so a GPU-resident hole (a dst gap) breaks every run.
+    """
+
+    def __init__(self, bank_count: int, bank_merge_ok: Tuple[bool, ...]) -> None:
+        self.bank_count = bank_count
+        self.bank_merge_ok = bank_merge_ok
+
+    def plan_layer(self, row_pairs) -> List[_Mxfp4H2DCopyEntry]:
+        # row_pairs must be ascending by (src_row, dst_row).  Output is
+        # sorted by (dst_row, bank) so the disable-merge case replays the
+        # legacy per-expert 4-bank enqueue order exactly.
+        runs: List[_Mxfp4H2DCopyEntry] = []
+        for bank in range(self.bank_count):
+            bank_runs: List[_Mxfp4H2DCopyEntry] = []
+            for src_row, dst_row in row_pairs:
+                if (
+                    bank_runs
+                    and self.bank_merge_ok[bank]
+                    and src_row == bank_runs[-1].src_row + bank_runs[-1].rows
+                    and dst_row == bank_runs[-1].dst_row + bank_runs[-1].rows
+                ):
+                    last = bank_runs[-1]
+                    bank_runs[-1] = _Mxfp4H2DCopyEntry(
+                        bank=bank,
+                        src_row=last.src_row,
+                        dst_row=last.dst_row,
+                        rows=last.rows + 1,
+                    )
+                else:
+                    bank_runs.append(
+                        _Mxfp4H2DCopyEntry(
+                            bank=bank, src_row=src_row, dst_row=dst_row, rows=1
+                        )
+                    )
+            runs.extend(bank_runs)
+        runs.sort(key=lambda entry: (entry.dst_row, entry.bank))
+        return runs
+
+
+def _assert_no_host_write_batch_on_dual_slot(geometry) -> None:
+    # The submit-all/single-sync host-write pattern is only fenced by the
+    # whole-window consensus; on the dual-slot path it would strand peers.
+    if geometry is None:
+        raise AssertionError(
+            "batched staging host writes require staging-window geometry"
+        )
+
+
+def _assert_h2d_plan_coverage(
+    entries: List[_Mxfp4H2DCopyEntry], bank_count: int, expected_rows: int
+) -> None:
+    # Structural guard before the first copy is enqueued; a mismatch means a
+    # planner bug, so it raises instead of using the sticky error channel.
+    rows = [0] * bank_count
+    for entry in entries:
+        rows[entry.bank] += entry.rows
+    if any(row_count != expected_rows for row_count in rows):
+        raise RuntimeError(
+            f"H2D plan covers {rows} rows per bank; expected {expected_rows} "
+            f"per bank on {bank_count} banks"
+        )
+
+
 class _Mxfp4PrefillSlot:
     """One complete MXFP4 layer image used by the layerwise prefill pipeline."""
 
@@ -2094,6 +2527,102 @@ def _kt_ownership_assert_level() -> int:
     return value
 
 
+_batch_dma_env_warned = False
+
+
+def _kt_prefill_batch_dma_enabled() -> bool:
+    # Inline-read at each layer load; invalid values warn once and disable.
+    global _batch_dma_env_warned
+    raw = os.environ.get("SGLANG_KT_PREFILL_BATCH_DMA")
+    if raw is None or raw == "0":
+        return False
+    if raw == "1":
+        return True
+    if not _batch_dma_env_warned:
+        _batch_dma_env_warned = True
+        logger.warning(
+            "Invalid SGLANG_KT_PREFILL_BATCH_DMA=%r; treating as 0", raw
+        )
+    return False
+
+
+_stage_window_env_warned = False
+
+
+def _stage_window_env_mode() -> int:
+    # Read once at staging setup; invalid values warn once and disable.
+    global _stage_window_env_warned
+    raw = os.environ.get("SGLANG_KT_PREFILL_STAGE_LAYER_WINDOW")
+    if raw is None or raw == "0":
+        return 0
+    if raw in ("1", "2"):
+        return int(raw)
+    if not _stage_window_env_warned:
+        _stage_window_env_warned = True
+        logger.warning(
+            "Invalid SGLANG_KT_PREFILL_STAGE_LAYER_WINDOW=%r; treating as 0",
+            raw,
+        )
+    return 0
+
+
+_stage_window_restart_warned = False
+
+
+def _check_stage_window_drift(frozen_mode: int) -> None:
+    # The negotiated mode is restart-required; a runtime env flip warns once
+    # per process and the frozen MIN value stays in effect.
+    global _stage_window_restart_warned
+    if _stage_window_restart_warned:
+        return
+    current = _stage_window_env_mode()
+    if current == frozen_mode:
+        return
+    _stage_window_restart_warned = True
+    logger.warning(
+        "SGLANG_KT_PREFILL_STAGE_LAYER_WINDOW changed from %d to %d after "
+        "init; the frozen value stays in effect until restart",
+        frozen_mode,
+        current,
+    )
+
+
+def _staging_window_capacity_ok(
+    total_nbytes: int, mem_available: int, shm_free: int, memlock_limit: int
+) -> bool:
+    # Pure four-input predicate; every capacity source must fit the window.
+    return (
+        total_nbytes <= mem_available
+        and total_nbytes <= shm_free
+        and total_nbytes <= memlock_limit
+    )
+
+
+def _staging_capacity_sources() -> Optional[Tuple[int, int, int]]:
+    # Best-effort (MemAvailable, /dev/shm free, RLIMIT_MEMLOCK) snapshot in
+    # bytes.  Any probe failure degrades the whole window setup instead of
+    # guessing at limits.
+    try:
+        mem_available = None
+        with open("/proc/meminfo", "r") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    mem_available = int(line.split()[1]) * 1024
+                    break
+        if mem_available is None:
+            return None
+        stat = os.statvfs("/dev/shm")
+        shm_free = stat.f_bavail * stat.f_frsize
+        import resource
+
+        memlock_limit = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
+        if memlock_limit == resource.RLIM_INFINITY:
+            memlock_limit = sys.maxsize
+        return mem_available, shm_free, memlock_limit
+    except Exception:
+        return None
+
+
 class _Mxfp4LayerwisePrefillManager:
     """Persistent two-slot MXFP4 layer-to-layer prefill scheduler.
 
@@ -2160,6 +2689,25 @@ class _Mxfp4LayerwisePrefillManager:
         self._ownership_warned: set = set()
         self._ownership_prime_logged = False
 
+        # Sticky fence errors mirror pending_h2d_error: they join the next
+        # transport setup commit so no new collective site is introduced.
+        self._pending_fence_error: Optional[Exception] = None
+        self._pending_window_error: Optional[Exception] = None
+
+        # Batch-DMA state.  The planner is built lazily in _advance_round:
+        # the manager is constructed before the SHM banks exist.  Window
+        # shadow tables are per-position flags (ownership rows project into
+        # _ownership_record_window's three-tuple cells).  Generation and the
+        # release table are process-monotonic and never rewind on abort.
+        self._h2d_planner: Optional["_Mxfp4H2DBatchPlanner"] = None
+        self._window_generation = 0
+        self._window_free_events: List = []
+        self._window_was_used: List[bool] = []
+        self._window_release_consensus_gen: List[int] = []
+        self._window_owner: List[Optional[Tuple[int, int, int]]] = []
+        self._window_freed: List[bool] = []
+        self._window_skip_note_logged = False
+
     @property
     def registry(self):
         return _MXFP4_PREFILL_LAYER_REGISTRY.get(self.signature, {})
@@ -2180,6 +2728,13 @@ class _Mxfp4LayerwisePrefillManager:
         # _ownership_record_host_slot.
         self._host_slot_owner = [None, None]
         self._host_slot_freed = [True, True]
+        # Sticky errors and the window shadow are round-scoped; the window
+        # generation and release table must survive (no collective site may
+        # ever observe generation parity mismatches after an abort).
+        self._pending_fence_error = None
+        self._pending_window_error = None
+        self._window_owner = [None] * len(self._window_owner)
+        self._window_freed = [True] * len(self._window_freed)
         if not self.round_active:
             return
         # Flush before the epoch bump: the row must carry the epoch that was
@@ -2201,6 +2756,7 @@ class _Mxfp4LayerwisePrefillManager:
                 f"registered layers are {order}"
             )
 
+        geometry = self.context._staging_geometry
         if (
             not self.round_active
             or self.last_layer_position is None
@@ -2212,6 +2768,32 @@ class _Mxfp4LayerwisePrefillManager:
                 if slot.epoch != self.epoch:
                     slot.invalidate()
             self._stats_begin_chunk()
+            if geometry is not None:
+                # Runtime env edits warn once per process; the frozen MIN
+                # mode stays in effect (restart-required).
+                _check_stage_window_drift(geometry.mode)
+        if self._h2d_planner is None:
+            # Lazy: the manager is constructed before the SHM banks exist.
+            # Without a staging geometry the host rows alternate 0/1 across
+            # positions, so per-bank merging must stay disabled there.
+            self._h2d_planner = _Mxfp4H2DBatchPlanner(
+                bank_count=len(_Mxfp4PrefillSlot.RAW_NAMES),
+                bank_merge_ok=(
+                    geometry.bank_merge_ok
+                    if geometry is not None
+                    else (False,) * len(_Mxfp4PrefillSlot.RAW_NAMES)
+                ),
+            )
+        if geometry is not None and not self._window_free_events:
+            # Lazy, twin of the planner above: the per-window fences shadow
+            # the window host lifecycle the way slot events shadow slots.
+            self._window_free_events = [
+                torch.cuda.Event() for _ in range(geometry.num_windows)
+            ]
+            self._window_was_used = [False] * geometry.num_windows
+            self._window_release_consensus_gen = [0] * geometry.num_windows
+            self._window_owner = [None] * geometry.num_windows
+            self._window_freed = [True] * geometry.num_windows
         self.last_layer_position = pos
 
     def _stats_begin_chunk(self) -> None:
@@ -2559,7 +3141,7 @@ class _Mxfp4LayerwisePrefillManager:
 
         def expert_nbytes(name: str) -> int:
             tensor = buffers[name]
-            return tensor.numel() // 2 * tensor.element_size()
+            return _shm_bank_expert_nbytes(tensor.dtype, tensor.numel() // 2)
 
         offsets = {
             name: host_slot * expert_nbytes(name)
@@ -2581,6 +3163,266 @@ class _Mxfp4LayerwisePrefillManager:
                 rank_pointers("w2_weight_scale_inv"),
             )
             method.wrapper.sync_write_weight_scale_to_buffer()
+
+    def _enqueue_planned_h2d(
+        self,
+        entries: List[_Mxfp4H2DCopyEntry],
+        weight_infos,
+        layer_idx: int,
+        stats_chunk,
+        was_used,
+        free_events,
+        index: int,
+    ) -> Optional[Exception]:
+        # Mirrors the legacy per-expert enqueue block, driven by planner
+        # entries; the launch error is returned for the sticky
+        # pending_h2d_error channel instead of raised.  The fence arrays let
+        # the dual-slot and staging-window paths share this body; per-buffer
+        # row counts make the byte accounting exact for both.
+        host_free_recorded = False
+        enqueue_t0 = _stats_now(stats_chunk)
+        try:
+            with torch.cuda.stream(self.transfer_stream):
+                try:
+                    planned_bytes = 0
+                    for entry in entries:
+                        _, cpu_buffer, destination = weight_infos[entry.bank]
+                        dst = destination[entry.dst_row : entry.dst_row + entry.rows]
+                        src = cpu_buffer[entry.src_row : entry.src_row + entry.rows]
+                        dst.copy_(src, non_blocking=True)
+                        planned_bytes += (
+                            _shm_bank_expert_nbytes(
+                                cpu_buffer.dtype,
+                                cpu_buffer.numel() // cpu_buffer.shape[0],
+                            )
+                            * entry.rows
+                        )
+                    _stats_note_ms(
+                        stats_chunk, layer_idx, "h2d_enqueue_ms", enqueue_t0
+                    )
+                    # Book payload only after the whole plan enqueued; a failed
+                    # entry leaves bytes_h2d below bytes_expected.
+                    if stats_chunk is not None:
+                        stats_chunk.layer_bucket(layer_idx).bytes_h2d += planned_bytes
+                finally:
+                    # Once any DMA may have been enqueued, a peer's failure
+                    # must not make this rank forget the local host-slot fence
+                    # before the consensus raises.
+                    was_used[index] = True
+                    free_events[index].record(self.transfer_stream)
+                    host_free_recorded = True
+        except Exception as exc:
+            if was_used[index] and not host_free_recorded:
+                try:
+                    # Event publication itself failed.  A local-stream sync is
+                    # the exception-only safe fallback before this rank reports
+                    # failure to its peers.
+                    self.transfer_stream.synchronize()
+                    was_used[index] = False
+                except Exception:
+                    pass
+            return exc
+        return None
+
+    def _window_pre_write_phase(
+        self, win: int, layer_idx: int, stats_chunk
+    ) -> None:
+        # Window-mode consensus #1: every rank confirms this window's prior
+        # H2D consumption is fenced before any host overwrite is submitted.
+        # A freed flag is only set after a successful local sync.
+        pre_write_error: Optional[Exception] = None
+        if self._window_was_used[win]:
+            stall_t0 = _stats_now(stats_chunk)
+            try:
+                self._window_free_events[win].synchronize()
+                self._window_freed[win] = True
+            except Exception as exc:
+                pre_write_error = exc
+            _stats_note_ms(stats_chunk, layer_idx, "h2d_stall_ms", stall_t0)
+        self._commit_tp_device_runtime_phase(
+            pre_write_error,
+            f"staging window {win} reuse for layer {layer_idx}",
+        )
+
+    def _ownership_record_window(
+        self, layer_idx: int, generation: int, win: int
+    ) -> Optional[Exception]:
+        # Assert W, twin of assert B for the staging-window path: a window
+        # may only be overwritten after its free-sync.  The A/B host-slot
+        # sentinel is structurally inert here; the skip note logs once.
+        if self._ownership_level == 0:
+            return None
+        if not self._window_skip_note_logged:
+            self._window_skip_note_logged = True
+            logger.debug(
+                "KT slot ownership A/B host-slot sentinel inactive in "
+                "staging-window mode; assert W covers window reuse"
+            )
+        owner = self._window_owner[win]
+        if (
+            owner is not None
+            and owner[0] == self.epoch
+            and not self._window_freed[win]
+        ):
+            return self._ownership_emit(
+                "W",
+                layer_idx,
+                win,
+                f"staging window still owned by layer={owner[1]} "
+                f"generation={owner[2]} without a free-sync",
+            )
+        self._window_owner[win] = (self.epoch, layer_idx, generation)
+        self._window_freed[win] = False
+        return None
+
+    def _submit_window_writes(
+        self,
+        method,
+        cpu_expert_ids: List[int],
+        win: int,
+        geometry: "_StagingWindowGeometry",
+    ) -> None:
+        # TP0-only host packing for a whole layer window.  Pointer rows are
+        # recomputed per expert from the frozen geometry, and one sync per
+        # window (not per expert) closes the submit-all pattern.
+        _assert_no_host_write_batch_on_dual_slot(geometry)
+        pointers = self.context.all_rank_staging_ptrs
+        num_experts = geometry.num_experts
+        with _stats_span(
+            self._stats_chunk, self._stats_span_layer, "host_write_ms"
+        ):
+            for position, expert_id in enumerate(cpu_expert_ids):
+                row = win * num_experts + position
+                row_pointers = {
+                    name: [
+                        ptr + row * geometry.bank_expert_nbytes[index]
+                        for ptr in pointers[name]
+                    ]
+                    for index, name in enumerate(_Mxfp4PrefillSlot.RAW_NAMES)
+                }
+                method.wrapper.submit_write_weight_scale_to_buffer(
+                    get_tensor_model_parallel_world_size(),
+                    expert_id,
+                    row_pointers["w13_weight"],
+                    row_pointers["w13_weight_scale_inv"],
+                    row_pointers["w2_weight"],
+                    row_pointers["w2_weight_scale_inv"],
+                )
+            method.wrapper.sync_write_weight_scale_to_buffer()
+
+    def _window_debug_row(
+        self, win: int, geometry: "_StagingWindowGeometry"
+    ) -> None:
+        # Per-window head digest over the registered banks; ranks compare via
+        # all_gather_object so a corrupted write is attributed to the sticky
+        # channel rather than a new consensus site.  One digest per window.
+        hasher = hashlib.sha256()
+        buffers = self.context.staging_buffers
+        for index, name in enumerate(_Mxfp4PrefillSlot.RAW_NAMES):
+            view = buffers[name].view(torch.uint8).reshape(-1)
+            start = win * geometry.bank_strides[index]
+            head = min(geometry.bank_expert_nbytes[index], 4096)
+            hasher.update(view[start : start + head].numpy().tobytes())
+        digest = hasher.hexdigest()
+        if not dist.is_initialized() or get_tensor_model_parallel_world_size() == 1:
+            logger.debug("staging window %d head digest %s", win, digest)
+            return
+        gathered = [None] * get_tensor_model_parallel_world_size()
+        dist.all_gather_object(gathered, digest, group=get_tp_group().cpu_group)
+        if any(peer != digest for peer in gathered):
+            self._pending_window_error = RuntimeError(
+                f"staging window {win} head digest mismatch across TP ranks"
+            )
+
+    def _load_window_cpu_experts(
+        self,
+        method,
+        cpu_expert_ids: List[int],
+        weight_infos,
+        layer_idx: int,
+        stats_chunk,
+        geometry: "_StagingWindowGeometry",
+    ) -> Optional[Exception]:
+        # Window-mode CPU-expert path: generation bump, reuse fence, host
+        # packing and planned H2D for one whole layer.  Device consensus per
+        # layer stays exactly two (reuse and producer-ready).
+        generation = self._window_generation
+        self._window_generation += 1
+        win = generation % geometry.num_windows
+
+        self._window_pre_write_phase(
+            win=win, layer_idx=layer_idx, stats_chunk=stats_chunk
+        )
+        # Fault-tolerance check-before-writeback: a window may only be
+        # recycled when its reuse was confirmed at least num_windows layers
+        # earlier; this raises before any submit of this generation.
+        if (
+            generation >= geometry.num_windows
+            and self._window_release_consensus_gen[win]
+            < generation - geometry.num_windows
+        ):
+            raise RuntimeError(
+                f"staging window {win} recycled at generation {generation} "
+                f"before its reuse consensus for generation "
+                f"{generation - geometry.num_windows} completed"
+            )
+        self._window_release_consensus_gen[win] = generation
+
+        write_error = self._ownership_record_window(
+            layer_idx=layer_idx, generation=generation, win=win
+        )
+        if method.tp_rank == 0 and write_error is None:
+            try:
+                if method.wrapper is None:
+                    raise RuntimeError(
+                        "MXFP4 TP0 has no KT wrapper for host weight transport"
+                    )
+                self._submit_window_writes(
+                    method=method,
+                    cpu_expert_ids=cpu_expert_ids,
+                    win=win,
+                    geometry=geometry,
+                )
+            except Exception as exc:
+                self._pending_window_error = exc
+
+        # Sticky leftovers join this phase's error so the device reduction
+        # below remains the only broadcast site; the raw-fence pop in
+        # _load_slot is the twin for errors raised past this point.
+        if self._pending_window_error is not None:
+            if write_error is None:
+                write_error = self._pending_window_error
+            self._pending_window_error = None
+        # Consensus #2 doubles as the error broadcast; TP0 cannot strand
+        # peers after a KT writer failure.
+        self._commit_tp_device_runtime_phase(
+            write_error, f"host writes for layer {layer_idx}"
+        )
+
+        if geometry.debug_rows:
+            self._window_debug_row(win, geometry)
+
+        window_infos = [
+            (name, self.context.staging_buffers[name], destination)
+            for name, _, destination in weight_infos
+        ]
+        row_pairs = [
+            (win * geometry.num_experts + position, expert_id)
+            for position, expert_id in enumerate(cpu_expert_ids)
+        ]
+        entries = self._h2d_planner.plan_layer(row_pairs)
+        _assert_h2d_plan_coverage(
+            entries, len(_Mxfp4PrefillSlot.RAW_NAMES), len(cpu_expert_ids)
+        )
+        return self._enqueue_planned_h2d(
+            entries=entries,
+            weight_infos=window_infos,
+            layer_idx=layer_idx,
+            stats_chunk=stats_chunk,
+            was_used=self._window_was_used,
+            free_events=self._window_free_events,
+            index=win,
+        )
 
     def _postprocess_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         from sglang.srt.layers.quantization.v4_marlin_moe import (
@@ -2698,6 +3540,9 @@ class _Mxfp4LayerwisePrefillManager:
                         os.sched_setaffinity(0, {target})
             except Exception as exc:
                 setup_error = exc
+            if setup_error is None and self._pending_fence_error is not None:
+                setup_error = self._pending_fence_error
+                self._pending_fence_error = None
             if setup_error is None:
                 setup_error = ownership_error
             self._commit_tp_runtime_phase(
@@ -2768,106 +3613,149 @@ class _Mxfp4LayerwisePrefillManager:
             )
 
             pending_h2d_error = None
-            for position, expert_id in enumerate(cpu_expert_ids):
-                host_slot = position % 2
-
-                # Rank 0 writes every rank's SHM.  Every rank must therefore
-                # finish its own DMA before that host slot can be overwritten.
-                # A prior H2D enqueue failure is sticky until this common
-                # control point, which lets every rank leave the hot loop in
-                # the same collective order instead of stranding a peer.
-                host_free_error = pending_h2d_error
-                pending_h2d_error = None
-                try:
-                    stall_t0 = _stats_now(stats_chunk)
-                    if self.host_slot_was_used[host_slot]:
-                        self.host_slot_free_events[host_slot].synchronize()
-                        _stats_note_ms(
-                            stats_chunk, layer_idx, "h2d_stall_ms", stall_t0
-                        )
-                        # The previous owner's DMA is complete; release it
-                        # for the ownership record below.
-                        self._host_slot_freed[host_slot] = True
-                except Exception as exc:
-                    if host_free_error is None:
-                        host_free_error = exc
-                self._commit_tp_device_runtime_phase(
-                    host_free_error,
-                    f"host-slot {host_slot} reuse for expert {expert_id}",
+            geometry = self.context._staging_geometry
+            if geometry is not None:
+                # Window mode: one whole-layer generation replaces the
+                # per-expert loop; device consensus per layer stays at two.
+                pending_h2d_error = self._load_window_cpu_experts(
+                    method=method,
+                    cpu_expert_ids=cpu_expert_ids,
+                    weight_infos=weight_infos,
+                    layer_idx=layer_idx,
+                    stats_chunk=stats_chunk,
+                    geometry=geometry,
                 )
+            else:
+                batch_dma = _kt_prefill_batch_dma_enabled()
+                for position, expert_id in enumerate(cpu_expert_ids):
+                    host_slot = position % 2
 
-                # Asserts A + B/E: the host-slot sync above released the
-                # previous owner, so the record runs before TP0 may
-                # overwrite the SHM slot (and gates that overwrite at
-                # enforce level).
-                write_error = self._ownership_record_host_slot(
-                    layer_idx, position, host_slot
-                )
-                if method.tp_rank == 0 and write_error is None:
+                    # Rank 0 writes every rank's SHM.  Every rank must therefore
+                    # finish its own DMA before that host slot can be overwritten.
+                    # A prior H2D enqueue failure is sticky until this common
+                    # control point, which lets every rank leave the hot loop in
+                    # the same collective order instead of stranding a peer.
+                    host_free_error = pending_h2d_error
+                    pending_h2d_error = None
                     try:
-                        if method.wrapper is None:
-                            raise RuntimeError(
-                                "MXFP4 TP0 has no KT wrapper for host weight "
-                                "transport"
-                            )
-                        self._submit_host_write(method, expert_id, host_slot)
-                    except Exception as exc:
-                        write_error = exc
-
-                # The device reduction is both the producer-ready fence and
-                # an error broadcast.  TP0 therefore cannot strand peer ranks
-                # in a later phase if its KT writer fails.
-                self._commit_tp_device_runtime_phase(
-                    write_error, f"host write for expert {expert_id}"
-                )
-
-                host_free_recorded = False
-                enqueue_t0 = _stats_now(stats_chunk)
-                try:
-                    with torch.cuda.stream(self.transfer_stream):
-                        try:
-                            for _, cpu_buffer, destination in weight_infos:
-                                destination[expert_id].copy_(
-                                    cpu_buffer[host_slot], non_blocking=True
-                                )
+                        stall_t0 = _stats_now(stats_chunk)
+                        if self.host_slot_was_used[host_slot]:
+                            self.host_slot_free_events[host_slot].synchronize()
                             _stats_note_ms(
-                                stats_chunk,
-                                layer_idx,
-                                "h2d_enqueue_ms",
-                                enqueue_t0,
+                                stats_chunk, layer_idx, "h2d_stall_ms", stall_t0
                             )
-                            # Book per-expert payload only after this expert's
-                            # enqueue succeeded; a failed expert leaves
-                            # bytes_h2d below bytes_expected.
-                            if stats_chunk is not None:
-                                stats_chunk.layer_bucket(
-                                    layer_idx
-                                ).bytes_h2d += stats_expert_bytes
-                        finally:
-                            # Once any DMA may have been enqueued, a peer's
-                            # failure must not make this rank forget the local
-                            # host-slot fence before the consensus raises.
-                            self.host_slot_was_used[host_slot] = True
-                            self.host_slot_free_events[host_slot].record(
-                                self.transfer_stream
-                            )
-                            host_free_recorded = True
-                except Exception as exc:
-                    pending_h2d_error = exc
-                    if self.host_slot_was_used[host_slot] and not host_free_recorded:
+                            # The previous owner's DMA is complete; release it
+                            # for the ownership record below.
+                            self._host_slot_freed[host_slot] = True
+                    except Exception as exc:
+                        if host_free_error is None:
+                            host_free_error = exc
+                    self._commit_tp_device_runtime_phase(
+                        host_free_error,
+                        f"host-slot {host_slot} reuse for expert {expert_id}",
+                    )
+
+                    # Asserts A + B/E: the host-slot sync above released the
+                    # previous owner, so the record runs before TP0 may
+                    # overwrite the SHM slot (and gates that overwrite at
+                    # enforce level).
+                    write_error = self._ownership_record_host_slot(
+                        layer_idx, position, host_slot
+                    )
+                    if method.tp_rank == 0 and write_error is None:
                         try:
-                            # Event publication itself failed.  A local-stream
-                            # sync is the exception-only safe fallback before
-                            # this rank reports failure to its peers.
-                            self.transfer_stream.synchronize()
-                            self.host_slot_was_used[host_slot] = False
-                        except Exception:
-                            pass
+                            if method.wrapper is None:
+                                raise RuntimeError(
+                                    "MXFP4 TP0 has no KT wrapper for host weight "
+                                    "transport"
+                                )
+                            self._submit_host_write(method, expert_id, host_slot)
+                        except Exception as exc:
+                            write_error = exc
+
+                    # The device reduction is both the producer-ready fence and
+                    # an error broadcast.  TP0 therefore cannot strand peer ranks
+                    # in a later phase if its KT writer fails.
+                    self._commit_tp_device_runtime_phase(
+                        write_error, f"host write for expert {expert_id}"
+                    )
+
+                    if batch_dma and self._h2d_planner is not None:
+                        # w0: one singleton entry per bank, so the enqueued DMAs
+                        # are byte-identical to the legacy loop below.
+                        entries = self._h2d_planner.plan_layer(
+                            [(host_slot, expert_id)]
+                        )
+                        _assert_h2d_plan_coverage(
+                            entries, len(_Mxfp4PrefillSlot.RAW_NAMES), 1
+                        )
+                        pending_h2d_error = self._enqueue_planned_h2d(
+                            entries=entries,
+                            weight_infos=weight_infos,
+                            layer_idx=layer_idx,
+                            stats_chunk=stats_chunk,
+                            was_used=self.host_slot_was_used,
+                            free_events=self.host_slot_free_events,
+                            index=host_slot,
+                        )
+                    else:
+                        host_free_recorded = False
+                        enqueue_t0 = _stats_now(stats_chunk)
+                        try:
+                            with torch.cuda.stream(self.transfer_stream):
+                                try:
+                                    for _, cpu_buffer, destination in weight_infos:
+                                        destination[expert_id].copy_(
+                                            cpu_buffer[host_slot], non_blocking=True
+                                        )
+                                    _stats_note_ms(
+                                        stats_chunk,
+                                        layer_idx,
+                                        "h2d_enqueue_ms",
+                                        enqueue_t0,
+                                    )
+                                    # Book per-expert payload only after this
+                                    # expert's enqueue succeeded; a failed expert
+                                    # leaves bytes_h2d below bytes_expected.
+                                    if stats_chunk is not None:
+                                        stats_chunk.layer_bucket(
+                                            layer_idx
+                                        ).bytes_h2d += stats_expert_bytes
+                                finally:
+                                    # Once any DMA may have been enqueued, a
+                                    # peer's failure must not make this rank
+                                    # forget the local host-slot fence before
+                                    # the consensus raises.
+                                    self.host_slot_was_used[host_slot] = True
+                                    self.host_slot_free_events[host_slot].record(
+                                        self.transfer_stream
+                                    )
+                                    host_free_recorded = True
+                        except Exception as exc:
+                            pending_h2d_error = exc
+                            if (
+                                self.host_slot_was_used[host_slot]
+                                and not host_free_recorded
+                            ):
+                                try:
+                                    # Event publication itself failed.  A
+                                    # local-stream sync is the exception-only
+                                    # safe fallback before this rank reports
+                                    # failure to its peers.
+                                    self.transfer_stream.synchronize()
+                                    self.host_slot_was_used[host_slot] = False
+                                except Exception:
+                                    pass
 
             # H2D launch errors are reported at the next pre-write consensus.
             # The final expert has no successor, so combine its sticky status
             # with raw-fence publication and commit it once per layer.
             raw_ready_error = pending_h2d_error
+            if self._pending_window_error is not None:
+                # Window-submit leftovers join the per-layer raw-fence commit.
+                if raw_ready_error is None:
+                    raw_ready_error = self._pending_window_error
+                self._pending_window_error = None
             fence_t0 = _stats_now(stats_chunk)
             try:
                 with torch.cuda.stream(self.transfer_stream):
@@ -2979,6 +3867,98 @@ class _Mxfp4LayerwisePrefillManager:
             return
         self._load_slot(target, successor_idx, next_method, next_layer)
 
+    def _record_slot_consumed(
+        self, slot: _Mxfp4PrefillSlot, main_stream: torch.cuda.Stream
+    ) -> None:
+        # The fence must follow the update commit: the dynamic update reads
+        # raw bytes of this slot on the main stream, so an earlier record
+        # would let successor transport reuse the slot before those reads.
+        try:
+            slot.consumed_event.record(main_stream)
+            slot.has_consumed_event = True
+            slot.reuse_guard = "consumed"
+            slot.state = "IN_USE"
+            self.current_slot_index = slot.index
+        except Exception as exc:
+            if self._pending_fence_error is None:
+                self._pending_fence_error = exc
+            try:
+                main_stream.synchronize()
+                slot.reuse_guard = "synchronized"
+                slot.state = "IN_USE"
+                self.current_slot_index = slot.index
+            except Exception:
+                pass
+
+    def _record_slot_consumed_from_exception(
+        self, slot: _Mxfp4PrefillSlot, main_stream: torch.cuda.Stream
+    ) -> None:
+        # Legacy exception-path fence; the guard doubles as the skip key once
+        # any fence (or its stream-sync fallback) already terminated the slot.
+        if slot.reuse_guard in ("consumed", "synchronized"):
+            return
+        try:
+            slot.consumed_event.record(main_stream)
+            slot.has_consumed_event = True
+            slot.reuse_guard = "consumed"
+            slot.state = "IN_USE"
+            self.current_slot_index = slot.index
+        except Exception as exc:
+            if self._pending_fence_error is None:
+                self._pending_fence_error = exc
+            try:
+                main_stream.synchronize()
+                slot.reuse_guard = "synchronized"
+                slot.state = "IN_USE"
+                self.current_slot_index = slot.index
+            except Exception:
+                pass
+
+    def _apply_dynamic_expert_update(self, method, layer, dispatch_output, slot):
+        # Dynamic MXFP4 placement must consume the raw image for the slot
+        # just executed.  Run it before successor prefetch can overwrite the
+        # shared shadow context's raw tensors.
+        layer_idx = method.kt_config.layer_idx
+        dynamic_error = None
+        stats_t0 = _stats_now(self._stats_chunk)
+        try:
+            torch.cuda.synchronize(self.device)
+            method._update_gpu_experts_from_batch(
+                layer=layer,
+                ctx=self.context,
+                dispatch_output=dispatch_output,
+                mxfp4_raw_source={
+                    name: getattr(slot, name)
+                    for name in _Mxfp4PrefillSlot.RAW_NAMES
+                },
+            )
+        except Exception as exc:
+            dynamic_error = exc
+        else:
+            _stats_note_ms(
+                self._stats_chunk,
+                self._stats_span_layer,
+                "hotupdate_ms",
+                stats_t0,
+            )
+            # Merge the churn tuple stashed by the update into this layer's
+            # bucket, then always clear: a stale tuple must not leak into a
+            # later epoch's attribution.
+            stats_chunk = self._stats_chunk
+            if (
+                stats_chunk is not None
+                and self._stats_span_layer is not None
+                and method._kt_stats_pending_churn is not None
+            ):
+                churn_in, churn_out = method._kt_stats_pending_churn
+                churn_bucket = stats_chunk.layer_bucket(self._stats_span_layer)
+                churn_bucket.churn_in += churn_in
+                churn_bucket.churn_out += churn_out
+            method._kt_stats_pending_churn = None
+        self._commit_tp_runtime_phase(
+            dynamic_error, f"dynamic expert update for layer {layer_idx}"
+        )
+
     def apply(self, method, layer, dispatch_output):
         layer_idx = method.kt_config.layer_idx
         slot, prefetch_hit = self._acquire(layer_idx, method, layer)
@@ -3003,77 +3983,41 @@ class _Mxfp4LayerwisePrefillManager:
         except Exception as exc:
             compute_error = exc
         finally:
-            if main_stream is not None:
+            if main_stream is not None and compute_error is not None:
                 try:
                     # Fence even when apply enqueues partial weight-reading
                     # work and then raises.
-                    slot.consumed_event.record(main_stream)
-                    slot.has_consumed_event = True
-                    slot.reuse_guard = "consumed"
-                    slot.state = "IN_USE"
-                    self.current_slot_index = slot.index
+                    self._record_slot_consumed_from_exception(slot, main_stream)
                 except Exception as exc:
                     if compute_error is None:
                         compute_error = exc
-                    try:
-                        main_stream.synchronize()
-                        slot.reuse_guard = "synchronized"
-                        slot.state = "IN_USE"
-                        self.current_slot_index = slot.index
-                    except Exception:
-                        pass
 
         # A rank-local Python launch error must be observed by every peer
         # before any successful rank enters successor transport collectives.
-        self._commit_tp_runtime_phase(
-            compute_error, f"compute launch for layer {layer_idx}"
-        )
-
-        # Dynamic MXFP4 placement must consume the raw image for the slot just
-        # executed.  Run it before successor prefetch can overwrite the shared
-        # shadow context's raw tensors.
-        if method.kt_config.kt_enable_dynamic_expert_update:
-            dynamic_error = None
-            stats_t0 = _stats_now(self._stats_chunk)
-            try:
-                torch.cuda.synchronize(self.device)
-                method._update_gpu_experts_from_batch(
-                    layer=layer,
-                    ctx=self.context,
-                    dispatch_output=dispatch_output,
-                    mxfp4_raw_source={
-                        name: getattr(slot, name)
-                        for name in _Mxfp4PrefillSlot.RAW_NAMES
-                    },
-                )
-            except Exception as exc:
-                dynamic_error = exc
-            else:
-                _stats_note_ms(
-                    self._stats_chunk,
-                    self._stats_span_layer,
-                    "hotupdate_ms",
-                    stats_t0,
-                )
-                # Merge the churn tuple stashed by the update into this
-                # layer's bucket, then always clear: a stale tuple must not
-                # leak into a later epoch's attribution.
-                stats_chunk = self._stats_chunk
-                if (
-                    stats_chunk is not None
-                    and self._stats_span_layer is not None
-                    and method._kt_stats_pending_churn is not None
-                ):
-                    churn_in, churn_out = method._kt_stats_pending_churn
-                    churn_bucket = stats_chunk.layer_bucket(
-                        self._stats_span_layer
-                    )
-                    churn_bucket.churn_in += churn_in
-                    churn_bucket.churn_out += churn_out
-                method._kt_stats_pending_churn = None
+        try:
             self._commit_tp_runtime_phase(
-                dynamic_error, f"dynamic expert update for layer {layer_idx}"
+                compute_error, f"compute launch for layer {layer_idx}"
             )
+            if method.kt_config.kt_enable_dynamic_expert_update:
+                try:
+                    self._apply_dynamic_expert_update(
+                        method, layer, dispatch_output, slot
+                    )
+                finally:
+                    self._record_slot_consumed(slot, main_stream)
+            else:
+                # The success-path fence is unconditional: it must still land
+                # before successor prefetch when the dynamic update is off.
+                self._record_slot_consumed(slot, main_stream)
+        except Exception:
+            # A POST-fence failure already set the guard; the guard is the
+            # skip key so re-arming here would double-record the event.
+            if (
+                main_stream is not None
+                and slot.reuse_guard not in ("consumed", "synchronized")
+            ):
+                self._record_slot_consumed_from_exception(slot, main_stream)
+            raise
 
         # GPU compute is now enqueued.  Host KT writes and successor transfer
         # scheduling can overlap it without requiring an async kt-kernel API.
