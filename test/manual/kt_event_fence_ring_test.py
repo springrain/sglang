@@ -23,10 +23,10 @@ sglang install, GPU, or kt_kernel_ext build is required:
       hook runs once per block in single-rank mode, and a cross-rank
       mismatch parks a sticky error in the ring channel instead of
       raising in place.
-  F8  chunk 0 folds the fence intent off, and the staging-window mutex
-      freezes the fence off with one warning (the drift segments left
-      with the env->CLI migration: a frozen CLI parameter has no runtime
-      drift channel for the checks to observe).
+  F8  chunk 0 folds the fence intent off, and an active staging-window
+      mode no longer vetoes the ring: compose mode freezes both
+      geometries, the fence negotiation stays silent, and the window
+      mode MIN stays single-sited inside _create_staging_windows.
 
 Run: python third_party/sglang/test/manual/kt_event_fence_ring_test.py
 """
@@ -160,12 +160,6 @@ def _restore_envs(saved):
             os.environ.pop(name, None)
         else:
             os.environ[name] = value
-
-
-def _reset_fence_latches(w):
-    # The drift and sub-env latches left with the env->CLI migration;
-    # only the mutex warn survives (the window knob is still an env).
-    w._event_fence_mutex_warned = False
 
 
 class _FakeEvent:
@@ -468,7 +462,6 @@ def f4_fence_off_identity(w):
     assert w._ring_row_count(geometry=_ring_geometry(w=w, e_chunk=3)) == 6
     handler, wrapper_logger, old_level = _attach_handler(w)
     saved = _save_ring_envs()
-    _reset_fence_latches(w)
     bag = w._TEST_EXEC_BAG.moe
     real_fence = bag.kt_prefill_event_fence
     bag.kt_prefill_event_fence = 0
@@ -492,7 +485,6 @@ def f4_fence_off_identity(w):
         bag.kt_prefill_event_fence = real_fence
         w._all_tp_ranks_succeeded = real_min
         _restore_envs(saved)
-        _reset_fence_latches(w)
         _detach_handler(wrapper_logger, handler, old_level)
     print(
         "F4 PASS: fence parameter off runs one intent MIN, keeps no "
@@ -503,7 +495,6 @@ def f4_fence_off_identity(w):
 def f5_ladder_and_min(w):
     handler, wrapper_logger, old_level = _attach_handler(w)
     saved = _save_ring_envs()
-    _reset_fence_latches(w)
     real_sources = w._staging_capacity_sources
     real_min_int = w._tp_int_min_all_reduce
     ctx = _make_ring_context(w=w)
@@ -565,7 +556,6 @@ def f5_ladder_and_min(w):
         w._staging_capacity_sources = real_sources
         w._tp_int_min_all_reduce = real_min_int
         _restore_envs(saved)
-        _reset_fence_latches(w)
         _detach_handler(wrapper_logger, handler, old_level)
     print(
         "F5 PASS: ladder floor on probe failure, rung skipping, peer MIN "
@@ -576,7 +566,6 @@ def f5_ladder_and_min(w):
 def f7_debug_digest(w):
     handler, wrapper_logger, old_level = _attach_handler(w, logging.DEBUG)
     saved = _save_ring_envs()
-    _reset_fence_latches(w)
     real_sources = w._staging_capacity_sources
     real_any = w._any_tp_rank_true
     real_dist = w.dist
@@ -643,7 +632,6 @@ def f7_debug_digest(w):
         w.get_tensor_model_parallel_world_size = real_wsize
         w.get_tp_group = real_group
         _restore_envs(saved)
-        _reset_fence_latches(w)
         _detach_handler(wrapper_logger, handler, old_level)
     print(
         "F7 PASS: debug MAX freeze, one digest per block, mismatch parks "
@@ -651,13 +639,13 @@ def f7_debug_digest(w):
     )
 
 
-def f8_chunk_zero_and_window_mutex(w):
+def f8_chunk_zero_and_window_composition(w):
     handler, wrapper_logger, old_level = _attach_handler(w)
     saved = _save_ring_envs()
-    _reset_fence_latches(w)
     bag = w._TEST_EXEC_BAG.moe
     real_min = w._all_tp_ranks_succeeded
     real_chunk = bag.kt_prefill_stage_chunk_experts
+    real_sources = w._staging_capacity_sources
     try:
         calls = []
 
@@ -674,26 +662,36 @@ def f8_chunk_zero_and_window_mutex(w):
         assert ctx._event_fence_frozen is False and ctx._ring_geometry is None
         assert calls == [False], calls
 
-        # A live staging window freezes the fence off with one warning.
+        # Compose mode: an active staging-window mode never vetoes the
+        # ring.  The fence negotiation freezes the full geometry and
+        # stays silent; the window mode MIN stays single-sited inside
+        # _create_staging_windows, so the mode cache is untouched here.
         handler.records.clear()
         bag.kt_prefill_stage_chunk_experts = 64
+        w._staging_capacity_sources = lambda: (1 << 40, 1 << 40, 1 << 40)
         os.environ[ENV_WINDOW] = "1"
         ctx = _make_ring_context(w=w)
         ctx._negotiate_event_fence()
-        assert ctx._event_fence_frozen is False and ctx._ring_geometry is None
+        assert ctx._event_fence_frozen is True
+        geometry = ctx._ring_geometry
+        assert geometry.e_chunk == 64 and geometry.ring_rows == 128
+        assert geometry.num_slots == 2 and geometry.num_experts == 8
+        assert geometry.bank_expert_nbytes == BANK_NBYTES
+        assert geometry.total_nbytes == 128 * sum(BANK_NBYTES)
+        assert geometry.debug_rows is False
         assert calls == [False, True], calls
-        hits = _warnings(handler=handler, needle="is inert while")
-        assert len(hits) == 1, handler.records
+        assert not handler.records, handler.records
+        assert ctx._staging_window_mode_cache is None
         os.environ.pop(ENV_WINDOW)
     finally:
         bag.kt_prefill_stage_chunk_experts = real_chunk
         w._all_tp_ranks_succeeded = real_min
+        w._staging_capacity_sources = real_sources
         _restore_envs(saved)
-        _reset_fence_latches(w)
         _detach_handler(wrapper_logger, handler, old_level)
     print(
-        "F8 PASS: chunk 0 folds the intent off; the window mutex freezes "
-        "the fence off with one warning"
+        "F8 PASS: chunk 0 folds the intent off; compose mode freezes the "
+        "ring beside the window with zero warnings"
     )
 
 
@@ -705,7 +703,7 @@ def main():
     f4_fence_off_identity(w=wrapper)
     f5_ladder_and_min(w=wrapper)
     f7_debug_digest(w=wrapper)
-    f8_chunk_zero_and_window_mutex(w=wrapper)
+    f8_chunk_zero_and_window_composition(w=wrapper)
     print("ALL PASS: kt_event_fence_ring_test (F1-F8)")
 
 

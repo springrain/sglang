@@ -3147,6 +3147,36 @@ class ServerArgs:
         "[ktransformers parameter] Explicit NUMA node IDs used by CPUInfer thread pools.",
         NS("exec.moe"),
     ] = None
+    kt_cpuinfer_watchdog: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] CPU-pool no-progress watchdog "
+            "(default 0 = off): a monitor thread compares a per-task "
+            "heartbeat against --kt-cpuinfer-watchdog-timeout-ms, and on "
+            "expiry latches a poison flag that fails every later CPU-MoE "
+            "sync with a task-tagged RuntimeError instead of hanging the "
+            "decode loop.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 0
+    kt_cpuinfer_watchdog_timeout_ms: A[
+        int,
+        "[ktransformers parameter] CPUInfer watchdog no-progress budget in "
+        "milliseconds; only read when --kt-cpuinfer-watchdog 1.",
+        NS("exec.moe"),
+    ] = 30000
+    kt_cpuinfer_reserve_cores: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Cores reserved per NUMA node "
+            "ahead of the CPUInfer pinned range (default 0 = off): reserving "
+            "a sliver of each node keeps the OS and the watchdog thread "
+            "runnable when the pool is saturated.",
+            choices=[0, 1, 2],
+        ),
+        NS("exec.moe"),
+    ] = 0
     kt_num_gpu_experts: A[
         Optional[int],
         "[ktransformers parameter] GPU experts per MoE layer; ratio overrides this value when both are set.",
@@ -3207,9 +3237,11 @@ class ServerArgs:
             "for MXFP4 layerwise prefill (default 1 = on): CPU experts move "
             "in --kt-prefill-stage-chunk-experts-sized blocks over a "
             "double ring, so a layer pays 2 x ceil(E/chunk) device "
-            "consensuses instead of the legacy 2 x E. Inert while a "
-            "staging-window mode is active. Pass 0 for the legacy "
-            "dual-slot consensus loop.",
+            "consensuses instead of the legacy 2 x E. Pass 0 for the "
+            "legacy dual-slot consensus loop. With a staging-window mode "
+            "active, healthy windows own the host transport while the "
+            "frozen ring stands by and takes over if window setup "
+            "degrades.",
             choices=[0, 1],
         ),
         NS("exec.moe"),
@@ -4368,6 +4400,14 @@ class ServerArgs:
                 )
             if any(node < 0 for node in self.kt_numa_nodes):
                 raise ValueError("--kt-numa-nodes values must be non-negative.")
+
+        if self.kt_cpuinfer_watchdog:
+            if self.kt_cpuinfer_watchdog_timeout_ms < 1000:
+                raise ValueError(
+                    "--kt-cpuinfer-watchdog-timeout-ms must be >= 1000 ms; "
+                    "shorter budgets false-fire on legitimately long "
+                    "prefill-side batches."
+                )
 
         if self.kt_num_gpu_experts is not None and self.kt_num_gpu_experts < 0:
             raise ValueError("--kt-num-gpu-experts must be non-negative.")

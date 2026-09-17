@@ -36,6 +36,10 @@ sglang install, GPU, or kt_kernel_ext build is required:
       BATCH_DMA invalid gate, the dual-slot host-write batch assertion,
       and the debug digest hook (debug line per window, mismatch to the
       sticky channel).
+  N12 Degraded-to-ring seam: a window capacity probe failure soft-falls
+      back to the ring-or-legacy transport with one warning and geometry
+      staying None; under the same open window mode the event-fence
+      negotiation still freezes the full ring geometry beside it.
 
 Run: python third_party/sglang/test/manual/kt_batch_dma_window_test.py
 """
@@ -1083,6 +1087,81 @@ def _n11_write_guards_and_digest(w, handler):
     assert "mismatch" in str(mgr._pending_window_error)
 
 
+def n12_degraded_window_ring_fallback(w):
+    handler, wrapper_logger, old_level = _attach_handler(w)
+    saved_window = os.environ.pop(ENV_STAGE_WINDOW, None)
+    saved_sources = w._staging_capacity_sources
+    saved_get_exec = w.get_exec
+    try:
+        gpu_layer = types.SimpleNamespace(
+            num_experts=8,
+            w13_weight=torch.zeros(8, 512, 512, dtype=torch.uint8),
+            w13_weight_scale_inv=torch.zeros(8, 512, 512, dtype=torch.float32),
+            w2_weight=torch.zeros(8, 1024, 512, dtype=torch.uint8),
+            w2_weight_scale_inv=torch.zeros(8, 512, 512, dtype=torch.float32),
+        )
+        ctx = w.SharedFullContext.__new__(w.SharedFullContext)
+        ctx.gpu_layer = gpu_layer
+        ctx._is_mxfp4_quant = True
+        ctx._staging_geometry = None
+        ctx._staging_window_mode_cache = None
+        ctx._staging_registered_host_buffers = []
+        ctx.staging_buffers = None
+        ctx.all_rank_staging_ptrs = None
+        ctx._staging_opened_shm_refs = {}
+        ctx._staging_shm_handles = {}
+        ctx._ring_geometry = None
+        ctx._event_fence_frozen = False
+
+        # A window-mode capacity probe at the floor soft-degrades every
+        # rank to the ring-or-legacy transport: geometry stays None and
+        # exactly one warning carries the fallback wording.  The window
+        # mode MIN has run once and cached the negotiated mode.
+        os.environ[ENV_STAGE_WINDOW] = "1"
+        w._staging_capacity_sources = lambda: (0, 0, 0)
+        ctx._create_staging_windows()
+        assert ctx._staging_geometry is None
+        hits = _warnings(handler, "ring-or-legacy")
+        assert len(hits) == 1, handler.records
+        assert ctx._staging_window_mode_cache == 1
+
+        # The fallback is the ring, not legacy: under the same open
+        # window mode the event-fence negotiation still freezes the full
+        # ring geometry and emits no further warning.
+        w._staging_capacity_sources = lambda: (2**62, 2**62, 2**62)
+        w.get_exec = lambda: types.SimpleNamespace(
+            moe=types.SimpleNamespace(
+                kt_prefill_event_fence=1,
+                kt_prefill_stage_chunk_experts=64,
+                kt_prefill_no_device_sync=0,
+                kt_prefill_fence_debug=0,
+            )
+        )
+        ctx._negotiate_event_fence()
+        assert ctx._event_fence_frozen is True
+        geometry = ctx._ring_geometry
+        assert geometry.e_chunk == 64 and geometry.ring_rows == 128
+        assert geometry.num_experts == 8
+        assert geometry.total_nbytes == 128 * sum(
+            geometry.bank_expert_nbytes
+        )
+        assert geometry.debug_rows is False
+        assert ctx._staging_geometry is None
+        assert len(handler.records) == 1, handler.records
+    finally:
+        w._staging_capacity_sources = saved_sources
+        w.get_exec = saved_get_exec
+        if saved_window is None:
+            os.environ.pop(ENV_STAGE_WINDOW, None)
+        else:
+            os.environ[ENV_STAGE_WINDOW] = saved_window
+        _detach_handler(wrapper_logger, handler, old_level)
+    print(
+        "N12 PASS: window capacity failure warns once; the frozen ring "
+        "beside it never degrades to legacy"
+    )
+
+
 def main():
     wrapper = _load_wrapper()
     n1_planner_runs(wrapper)
@@ -1096,7 +1175,8 @@ def main():
     n9_consumed_fence_order(wrapper)
     n10_assert_w(wrapper)
     n11_env_semantics(wrapper)
-    print("ALL PASS: kt_batch_dma_window_test (N1-N11)")
+    n12_degraded_window_ring_fallback(wrapper)
+    print("ALL PASS: kt_batch_dma_window_test (N1-N12)")
 
 
 if __name__ == "__main__":

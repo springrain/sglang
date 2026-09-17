@@ -103,8 +103,10 @@ mid-run setenv takes effect on the next chunk):
         the legacy 2 x E.  The intent MIN runs on every rank (off
         included) so peers never hang in collectives.  Disabling freezes
         every allocation byte and the protocol (R20), and the ring
-        sub-knobs are ignored with exactly one startup warning.  Inert
-        while a staging-window mode is active (mutex, one warning).
+        sub-knobs are ignored with exactly one startup warning.  With a
+        staging-window mode active, healthy windows own the host
+        transport while the frozen ring stands by and takes over if
+        window setup degrades.
       --kt-prefill-stage-chunk-experts={0,16,32,64} (default 64)
         Ring block size.  0 folds the fence intent off.  A failed
         capacity probe walks the rungs 64 -> 32 -> 16 -> 1 and the floor
@@ -200,6 +202,8 @@ class KTConfig:
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
         expert_lora_path: Optional PEFT adapter directory for KT CPU expert LoRA
+        reserve_cores: Cores reserved per NUMA node ahead of the CPUInfer pinned range
+        watchdog_timeout_ms: CPUInfer no-progress watchdog budget in ms (0 = off)
     """
 
     layer_idx: int
@@ -215,6 +219,8 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+    reserve_cores: int = 0
+    watchdog_timeout_ms: int = 0
 
 
 @dataclass
@@ -1093,14 +1099,14 @@ class SharedFullContext:
         self, local_error: Optional[Exception], phase: str
     ) -> bool:
         # Soft-degrade twin of _commit_cpu_buffer_phase: identical MIN
-        # verdict, but a window failure falls back to the legacy dual-slot
-        # path with one warning instead of raising.
+        # verdict, but a window failure falls back to the ring-or-legacy
+        # transport with one warning instead of raising.
         if _all_tp_ranks_succeeded(local_error is None):
             return True
         self._cleanup_staging_after_failure()
         logger.warning(
             "KT staging-window %s failed on at least one TP rank; "
-            "falling back to the legacy dual-slot path",
+            "falling back to the ring-or-legacy transport",
             phase,
             exc_info=local_error,
         )
@@ -1327,9 +1333,9 @@ class SharedFullContext:
     def _create_staging_windows(self) -> None:
         """Negotiate and allocate whole-layer staging windows (mode >= 1).
 
-        Any setup failure degrades every rank uniformly to the legacy
-        dual-slot path: geometry stays None and exactly one warning is
-        emitted per process.
+        Any setup failure degrades every rank uniformly to the
+        ring-or-legacy transport: geometry stays None and exactly one
+        warning is emitted per process.
         """
         mode = self._staging_window_mode_frozen()
         if mode == 0:
@@ -1385,9 +1391,9 @@ class SharedFullContext:
     # --- event-fence ring transport (--kt-prefill-event-fence) ---
 
     def _staging_window_mode_frozen(self) -> int:
-        # The event-fence mutex needs the negotiated window mode before
-        # _create_staging_windows would normally run it; the MIN collective
-        # fires exactly once per layer either way.
+        # Single consumer site: _create_staging_windows runs the MIN once
+        # and caches the mode here; nothing else reads the env or the MIN
+        # a second time.
         if self._staging_window_mode_cache is None:
             self._staging_window_mode_cache = (
                 self._negotiate_staging_window_mode()
@@ -1451,13 +1457,6 @@ class SharedFullContext:
                     "--kt-prefill-event-fence negotiated down to off to "
                     "match every TP rank"
                 )
-            self._event_fence_frozen = False
-            return
-        window_mode = self._staging_window_mode_frozen()
-        if window_mode >= 1:
-            # Mutex: whole-layer staging windows already own the host
-            # transport; the ring stays inert with one warning per process.
-            _event_fence_mutex_warn()
             self._event_fence_frozen = False
             return
         bank_nbytes = self._ring_bank_expert_nbytes()
@@ -2765,23 +2764,6 @@ def _fence_debug_env_local() -> bool:
     # Plain local read of the digest flag; the all-rank MAX freeze in the
     # negotiation keeps every rank in lockstep.
     return bool(get_exec().moe.kt_prefill_fence_debug)
-
-
-_event_fence_mutex_warned = False
-
-
-def _event_fence_mutex_warn() -> None:
-    # One line per process: staging windows own the host transport this
-    # phase, so the ring stays inert.
-    global _event_fence_mutex_warned
-    if _event_fence_mutex_warned:
-        return
-    _event_fence_mutex_warned = True
-    logger.warning(
-        "--kt-prefill-event-fence is inert while "
-        "SGLANG_KT_PREFILL_STAGE_LAYER_WINDOW>=1 (staging windows own the "
-        "host transport this phase)"
-    )
 
 
 def _tp_int_min_all_reduce(value: int) -> int:
@@ -5642,6 +5624,15 @@ def create_kt_config_from_server_args(
         gpu_prefill_token_threshold=get_exec().moe.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=get_exec().moe.kt_enable_dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
+        reserve_cores=get_exec().moe.kt_cpuinfer_reserve_cores,
+        # The timeout is only meaningful while the watchdog switch is on; keep
+        # the config field at its default otherwise so old-extension fallback
+        # paths (arity-gated CPUInfer ctor) still see a bit-exact legacy setup.
+        watchdog_timeout_ms=(
+            get_exec().moe.kt_cpuinfer_watchdog_timeout_ms
+            if get_exec().moe.kt_cpuinfer_watchdog
+            else 0
+        ),
     )
 
 
@@ -6243,6 +6234,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 numa_nodes=self.kt_config.numa_nodes,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                reserve_cores=self.kt_config.reserve_cores,
+                watchdog_timeout_ms=self.kt_config.watchdog_timeout_ms,
             )
             if self.kt_expert_lora_enabled:
                 if _kt_swiglu_limit != 0.0:
