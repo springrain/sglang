@@ -3200,6 +3200,101 @@ class ServerArgs:
         "[ktransformers parameter] KT CPU-expert LoRA adapter path.",
         NS("exec.moe"),
     ] = None
+    kt_direct_bank_dma: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Per-rank pinned weight bank "
+            "transport (default 1 = on). Each rank discovers "
+            "<weight_path>/bank/manifest.json at layerwise-prefill init; "
+            "any validation or capacity failure degrades to the legacy "
+            "TP0-relay SHM path with exactly one warning. Restart-required "
+            "like the window mode. Pass 0 to force the legacy path.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 1
+    kt_prefill_event_fence: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Event-fence ring transport "
+            "for MXFP4 layerwise prefill (default 1 = on): CPU experts move "
+            "in --kt-prefill-stage-chunk-experts-sized blocks over a "
+            "double ring, so a layer pays 2 x ceil(E/chunk) device "
+            "consensuses instead of the legacy 2 x E. Inert while a "
+            "staging-window mode is active. Pass 0 for the legacy "
+            "dual-slot consensus loop.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 1
+    kt_prefill_stage_chunk_experts: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Ring block size in experts. "
+            "0 folds the event-fence intent off entirely; a failed "
+            "capacity probe walks the rungs 64 -> 32 -> 16 -> 1, and the "
+            "frozen all-rank MIN stays restart-required.",
+            choices=[0, 16, 32, 64],
+        ),
+        NS("exec.moe"),
+    ] = 64
+    kt_prefill_no_device_sync: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Reserved knob for dropping "
+            "guarded host-blocking syncs (default 0 = off). The "
+            "whitelist is empty this phase, so passing 1 only warns "
+            "once at startup.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 0
+    kt_prefill_fence_debug: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Per-ring-block 4KB head "
+            "digest all-gather check (default 0 = off). Pass 1 to "
+            "enable; the value is frozen into the ring geometry at "
+            "init via an all-rank MAX so ranks never disagree about "
+            "the digest hook.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 0
+    kt_dump_slot_bytes: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Dump each loaded slot's raw "
+            "field bytes after the raw-ready fence (default 0 = off). "
+            "Pass 1 to enable; the readback always synchronizes the "
+            "raw_ready event first, and the files land under "
+            "./kt_slot_dump/.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 0
+    kt_bank_dma_batch: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Reserved for a later batched "
+            "bank-DMA phase (default 0 = off); inert today, registered "
+            "so the name cannot be reused with another meaning. Passing "
+            "1 has no effect this phase.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 0
+    kt_bank_dma_lean: A[
+        int,
+        Arg(
+            help="[ktransformers parameter] Reserved for the phase-2 "
+            "no-op consensus trim (default 0 = off); inert today, "
+            "registered so the name cannot be reused with another "
+            "meaning. Passing 1 has no effect this phase.",
+            choices=[0, 1],
+        ),
+        NS("exec.moe"),
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Diffusion LLM
@@ -4420,6 +4515,31 @@ class ServerArgs:
                 "KT expert LoRA serving requires --max-running-requests >= 2 "
                 f"(got {self.max_running_requests})."
             )
+
+        if self.kt_prefill_no_device_sync:
+            # The guarded device-sync whitelist is empty this phase, so
+            # the flag never reaches the runtime; one line at prepare is
+            # the whole contract.
+            logger.warning(
+                "--kt-prefill-no-device-sync is inert this phase: the "
+                "guarded device-sync whitelist is empty; treating as "
+                "disabled."
+            )
+
+        if not self.kt_prefill_event_fence:
+            ignored_ring_args = []
+            if self.kt_prefill_stage_chunk_experts != 64:
+                ignored_ring_args.append("--kt-prefill-stage-chunk-experts")
+            if self.kt_prefill_no_device_sync:
+                ignored_ring_args.append("--kt-prefill-no-device-sync")
+            if self.kt_prefill_fence_debug:
+                ignored_ring_args.append("--kt-prefill-fence-debug")
+            if ignored_ring_args:
+                logger.warning(
+                    "--kt-prefill-event-fence=0 freezes the legacy "
+                    "dual-slot path; ignoring %s.",
+                    ", ".join(ignored_ring_args),
+                )
 
     def __setattr__(self, name, value):
         # Once resolution has finished the record is the READ-ONLY raw input

@@ -56,6 +56,10 @@ WRAPPER_PATH = (
     REPO_ROOT
     / "third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py"
 )
+BANK_DMA_PATH = (
+    REPO_ROOT
+    / "third_party/sglang/python/sglang/srt/layers/moe/kt_bank_dma.py"
+)
 
 ENV_BATCH_DMA = "SGLANG_KT_PREFILL_BATCH_DMA"
 ENV_STAGE_WINDOW = "SGLANG_KT_PREFILL_STAGE_LAYER_WINDOW"
@@ -90,7 +94,10 @@ def _load_wrapper():
         get_tp_group=lambda: None,
     )
     _stub("sglang.srt.layers")
-    _stub("sglang.srt.layers.moe")
+    _stub(
+        "sglang.srt.layers.moe",
+        kt_bank_dma=_load_module("kt_bank_dma_iso", BANK_DMA_PATH),
+    )
     _stub("sglang.srt.layers.quantization")
     _stub("sglang.srt.layers.quantization.base_config", FusedMoEMethodBase=object)
     _stub(
@@ -236,6 +243,16 @@ def _make_window_manager(w, geometry, tp_rank=0, level=2):
     mgr._host_slot_freed = [True, True]
     mgr._window_skip_note_logged = False
     mgr._pending_window_error = None
+    # Ring twin shadows, empty lists mirroring __init__ (ring mode not
+    # negotiated in this fake); abort_round rewrites them unconditionally.
+    mgr._ring_generation = 0
+    mgr._ring_free_events = []
+    mgr._ring_was_used = []
+    mgr._ring_owner = []
+    mgr._ring_freed = []
+    mgr._ring_last_chunk_key = None
+    mgr._ring_skip_note_logged = False
+    mgr._pending_ring_error = None
     mgr._pending_fence_error = None
     mgr._ownership_level = level
     mgr._ownership_warned = set()
@@ -834,6 +851,9 @@ def n9_consumed_fence_order(w):
     mgr._window_owner = []
     mgr._window_freed = []
     mgr._pending_window_error = None
+    mgr._ring_owner = []
+    mgr._ring_freed = []
+    mgr._pending_ring_error = None
     mgr.abort_round()
     assert mgr._pending_fence_error is None
 

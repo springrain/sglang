@@ -31,6 +31,10 @@ WRAPPER_PATH = (
     REPO_ROOT
     / "third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py"
 )
+BANK_DMA_PATH = (
+    REPO_ROOT
+    / "third_party/sglang/python/sglang/srt/layers/moe/kt_bank_dma.py"
+)
 ENV_NAME = "SGLANG_KT_SLOT_OWNERSHIP_ASSERT"
 
 
@@ -63,7 +67,10 @@ def _load_wrapper():
         get_tp_group=lambda: None,
     )
     _stub("sglang.srt.layers")
-    _stub("sglang.srt.layers.moe")
+    _stub(
+        "sglang.srt.layers.moe",
+        kt_bank_dma=_load_module("kt_bank_dma_iso", BANK_DMA_PATH),
+    )
     _stub("sglang.srt.layers.quantization")
     _stub("sglang.srt.layers.quantization.base_config", FusedMoEMethodBase=object)
     _stub(
