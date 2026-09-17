@@ -3200,19 +3200,6 @@ class ServerArgs:
         "[ktransformers parameter] KT CPU-expert LoRA adapter path.",
         NS("exec.moe"),
     ] = None
-    kt_direct_bank_dma: A[
-        int,
-        Arg(
-            help="[ktransformers parameter] Per-rank pinned weight bank "
-            "transport (default 1 = on). Each rank discovers "
-            "<weight_path>/bank/manifest.json at layerwise-prefill init; "
-            "any validation or capacity failure degrades to the legacy "
-            "TP0-relay SHM path with exactly one warning. Restart-required "
-            "like the window mode. Pass 0 to force the legacy path.",
-            choices=[0, 1],
-        ),
-        NS("exec.moe"),
-    ] = 1
     kt_prefill_event_fence: A[
         int,
         Arg(
@@ -3257,40 +3244,6 @@ class ServerArgs:
             "enable; the value is frozen into the ring geometry at "
             "init via an all-rank MAX so ranks never disagree about "
             "the digest hook.",
-            choices=[0, 1],
-        ),
-        NS("exec.moe"),
-    ] = 0
-    kt_dump_slot_bytes: A[
-        int,
-        Arg(
-            help="[ktransformers parameter] Dump each loaded slot's raw "
-            "field bytes after the raw-ready fence (default 0 = off). "
-            "Pass 1 to enable; the readback always synchronizes the "
-            "raw_ready event first, and the files land under "
-            "./kt_slot_dump/.",
-            choices=[0, 1],
-        ),
-        NS("exec.moe"),
-    ] = 0
-    kt_bank_dma_batch: A[
-        int,
-        Arg(
-            help="[ktransformers parameter] Reserved for a later batched "
-            "bank-DMA phase (default 0 = off); inert today, registered "
-            "so the name cannot be reused with another meaning. Passing "
-            "1 has no effect this phase.",
-            choices=[0, 1],
-        ),
-        NS("exec.moe"),
-    ] = 0
-    kt_bank_dma_lean: A[
-        int,
-        Arg(
-            help="[ktransformers parameter] Reserved for the phase-2 "
-            "no-op consensus trim (default 0 = off); inert today, "
-            "registered so the name cannot be reused with another "
-            "meaning. Passing 1 has no effect this phase.",
             choices=[0, 1],
         ),
         NS("exec.moe"),

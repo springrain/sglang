@@ -47,11 +47,6 @@ WRAPPER_PATH = (
     REPO_ROOT
     / "third_party/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py"
 )
-BANK_DMA_PATH = (
-    REPO_ROOT
-    / "third_party/sglang/python/sglang/srt/layers/moe/kt_bank_dma.py"
-)
-
 # The staging window stays an env (tier-1 knob); every other ring knob
 # of this batch is now a frozen --kt-* CLI parameter mirrored by the
 # exec bag stubbed into runtime_context inside _load_wrapper().
@@ -92,10 +87,7 @@ def _load_wrapper():
         get_tp_group=lambda: None,
     )
     _stub("sglang.srt.layers")
-    _stub(
-        "sglang.srt.layers.moe",
-        kt_bank_dma=_load_module("kt_bank_dma_iso", BANK_DMA_PATH),
-    )
+    _stub("sglang.srt.layers.moe")
     _stub("sglang.srt.layers.quantization")
     _stub("sglang.srt.layers.quantization.base_config", FusedMoEMethodBase=object)
     _stub(
@@ -106,14 +98,10 @@ def _load_wrapper():
     # per test and restored in finally blocks (setattr precedent).
     exec_bag = types.SimpleNamespace(
         moe=types.SimpleNamespace(
-            kt_direct_bank_dma=1,
             kt_prefill_event_fence=1,
             kt_prefill_stage_chunk_experts=64,
             kt_prefill_no_device_sync=0,
             kt_prefill_fence_debug=0,
-            kt_dump_slot_bytes=0,
-            kt_bank_dma_batch=0,
-            kt_bank_dma_lean=0,
         )
     )
     _stub(
@@ -288,7 +276,6 @@ def _make_ring_manager(w, geometry, tp_rank=0, level=2, num_experts=8):
     mgr._stats_span_layer = None
     mgr.context = types.SimpleNamespace(
         _ring_geometry=geometry,
-        _rank_bank=None,
         cpu_buffers=buffers,
         all_rank_buffer_ptrs={name: [4096] for name in _raw_names(w)},
     )

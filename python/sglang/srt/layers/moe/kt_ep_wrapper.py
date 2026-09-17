@@ -96,14 +96,6 @@ mid-run setenv takes effect on the next chunk):
       SGLANG_KT_PREFILL_NO_BATCH_MEMCPY=0|1
         Reserved for a later batched-cudaMemcpy phase; inert today.
         Registered so the name cannot be reused with another meaning.
-      --kt-direct-bank-dma 0|1 (default 1)
-        Per-rank pinned weight bank.  Each rank discovers
-        <weight_path>/bank/manifest.json at layerwise-prefill init; any
-        validation or capacity failure forces the flag back to off with
-        exactly one [KT-DEGRADE] warning and the legacy dual-slot SHM
-        path runs bit-identical.  Frozen via an all-rank MIN at init;
-        restart-required like the window mode.  Inert while a
-        staging-window mode is active (mutex, one warning).
       --kt-prefill-event-fence 0|1 (default 1)
         Event-fence ring transport: CPU experts move in
         --kt-prefill-stage-chunk-experts-sized blocks over a double ring,
@@ -126,15 +118,6 @@ mid-run setenv takes effect on the next chunk):
         Per-ring-block 4KB head digest all-gather check.  Frozen into
         the ring geometry at init via an all-rank MAX so ranks can never
         disagree about the digest hook.
-      --kt-dump-slot-bytes 0|1 (default 0)
-        Dump each loaded slot's raw field bytes after the raw-ready
-        fence.  The readback always synchronizes the raw_ready event
-        first; the dump files land under ./kt_slot_dump/.
-      --kt-bank-dma-batch 0|1 (default 0)
-        Reserved for a batched bank-DMA phase; inert today.  Registered
-        so the name cannot be reused with another meaning.
-      --kt-bank-dma-lean 0|1 (default 0)
-        Reserved for the phase-2 no-op consensus trim; inert today.
 """
 
 import bisect
@@ -165,7 +148,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from sglang.srt.layers.moe import kt_bank_dma as _bank_dma
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.runtime_context import (
@@ -506,22 +488,12 @@ class SharedFullContext:
         self._staging_opened_shm_refs: Dict[str, shared_memory.SharedMemory] = {}
         self._staging_registered_host_buffers: List[torch.Tensor] = []
 
-        # Per-rank pinned weight bank (--kt-direct-bank-dma); None
-        # means the legacy TP0-relay SHM transport.  Built by
-        # _init_rank_bank; the field stays None on any degrade.  The
-        # frozen flag is restart-required like the window mode.
-        self._rank_bank: Optional["_bank_dma._RankBank"] = None
-        self._bank_dma_frozen = False
-
         # Event-fence ring state (--kt-prefill-event-fence); None
         # geometry means the legacy per-expert dual-slot consensus loop.
         # _negotiate_event_fence freezes it before _create_cpu_buffers sizes
         # the host ring; restart-required like the window mode.
         self._ring_geometry: Optional["_Mxfp4RingGeometry"] = None
         self._event_fence_frozen = False
-        # kt_config captured for the bank geometry (weight path, layer
-        # count); same object the __init__ prologue already inspected.
-        self._kt_config = _kt_config
         if not defer_cpu_buffers:
             self.initialize_cpu_buffers()
 
@@ -542,7 +514,6 @@ class SharedFullContext:
         self._create_cpu_buffers()
         if getattr(self, "_is_mxfp4_quant", False):
             self._create_staging_windows()
-            self._init_rank_bank()
         self._cpu_buffers_initialized = True
 
     def _init_mxfp8_aux(self) -> None:
@@ -1469,7 +1440,7 @@ class SharedFullContext:
         # Restart-required ring freeze, run before _create_cpu_buffers so
         # the host allocation reflects the frozen chunk.  The intent MIN
         # runs on every rank even when the env is 0: all ranks must walk
-        # the same collective sequence (bank-dma flag precedent).
+        # the same collective sequence (frozen-flag negotiation precedent).
         chunk_requested = _event_fence_chunk_env()
         fence_env = _event_fence_env_enabled()
         intent = fence_env and chunk_requested != 0
@@ -1513,275 +1484,6 @@ class SharedFullContext:
             debug_rows=debug_rows,
         )
         self._event_fence_frozen = True
-
-    # --- per-rank pinned weight bank (--kt-direct-bank-dma) ----------
-
-    def _negotiate_bank_dma_flag(self) -> bool:
-        # Restart-required twin of _negotiate_staging_window_mode: the local
-        # intent is frozen across ranks with MIN so no rank can serve bank
-        # rows while a peer still walks the legacy TP0 relay.
-        local = bool(get_exec().moe.kt_direct_bank_dma)
-        if (
-            not dist.is_initialized()
-            or get_tensor_model_parallel_world_size() == 1
-        ):
-            return local
-        flag_tensor = torch.tensor(
-            [int(local)], dtype=torch.int32, device="cpu"
-        )
-        dist.all_reduce(
-            flag_tensor, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group
-        )
-        negotiated = bool(flag_tensor.item())
-        if negotiated != local:
-            logger.warning(
-                "--kt-direct-bank-dma=%d negotiated down to %d to "
-                "match every TP rank",
-                int(local),
-                int(negotiated),
-            )
-        return negotiated
-
-    def _load_bank_manifest(
-        self, weight_path: str
-    ) -> Tuple["_bank_dma._BankManifest", str]:
-        # Returns (manifest, sha256 of the raw file).  The digest is the
-        # cross-rank consistency key: the all-gather at freeze time raises
-        # when any two ranks read different manifest bytes (D6).
-        manifest_path = _bank_dma.bank_manifest_path(weight_path)
-        try:
-            with open(manifest_path, "r") as handle:
-                raw_text = handle.read()
-            payload = json.loads(raw_text)
-            manifest = _bank_dma._bank_manifest_from_dict(payload)
-        except Exception as exc:
-            raise _bank_dma._BankDegradeError(
-                reason="manifest_unreadable", detail=str(exc)
-            )
-        digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-        return manifest, digest
-
-    def _bank_geometry_and_rows(
-        self, manifest: "_bank_dma._BankManifest"
-    ) -> Tuple["_bank_dma._BankGeometry", Dict[str, int]]:
-        # Expert count, TP width and layer count are local truths; the
-        # manifest self-reports the quant geometry it was packed with and
-        # the dims key-group hash proves the two agree.  Missing dims keys
-        # become -1 so the dims hash mismatch fires before any formula.
-        kt_config = self._kt_config
-        num_layers = getattr(kt_config, "num_layers", None)
-        if num_layers is None:
-            raise _bank_dma._BankDegradeError(reason="num_layers_unavailable")
-        dims = manifest.dims
-
-        def _dim(key: str) -> int:
-            return int(dims.get(key, -1))
-
-        geometry = _bank_dma._BankGeometry(
-            gpu_tp_count=get_tensor_model_parallel_world_size(),
-            num_layers=int(num_layers),
-            num_experts=self.gpu_layer.num_experts,
-            hidden_size=_dim("hidden_size"),
-            intermediate_size=_dim("intermediate_size"),
-            group_size=_dim("group_size"),
-        )
-        try:
-            invalid = _bank_dma._bank_manifest_validate(
-                manifest=manifest,
-                geometry=geometry,
-                rank=get_tensor_model_parallel_rank(),
-            )
-        except ValueError as exc:
-            raise _bank_dma._BankDegradeError(reason="dims", detail=str(exc))
-        if invalid is not None:
-            raise _bank_dma._BankDegradeError(reason=invalid)
-        row_nbytes = _bank_dma.bank_field_row_bytes(
-            hidden=geometry.hidden_size,
-            inter=geometry.intermediate_size,
-            group_size=geometry.group_size,
-            tp_count=geometry.gpu_tp_count,
-        )
-        # Cross-check the self-reported geometry against the live SHM bank
-        # layout so a self-consistent-but-wrong manifest cannot pass (D3).
-        for name in _bank_dma.BANK_FIELDS:
-            gpu_tensor = getattr(self.gpu_layer, name)
-            buf_dtype = _shm_bank_buf_dtype(True, name, gpu_tensor.dtype)
-            shm_nbytes = _shm_bank_expert_nbytes(
-                buf_dtype=buf_dtype,
-                expert_numel=gpu_tensor.numel() // geometry.num_experts,
-            )
-            if row_nbytes[name] != shm_nbytes:
-                raise _bank_dma._BankDegradeError(
-                    reason="geometry_mismatch",
-                    detail=f"{name}: manifest {row_nbytes[name]} B != "
-                    f"shm {shm_nbytes} B",
-                )
-        return geometry, row_nbytes
-
-    def _bank_capacity_check(
-        self,
-        geometry: "_bank_dma._BankGeometry",
-        row_nbytes: Dict[str, int],
-    ) -> None:
-        # Fail-closed precheck BEFORE any large allocation (R15): RAM,
-        # RLIMIT_MEMLOCK and the NUMA first-touch budget must all admit
-        # the full pinned bank.
-        total_nbytes = (
-            geometry.num_layers
-            * geometry.num_experts
-            * sum(row_nbytes.values())
-        )
-        sources = _bank_dma._bank_capacity_sources()
-        if sources is None:
-            raise _bank_dma._BankDegradeError(
-                reason="capacity_insufficient", detail="capacity probe failed"
-            )
-        mem_available, memlock_limit = sources
-        if not _bank_dma._bank_capacity_precheck(
-            total_nbytes=total_nbytes,
-            mem_available=mem_available,
-            memlock_limit=memlock_limit,
-            numa_free=_bank_dma._bank_numa_free_bytes(),
-        ):
-            raise _bank_dma._BankDegradeError(
-                reason="capacity_insufficient",
-                detail=f"need {total_nbytes} B pinned",
-            )
-
-    def _bank_alloc_and_fill(
-        self,
-        manifest: "_bank_dma._BankManifest",
-        geometry: "_bank_dma._BankGeometry",
-        weight_path: str,
-    ) -> Dict[Tuple[int, str], torch.Tensor]:
-        # Layer-by-layer pageable read into freshly pinned arenas; each
-        # layer's blob is dropped after the copy so the peak stays at one
-        # tile plus the pinned total.  cudaHostAlloc via pin_memory needs
-        # no unregister bookkeeping: GC reclaims a half-built bank (R18).
-        rank = get_tensor_model_parallel_rank()
-        tensors: Dict[Tuple[int, str], torch.Tensor] = {}
-        try:
-            for layer_idx in range(geometry.num_layers):
-                layer_bytes = _bank_dma._bank_load_layer_bytes(
-                    root=weight_path,
-                    manifest=manifest,
-                    layer=layer_idx,
-                    rank=rank,
-                )
-                for name in _bank_dma.BANK_FIELDS:
-                    gpu_tensor = getattr(self.gpu_layer, name)
-                    buf_dtype = _shm_bank_buf_dtype(
-                        True, name, gpu_tensor.dtype
-                    )
-                    payload = layer_bytes[name]
-                    flat = torch.empty(
-                        len(payload), dtype=torch.uint8, pin_memory=True
-                    )
-                    flat.copy_(
-                        torch.frombuffer(bytearray(payload), dtype=torch.uint8)
-                    )
-                    expert_shape = tuple(gpu_tensor.shape[1:])
-                    tensors[(layer_idx, name)] = flat.view(buf_dtype).view(
-                        (geometry.num_experts,) + expert_shape
-                    )
-        except _bank_dma._BankDegradeError:
-            tensors = {}
-            gc.collect()
-            raise
-        except Exception as exc:
-            tensors = {}
-            gc.collect()
-            raise _bank_dma._BankDegradeError(
-                reason="bank_alloc_failed", detail=str(exc)
-            )
-        return tensors
-
-    def _load_bank_local(self) -> Tuple["_bank_dma._RankBank", str]:
-        """Build this rank's bank plus the manifest digest; fail-closed."""
-        kt_config = self._kt_config
-        weight_path = getattr(kt_config, "weight_path", None)
-        if not weight_path:
-            raise _bank_dma._BankDegradeError(reason="no_weight_path")
-        manifest, digest = self._load_bank_manifest(weight_path)
-        geometry, row_nbytes = self._bank_geometry_and_rows(manifest)
-        self._bank_capacity_check(geometry, row_nbytes)
-        tensors = self._bank_alloc_and_fill(manifest, geometry, weight_path)
-        bank = _bank_dma._RankBank(
-            root=weight_path,
-            rank=get_tensor_model_parallel_rank(),
-            geometry=geometry,
-            row_nbytes=row_nbytes,
-            tensors=tensors,
-        )
-        return bank, digest
-
-    def _init_rank_bank(self) -> None:
-        """Negotiate, build and freeze the per-rank pinned weight bank.
-
-        Every rank runs the same collectives regardless of its local env
-        so the decision is rank-symmetric.  Any local failure downgrades
-        every rank uniformly: _rank_bank stays None and exactly one
-        [KT-DEGRADE] warning names the first reported reason.
-        """
-        negotiated = self._negotiate_bank_dma_flag()
-        if self._staging_geometry is not None:
-            # Mutex with the staging windows; the window geometry is
-            # already MIN-frozen so this gate is rank-symmetric.
-            if negotiated:
-                _kt_degrade_emit(
-                    family=_KT_DEGRADE_FAMILY_BANK_DMA,
-                    code="mutex_window",
-                )
-            self._bank_dma_frozen = False
-            return
-        self._bank_dma_frozen = negotiated
-        if not negotiated:
-            return
-
-        local_error: Optional[_bank_dma._BankDegradeError] = None
-        digest: Optional[str] = None
-        bank: Optional["_bank_dma._RankBank"] = None
-        try:
-            bank, digest = self._load_bank_local()
-        except _bank_dma._BankDegradeError as exc:
-            local_error = exc
-        error_payload = (
-            None
-            if local_error is None
-            else (local_error.reason, local_error.detail)
-        )
-        # One all-gather carries the (error, digest) pair so the collective
-        # count stays unchanged.  Two different non-None digests mean the
-        # manifests disagree across ranks: raise the same message on all.
-        gathered = [(error_payload, digest)]
-        if (
-            dist.is_initialized()
-            and get_tensor_model_parallel_world_size() > 1
-        ):
-            gathered = [None] * get_tensor_model_parallel_world_size()
-            dist.all_gather_object(
-                gathered,
-                (error_payload, digest),
-                group=get_tp_group().cpu_group,
-            )
-        digests = {item[1] for item in gathered if item[1] is not None}
-        if len(digests) > 1:
-            raise RuntimeError(
-                "KT bank manifests disagree across TP ranks; refusing to "
-                "start the bank DMA path"
-            )
-        first_error = next(
-            (item[0] for item in gathered if item[0] is not None), None
-        )
-        if first_error is not None:
-            _kt_degrade_emit(
-                family=_KT_DEGRADE_FAMILY_BANK_DMA,
-                code=first_error[0],
-                detail=first_error[1],
-            )
-            self._bank_dma_frozen = False
-            return
-        self._rank_bank = bank
 
     def _prepare_weight_int4(self, wrapper):
         """Prepare INT4 Marlin weights by writing from KT, copying to GPU, and postprocessing.
@@ -4121,23 +3823,17 @@ class _Mxfp4LayerwisePrefillManager:
         geometry: "_Mxfp4RingGeometry",
     ) -> Optional[Exception]:
         # Plain H2D fan-out for one ring block; no planner involvement, so
-        # the BATCH_DMA env never affects the ring path.  Source rows come
-        # from the bank (expert rows) or the ring (slot * e_chunk +
-        # position).  was_used flips before the record, mirroring
-        # _enqueue_planned_h2d; an event-publication failure falls back to
-        # a stream sync.
-        bank = self.context._rank_bank
+        # the BATCH_DMA env never affects the ring path.  Source rows are
+        # ring_slot * e_chunk + position.  was_used flips before the
+        # record, mirroring _enqueue_planned_h2d; an event-publication
+        # failure falls back to a stream sync.
         host_free_recorded = False
         enqueue_t0 = _stats_now(stats_chunk)
         try:
             with torch.cuda.stream(self.transfer_stream):
                 try:
                     for position, expert_id in enumerate(block_expert_ids):
-                        src_row = (
-                            expert_id
-                            if bank is not None
-                            else ring_slot * geometry.e_chunk + position
-                        )
+                        src_row = ring_slot * geometry.e_chunk + position
                         for _, cpu_buffer, destination in weight_infos:
                             destination[expert_id].copy_(
                                 cpu_buffer[src_row], non_blocking=True
@@ -4197,7 +3893,6 @@ class _Mxfp4LayerwisePrefillManager:
         # double ring.  Every block runs begin fence, reuse consensus,
         # ownership, TP0 host packing and the plain H2D fan-out; the
         # device-consensus count is 2 x ceil(len / e_chunk).
-        bank = self.context._rank_bank
         for block_index, (start, count) in enumerate(
             _ring_blocks(len(cpu_expert_ids), geometry.e_chunk)
         ):
@@ -4217,11 +3912,7 @@ class _Mxfp4LayerwisePrefillManager:
             write_error = self._ownership_record_ring(
                 layer_idx=layer_idx, generation=generation, ring_slot=ring_slot
             )
-            if (
-                bank is None
-                and method.tp_rank == 0
-                and write_error is None
-            ):
+            if method.tp_rank == 0 and write_error is None:
                 try:
                     if method.wrapper is None:
                         raise RuntimeError(
@@ -4299,23 +3990,6 @@ class _Mxfp4LayerwisePrefillManager:
             self._stats_chunk, self._stats_span_layer, "postprocess_ms", stats_t0
         )
 
-    def _dump_slot_bytes(self, slot: _Mxfp4PrefillSlot, layer_idx: int) -> None:
-        """--kt-dump-slot-bytes: sync the raw fence, then read back."""
-        # The readback must observe the finished H2D bytes, so the raw-ready
-        # event is synchronized BEFORE anything leaves the GPU (D9).
-        slot.raw_ready_event.synchronize()
-        out_dir = os.path.join(".", "kt_slot_dump")
-        os.makedirs(out_dir, exist_ok=True)
-        rank = get_tensor_model_parallel_rank()
-        for name in _Mxfp4PrefillSlot.RAW_NAMES:
-            raw = getattr(slot, name).detach().cpu().view(torch.uint8)
-            path = os.path.join(
-                out_dir,
-                f"layer{layer_idx}_rank{rank}_slot{slot.index}_{name}.bin",
-            )
-            with open(path, "wb") as handle:
-                handle.write(raw.numpy().tobytes())
-
     def _load_slot(
         self,
         slot: _Mxfp4PrefillSlot,
@@ -4366,29 +4040,14 @@ class _Mxfp4LayerwisePrefillManager:
         try:
             setup_error = None
             try:
-                bank = self.context._rank_bank
-                # Bank mode replaces the SHM host-slot rows with this rank's
-                # pinned expert-indexed bank view below; every consumer then
-                # keys rows by expert_id instead of the dual host_slot.
-                weight_infos = (
-                    [
-                        (
-                            name,
-                            self.context.cpu_buffers[name],
-                            getattr(slot, name),
-                        )
-                        for name in _Mxfp4PrefillSlot.RAW_NAMES
-                    ]
-                    if bank is None
-                    else [
-                        (
-                            name,
-                            bank.tensors[(layer_idx, name)],
-                            getattr(slot, name),
-                        )
-                        for name in _Mxfp4PrefillSlot.RAW_NAMES
-                    ]
-                )
+                weight_infos = [
+                    (
+                        name,
+                        self.context.cpu_buffers[name],
+                        getattr(slot, name),
+                    )
+                    for name in _Mxfp4PrefillSlot.RAW_NAMES
+                ]
                 gpu_expert_ids = []
                 cpu_expert_ids = []
                 for expert_id in range(slot.num_experts):
@@ -4526,9 +4185,7 @@ class _Mxfp4LayerwisePrefillManager:
                     pending_h2d_error = None
                     try:
                         stall_t0 = _stats_now(stats_chunk)
-                        # Bank mode owns no SHM host slot, so the reuse
-                        # fence below stays as a no-op error broadcast.
-                        if bank is None and self.host_slot_was_used[host_slot]:
+                        if self.host_slot_was_used[host_slot]:
                             self.host_slot_free_events[host_slot].synchronize()
                             _stats_note_ms(
                                 stats_chunk, layer_idx, "h2d_stall_ms", stall_t0
@@ -4544,32 +4201,25 @@ class _Mxfp4LayerwisePrefillManager:
                         f"host-slot {host_slot} reuse for expert {expert_id}",
                     )
 
-                    if bank is None:
-                        # Asserts A + B/E: the host-slot sync above released
-                        # the previous owner, so the record runs before TP0
-                        # may overwrite the SHM slot (and gates that
-                        # overwrite at enforce level).
-                        write_error = self._ownership_record_host_slot(
-                            layer_idx, position, host_slot
-                        )
-                        if method.tp_rank == 0 and write_error is None:
-                            try:
-                                if method.wrapper is None:
-                                    raise RuntimeError(
-                                        "MXFP4 TP0 has no KT wrapper for host "
-                                        "weight transport"
-                                    )
-                                self._submit_host_write(
-                                    method, expert_id, host_slot
+                    # Asserts A + B/E: the host-slot sync above released
+                    # the previous owner, so the record runs before TP0
+                    # may overwrite the SHM slot (and gates that
+                    # overwrite at enforce level).
+                    write_error = self._ownership_record_host_slot(
+                        layer_idx, position, host_slot
+                    )
+                    if method.tp_rank == 0 and write_error is None:
+                        try:
+                            if method.wrapper is None:
+                                raise RuntimeError(
+                                    "MXFP4 TP0 has no KT wrapper for host "
+                                    "weight transport"
                                 )
-                            except Exception as exc:
-                                write_error = exc
-                    else:
-                        # Bank mode skips the ownership record and the TP0
-                        # host write entirely; the consensus below stays as
-                        # a no-op error broadcast so the per-layer count is
-                        # pinned at the legacy 2 x num_experts.
-                        write_error = None
+                            self._submit_host_write(
+                                method, expert_id, host_slot
+                            )
+                        except Exception as exc:
+                            write_error = exc
 
                     # The device reduction is both the producer-ready fence and
                     # an error broadcast.  TP0 therefore cannot strand peer ranks
@@ -4580,10 +4230,8 @@ class _Mxfp4LayerwisePrefillManager:
 
                     if batch_dma and self._h2d_planner is not None:
                         # w0: one singleton entry per bank, so the enqueued DMAs
-                        # are byte-identical to the legacy loop below.  Bank
-                        # rows are expert-indexed, so the source is the
-                        # expert itself instead of the dual host_slot.
-                        src_row = expert_id if bank is not None else host_slot
+                        # are byte-identical to the legacy loop below.
+                        src_row = host_slot
                         entries = self._h2d_planner.plan_layer(
                             [(src_row, expert_id)]
                         )
@@ -4605,11 +4253,7 @@ class _Mxfp4LayerwisePrefillManager:
                         try:
                             with torch.cuda.stream(self.transfer_stream):
                                 try:
-                                    src_row = (
-                                        expert_id
-                                        if bank is not None
-                                        else host_slot
-                                    )
+                                    src_row = host_slot
                                     for _, cpu_buffer, destination in weight_infos:
                                         destination[expert_id].copy_(
                                             cpu_buffer[src_row], non_blocking=True
@@ -4687,9 +4331,6 @@ class _Mxfp4LayerwisePrefillManager:
             self._commit_tp_runtime_phase(
                 raw_ready_error, f"raw-ready fence for layer {layer_idx}"
             )
-
-            if get_exec().moe.kt_dump_slot_bytes:
-                self._dump_slot_bytes(slot, layer_idx)
 
             postprocess_error = None
             try:
@@ -4962,7 +4603,6 @@ class _Mxfp4LayerwisePrefillManager:
 
 _KT_DEGRADE_FAMILY = "mxfp4_layerwise_prefill"
 _KT_DEGRADE_FAMILY_KV_BUDGET = "mxfp4_kv_budget"
-_KT_DEGRADE_FAMILY_BANK_DMA = "mxfp4_bank_dma"
 
 # Reason codes returned by the *_reasoned gate twins.
 _KT_DEGRADE_NOT_REQUESTED = "not_requested"
@@ -4981,41 +4621,6 @@ _KT_DEGRADE_KV_BUDGET_SKIPPED = "kv_budget_skipped"
 # Codes that describe a normal configuration outcome, not a degradation.
 _KT_DEGRADE_SILENT_CODES = frozenset({_KT_DEGRADE_NOT_REQUESTED})
 
-# Bank-DMA codes.  The manifest key-group reason literals double as the
-# values so a degrade warning names the exact failed key (D1).
-_KT_BANK_REASONS = (
-    "layout_version",
-    "topo",
-    "dims",
-    "dtype",
-    "map",
-    "weights_sha256_malformed",
-    "tile_missing",
-    "tile_field_shape",
-    "tile_unreadable",
-    "tile_sha256",
-)
-_KT_BANK_MESSAGES = {
-    "layout_version": "bank manifest layout_version is unsupported",
-    "topo": "bank manifest topo key group mismatch",
-    "dims": "bank manifest dims key group mismatch",
-    "dtype": "bank manifest dtype key group mismatch",
-    "map": "bank manifest map key group mismatch",
-    "weights_sha256_malformed": "bank manifest weights hash is malformed",
-    "tile_missing": "bank tile missing for this rank",
-    "tile_field_shape": "bank tile field shape mismatch",
-    "tile_unreadable": "bank tile read failed",
-    "tile_sha256": "bank tile field sha256 mismatch",
-    # Wrapper-side reasons (no manifest counterpart).
-    "manifest_unreadable": "bank manifest read or parse failed",
-    "no_weight_path": "kt_config.weight_path is unavailable",
-    "num_layers_unavailable": "kt_config.num_layers is unavailable",
-    "geometry_mismatch": "bank row bytes disagree with the SHM bank layout",
-    "capacity_insufficient": "host memory or memlock budget cannot pin the bank",
-    "bank_alloc_failed": "pinned bank allocation or fill failed",
-    "mutex_window": "bank DMA is inert while a staging-window mode is active",
-}
-
 _KT_DEGRADE_MESSAGES = {
     _KT_DEGRADE_NOT_REQUESTED: "layerwise prefill not requested",
     _KT_DEGRADE_V4_HELPERS_MISSING: "v4_marlin_moe prepared-weight helpers are unavailable",
@@ -5029,7 +4634,6 @@ _KT_DEGRADE_MESSAGES = {
     _KT_DEGRADE_RAW_SOURCE_ABSENT: "canonical raw MXFP4 weights were not preserved for this layer",
     _KT_DEGRADE_RAW_SOURCE_INCOMPLETE: "canonical raw MXFP4 weights are incomplete",
     _KT_DEGRADE_KV_BUDGET_SKIPPED: "KV-cache reservation for the lazy layerwise slots was skipped",
-    **_KT_BANK_MESSAGES,
 }
 
 _KT_DEGRADE_EMITTED = set()
