@@ -449,6 +449,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         self.num_experts = num_experts
+        # num_experts is the authoritative buffer row count: the KT wrapper
+        # passes a per-layer GPU-expert subset smaller than layer.num_local_experts.
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
@@ -538,7 +540,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
-                layer.num_local_experts,
+                self.num_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // 2,
                 dtype=weight_dtype,
@@ -551,7 +553,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight_scale = torch.nn.Parameter(
             torch.full(
                 (
-                    layer.num_local_experts,
+                    self.num_experts,
                     2 * intermediate_size_per_partition_after_pad,
                     hidden_size // mxfp4_block,
                 ),
@@ -568,7 +570,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if create_bias:
             w13_weight_bias = torch.nn.Parameter(
                 torch.zeros(
-                    layer.num_local_experts,
+                    self.num_experts,
                     2 * intermediate_size_per_partition_after_pad,
                     dtype=torch.bfloat16,
                 ),
@@ -580,7 +582,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.zeros(
-                layer.num_local_experts,
+                self.num_experts,
                 hidden_size,
                 intermediate_size_per_partition_after_pad // 2,
                 dtype=weight_dtype,
@@ -593,7 +595,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_weight_scale = torch.nn.Parameter(
             torch.full(
                 (
-                    layer.num_local_experts,
+                    self.num_experts,
                     hidden_size,
                     intermediate_size_per_partition_after_pad // mxfp4_block,
                 ),
@@ -608,7 +610,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if create_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
+                torch.zeros(self.num_experts, hidden_size, dtype=torch.bfloat16),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
@@ -702,9 +704,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._process_weights_for_sm120_cutlass(layer)
             return
         if self.use_flashinfer:
-            # Per-expert buffers are local (create_weights uses num_local_experts);
-            # the global self.num_experts here breaks EP>1. Mirrors the SM90 path.
-            E = layer.num_local_experts
+            # Per-expert buffers match the create_weights row count (self.num_experts).
+            E = self.num_experts
             _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
             _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
             layer.gemm1_alpha = Parameter(
@@ -1110,10 +1111,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )  # hidden (unpadded, *2 because packed 4-bit)
         N_pad = self._padded_intermediate
         K_pad = self._padded_hidden
-        # Use the local expert count (matches the existing buffer allocation in
-        # create_weights) so the SM90 cutlass path remains correct under
-        # Expert Parallelism. `self.num_experts` is the *global* count.
-        E = layer.num_local_experts
+        # E must match the buffer row count from create_weights (self.num_experts).
+        E = self.num_experts
         device = layer.w13_weight.device
         bias_dtype = layer.w13_weight_bias.dtype
 
@@ -1303,7 +1302,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         K_un = layer.w13_weight.shape[2] * 2
         N_pad = self._padded_intermediate
         K_pad = self._padded_hidden
-        E = layer.num_local_experts
+        E = self.num_experts
         device = layer.w13_weight.device
 
         def _stack_up_gate_w13(unpadded, last_pad, last_un):

@@ -6178,6 +6178,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             params_dtype=params_dtype,
             **extra_weight_attrs,
         )
+        # Generic model loaders index resident buffers with the global expert id;
+        # the remap switches them to GPU rows and makes them skip CPU experts.
+        layer.kt_logical_to_gpu_index = self.logical_to_gpu_index
 
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device

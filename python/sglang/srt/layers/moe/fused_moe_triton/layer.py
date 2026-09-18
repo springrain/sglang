@@ -372,6 +372,9 @@ class FusedMoE(torch.nn.Module):
         self._num_local_routed = self._num_global_routed // storage_ep_size
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
+        # Set by KTEPWrapperMethod.create_weights: global expert id -> resident
+        # GPU row, -1 = CPU-resident; None = dense/expert-parallel storage.
+        self.kt_logical_to_gpu_index = None
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
@@ -975,6 +978,10 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        remap = self.kt_logical_to_gpu_index
+        if remap is not None and expert_id < remap.numel():
+            # Returning -1 makes weight_loader skip the GPU write.
+            return int(remap[expert_id])
         start_idx = self._expert_storage_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
