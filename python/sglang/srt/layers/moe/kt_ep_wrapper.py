@@ -3001,6 +3001,50 @@ def generate_uniform_masks(
     return masks
 
 
+def generate_frequency_masks(
+    activation_freq: torch.Tensor,
+    num_gpu_experts: int,
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+) -> torch.Tensor:
+    """Select frequent experts only from MoE layers still managed by KT.
+
+    Layers before ``first_k_dense_replace`` include dense layers and layers
+    pinned entirely on GPU by ``--kt-num-gpu-layers``. Their mask rows are not
+    consumed by KTEP, so allowing them into the global top-k would waste the
+    GPU-expert budget whenever their scores tie with eligible experts (notably
+    for sparse or all-zero activation-count files).
+    """
+    num_layers, num_experts = activation_freq.shape
+    masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
+    moe_layers = [
+        layer_idx
+        for layer_idx in range(num_layers)
+        if layer_idx >= first_k_dense_replace
+        and layer_idx % moe_layer_freq == 0
+    ]
+
+    if moe_layers:
+        flat_freq = activation_freq[moe_layers, :].reshape(-1).to(device="cpu")
+        num_to_select = min(max(num_gpu_experts, 0), flat_freq.numel())
+        if num_to_select:
+            _, selected = torch.topk(
+                flat_freq, k=num_to_select, largest=True, sorted=False
+            )
+            eligible_masks = torch.zeros(
+                flat_freq.numel(), dtype=torch.bool, device="cpu"
+            )
+            eligible_masks[selected] = True
+            masks[moe_layers, :] = eligible_masks.view(len(moe_layers), num_experts)
+
+    # These rows bypass KTEP and retain the existing all-GPU sentinel mask.
+    for layer_idx in range(num_layers):
+        if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
+            masks[layer_idx, :] = True
+
+    return masks
+
+
 def generate_random_masks(
     num_layers: int,
     num_experts: int,
@@ -3219,9 +3263,6 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                 )
             # Sum across buffer_size (dim0) to get total activation counts per expert
             activation_freq = activation_counts.sum(dim=0).float()  # [num_layers, num_experts]
-            if num_gpu_layers > 0:
-                # Pinned layers bypass KT; their experts must not win budget slots.
-                activation_freq[:num_gpu_layers, :] = 0.0
             logger.info("Using frequency-based strategy with activation frequency data")
         else:
             # No activation frequency file, use zeros (uniform distribution)
@@ -3237,11 +3278,12 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
 
         # Generate masks on rank 0
         if tp_rank == 0:
-            masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
-            # For non-MoE layers, set all experts to GPU
-            for layer_idx in range(num_layers):
-                if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
-                    masks[layer_idx, :] = True
+            masks = generate_frequency_masks(
+                activation_freq=activation_freq,
+                num_gpu_experts=num_gpu_experts,
+                first_k_dense_replace=first_k_dense_replace,
+                moe_layer_freq=moe_layer_freq,
+            )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 

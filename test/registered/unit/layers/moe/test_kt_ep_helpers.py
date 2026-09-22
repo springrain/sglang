@@ -46,6 +46,44 @@ def test_front_loading_masks_are_deterministic_and_bounded():
     assert torch.equal(masks, kt_ep.generate_front_loading_masks(4, 4, 5, 0, 1))
 
 
+def test_frequency_masks_do_not_spend_budget_on_pinned_layers():
+    activation_freq = torch.zeros(6, 4)
+    activation_freq[:2] = 1000
+    activation_freq[5, 3] = 10
+
+    masks = kt_ep.generate_frequency_masks(
+        activation_freq=activation_freq,
+        num_gpu_experts=8,
+        first_k_dense_replace=2,
+        moe_layer_freq=1,
+    )
+
+    # The first two rows bypass KTEP and keep their all-GPU sentinel masks.
+    assert masks[:2].all()
+    # All eight budgeted experts must belong to the four remaining MoE layers,
+    # even when the bypassed layers have much larger recorded counts.
+    assert int(masks[2:].sum()) == 8
+    assert masks[5, 3]
+
+
+def test_frequency_masks_clamp_budget_to_eligible_moe_experts():
+    activation_freq = torch.zeros(5, 3)
+
+    masks = kt_ep.generate_frequency_masks(
+        activation_freq=activation_freq,
+        num_gpu_experts=100,
+        first_k_dense_replace=1,
+        moe_layer_freq=2,
+    )
+
+    # With the global modulo convention used by the wrapper, only layers 2 and
+    # 4 are eligible MoE layers. The oversized budget clamps to their six rows.
+    assert masks[[0, 1, 3]].all()
+    assert masks[2].all()
+    assert masks[4].all()
+    assert int(masks[[2, 4]].sum()) == 6
+
+
 def test_random_masks_are_reproducible():
     first = kt_ep.generate_random_masks(4, 8, 6, 0, 1, seed=17)
     second = kt_ep.generate_random_masks(4, 8, 6, 0, 1, seed=17)
