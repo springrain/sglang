@@ -3,8 +3,8 @@
 import pytest
 
 torch = pytest.importorskip("torch")
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -16,8 +16,25 @@ def _parse_server_args(extra: list[str]) -> ServerArgs:
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
-    namespace = parser.parse_args(["--model", "dummy", *extra])
-    return ServerArgs.from_cli_args(namespace)
+    # The modular resolver deliberately stops before model-derived defaults
+    # for a dummy model. Supply the two values generic validation reads so this
+    # helper can exercise the real resolve -> check lifecycle without loading a
+    # model solely to test KT's argument contract.
+    namespace = parser.parse_args(
+        [
+            "--model",
+            "dummy",
+            "--served-model-name",
+            "dummy",
+            "--chunked-prefill-size",
+            "-1",
+            *extra,
+        ]
+    )
+    server_args = ServerArgs.from_cli_args(namespace)
+    server_args.resolve_once()
+    server_args.check_server_args()
+    return server_args
 
 
 def test_uniform_masks_keep_dense_layers_on_gpu():
@@ -31,7 +48,7 @@ def test_uniform_masks_keep_dense_layers_on_gpu():
     assert masks.dtype == torch.bool
     assert masks.shape == (5, 8)
     assert masks[0].all()
-    assert [int(row.sum()) for row in masks[1:]] == [3, 3, 2, 0]
+    assert [int(row.sum()) for row in masks[1:]] == [2, 2, 2, 2]
 
 
 def test_front_loading_masks_are_deterministic_and_bounded():

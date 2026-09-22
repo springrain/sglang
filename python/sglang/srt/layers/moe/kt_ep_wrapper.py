@@ -3425,7 +3425,7 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=get_exec().moe.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=get_exec().moe.kt_enable_dynamic_expert_update,
-        expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
+        expert_lora_path=get_exec().moe.kt_expert_lora_path,
     )
 
 
@@ -4284,6 +4284,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
+
         if self.tp_rank != 0 or self.wrapper is None:
             return
 
