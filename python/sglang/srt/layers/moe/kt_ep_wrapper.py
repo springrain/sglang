@@ -4054,6 +4054,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     swiglu_alpha=_kt_swiglu_alpha,
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
+                    pack_all_experts_on_load=(
+                        self.kt_config.kt_enable_dynamic_expert_update
+                    ),
                 )
 
         # Registration happens during model construction, not on the first
