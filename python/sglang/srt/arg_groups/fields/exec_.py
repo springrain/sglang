@@ -832,7 +832,7 @@ class ExecMoe(msgspec.Struct):
     ] = None
     kt_prefill_stream_top_n: A[
         Optional[int],
-        "[ktransformers parameter] Maximum current-prefill hot experts streamed per cache-managed MoE layer and chunk. Only valid with --kt-expert-placement-strategy decayed-lfu; defaults to min(4, --kt-num-gpu-experts).",
+        "[ktransformers parameter] Maximum current-prefill hotset per cache-managed MoE layer and chunk. The MXFP4 v1 transport eagerly streams at most its two fixed staging slots and keeps overflow hot experts in the main CPU task. Only valid with --kt-expert-placement-strategy decayed-lfu; defaults to min(4, --kt-num-gpu-experts).",
     ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],

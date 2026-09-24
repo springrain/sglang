@@ -710,6 +710,12 @@ class Mxfp4StreamTransport:
     def pending_install_commits(self) -> tuple[ResidentInstallCommit, ...]:
         return tuple(self._pending_commits.values())
 
+    @property
+    def prebegin_capacity(self) -> int:
+        """Number of writers that can be queued before the main CPU task."""
+
+        return len(self.slots)
+
     def _operation_token(
         self,
         op: str,
@@ -854,14 +860,33 @@ class Mxfp4StreamTransport:
             raise ValueError(message)
 
         tickets = []
-        for expert_id in candidates:
-            ticket = Mxfp4StreamTicket(
-                self, self._next_ticket_id, method, expert_id
-            )
-            self._next_ticket_id += 1
-            self._active[ticket.ticket_id] = ticket
-            self._pending.append(ticket)
-            tickets.append(ticket)
+        ticket_creation_error: Exception | None = None
+        ticket_id_start = self._next_ticket_id
+        # Reserve the complete deterministic range before any rank allocates a
+        # CUDA Event.  A partial local construction failure must not leave the
+        # next group's ticket IDs divergent across TP ranks.
+        self._next_ticket_id += len(candidates)
+        try:
+            for position, expert_id in enumerate(candidates):
+                ticket = Mxfp4StreamTicket(
+                    self, ticket_id_start + position, method, expert_id
+                )
+                self._active[ticket.ticket_id] = ticket
+                self._pending.append(ticket)
+                tickets.append(ticket)
+        except Exception as exc:  # noqa: BLE001 - TP creation commit below
+            ticket_creation_error = exc
+        if not self._stage_commit(
+            "BEGIN",
+            "TICKETS_CREATED",
+            ticket_creation_error is None,
+            detail=(candidates,),
+        ):
+            self._abort_candidates_internal()
+            message = "MXFP4 stream ticket creation failed on at least one TP rank"
+            if ticket_creation_error is not None:
+                raise RuntimeError(message) from ticket_creation_error
+            raise RuntimeError(message)
         try:
             self._pump_writer_submissions()
         except Exception:
@@ -871,6 +896,104 @@ class Mxfp4StreamTransport:
             self._abort_candidates_internal()
             raise
         return tuple(tickets)
+
+    def confirm_dispatch_ready(
+        self,
+        *,
+        layer_idx: int,
+        candidate_ids: Sequence[int],
+        local_success: bool,
+    ) -> bool:
+        """Commit the rank-local CPU/GPU assignment split before ticket creation."""
+
+        return self._stage_commit(
+            "PREBEGIN",
+            "DISPATCH_READY",
+            local_success,
+            detail=(int(layer_idx), tuple(int(value) for value in candidate_ids)),
+        )
+
+    def confirm_cpu_main_ordered(
+        self,
+        tickets: Sequence[Mxfp4StreamTicket],
+        *,
+        local_success: bool,
+    ) -> bool:
+        """Commit that every rank may enter the prebegun wait/launch sequence.
+
+        TP0 is the only rank that submits the main CPU expert task.  Once
+        writers are pre-begun, a local failure in filtering, submission, or the
+        CUDA callback boundary must be reported before a peer enters the next
+        ticket collective.  A failed commit is followed by a coordinated abort
+        on every rank.
+        """
+
+        ordered = tuple(tickets)
+        if not ordered:
+            return local_success
+        ticket_ids = tuple(int(ticket.ticket_id) for ticket in ordered)
+        expert_ids = tuple(int(ticket.expert_id) for ticket in ordered)
+        slot_claims = tuple(
+            (ticket.slot_index, ticket.slot_generation) for ticket in ordered
+        )
+
+        def writer_is_submitted(ticket: Mxfp4StreamTicket) -> bool:
+            if (
+                ticket.manager is not self
+                or ticket.ticket_id not in self._active
+                or ticket.state != StreamTicketState.WRITER_SUBMITTED
+                or ticket.slot_index is None
+                or not 0 <= ticket.slot_index < len(self.slots)
+            ):
+                return False
+            slot = self.slots[ticket.slot_index]
+            return (
+                slot.ticket_id == ticket.ticket_id
+                and slot.generation == ticket.slot_generation
+                and slot.state == StreamSlotState.WRITING
+            )
+
+        local_valid = local_success and all(
+            writer_is_submitted(ticket) for ticket in ordered
+        )
+        return self._stage_commit(
+            "PRELAUNCH",
+            "CPU_MAIN_ORDERED",
+            local_valid,
+            ticket=ordered[0],
+            detail=(ticket_ids, expert_ids, slot_claims),
+        )
+
+    def confirm_wrapper_phase(
+        self,
+        phase: str,
+        tickets: Sequence[Mxfp4StreamTicket],
+        *,
+        local_success: bool,
+    ) -> bool:
+        """Commit wrapper-owned phases that are independent of slot state."""
+
+        allowed = {
+            "CPU_MAIN_FALLBACK_ORDERED",
+            "EXECUTION_PLAN_READY",
+            "PREBEGIN_TICKET_ORDER",
+            "WAVE_OUTPUT_VALID",
+            "WAVE_OUTPUT_MERGED",
+            "LAYER_OUTPUT_READY",
+            "LATE_FALLBACK_READY",
+        }
+        if phase not in allowed:
+            raise ValueError(f"unsupported MXFP4 wrapper phase: {phase}")
+        ordered = tuple(tickets)
+        return self._stage_commit(
+            "WRAPPER",
+            phase,
+            local_success,
+            detail=(
+                tuple(int(ticket.ticket_id) for ticket in ordered),
+                tuple(int(ticket.expert_id) for ticket in ordered),
+            ),
+        )
 
     def _pump_writer_submissions(self) -> None:
         while self._pending:
@@ -1573,11 +1696,6 @@ class Mxfp4StreamTransport:
                 "MXFP4 transport cannot recover after a resident install failure; "
                 "the process must fail-stop"
             ) from self._fatal_error
-        if not self._active and not self._pending:
-            return AbortResult(
-                recovered=True,
-                pending_commits=self.pending_install_commits,
-            )
         irreversible = [
             ticket
             for ticket in self._active.values()
@@ -1624,7 +1742,6 @@ class Mxfp4StreamTransport:
             "ABORT",
             "RECOVERY_FENCED",
             cuda_safe,
-            detail=(tuple(sorted(self._active)),),
         ):
             fatal = RuntimeError(
                 "MXFP4 transport could not establish a common recovery fence"
@@ -1753,6 +1870,10 @@ class UnsupportedMxfp4StreamTransport:
     supported: bool
     reason: str
 
+    @property
+    def prebegin_capacity(self) -> int:
+        return 0
+
     def begin_candidates(self, method: Any, candidate_ids: Sequence[int]):
         raise RuntimeError(self.reason)
 
@@ -1795,12 +1916,20 @@ def probe_mxfp4_stream_transport(
     if tp_rank == 0:
         wrapper = getattr(method, "wrapper", None)
         moe = getattr(wrapper, "moe", None)
+        cpu_infer = getattr(wrapper, "cpu_infer", None)
         if wrapper is None or not hasattr(
             moe, "write_weight_scale_to_buffer_tracked_task"
         ):
             return Mxfp4StreamCapability(
                 False,
                 "kt-kernel lacks task-specific MXFP4 writer completion",
+            )
+        if cpu_infer is None or not hasattr(
+            cpu_infer, "rethrow_pending_callback_exception"
+        ):
+            return Mxfp4StreamCapability(
+                False,
+                "kt-kernel lacks non-blocking CPU callback error reporting",
             )
     return Mxfp4StreamCapability(True, "supported")
 

@@ -66,6 +66,187 @@ def test_layout_is_single_expert_and_writer_compatible():
     assert layout.spec("w13_weight_scale_inv").gpu_dtype == torch.float32
 
 
+def test_prebegin_capacity_matches_the_fixed_staging_pool():
+    manager = object.__new__(Mxfp4StreamTransport)
+    manager.slots = (object(), object())
+
+    assert manager.prebegin_capacity == 2
+
+
+def test_cpu_main_ordering_commit_covers_ticket_order_and_failure():
+    manager = object.__new__(Mxfp4StreamTransport)
+    calls = []
+
+    def stage_commit(op, stage, local_success, **kwargs):
+        calls.append((op, stage, local_success, kwargs))
+        return local_success
+
+    manager._stage_commit = stage_commit
+    ticket0 = SimpleNamespace(
+        manager=manager,
+        ticket_id=11,
+        expert_id=7,
+        state=StreamTicketState.WRITER_SUBMITTED,
+        slot_index=0,
+        slot_generation=3,
+    )
+    ticket1 = SimpleNamespace(
+        manager=manager,
+        ticket_id=12,
+        expert_id=9,
+        state=StreamTicketState.WRITER_SUBMITTED,
+        slot_index=1,
+        slot_generation=4,
+    )
+    manager.slots = (
+        SimpleNamespace(
+            ticket_id=11,
+            generation=3,
+            state=StreamSlotState.WRITING,
+        ),
+        SimpleNamespace(
+            ticket_id=12,
+            generation=4,
+            state=StreamSlotState.WRITING,
+        ),
+    )
+    manager._active = {11: ticket0, 12: ticket1}
+
+    assert manager.confirm_cpu_main_ordered(
+        (ticket0, ticket1), local_success=True
+    )
+    assert calls == [
+        (
+            "PRELAUNCH",
+            "CPU_MAIN_ORDERED",
+            True,
+            {
+                "ticket": ticket0,
+                "detail": ((11, 12), (7, 9), ((0, 3), (1, 4))),
+            },
+        )
+    ]
+
+    assert not manager.confirm_cpu_main_ordered(
+        (ticket0, ticket1), local_success=False
+    )
+    assert calls[-1][2] is False
+
+    ticket1.state = StreamTicketState.CREATED
+    assert not manager.confirm_cpu_main_ordered(
+        (ticket0, ticket1), local_success=True
+    )
+    assert calls[-1][2] is False
+
+
+def test_dispatch_ready_commit_precedes_ticket_creation():
+    manager = object.__new__(Mxfp4StreamTransport)
+    calls = []
+    manager._stage_commit = lambda *args, **kwargs: calls.append(
+        (args, kwargs)
+    ) or kwargs.get("local_success", args[2])
+
+    assert manager.confirm_dispatch_ready(
+        layer_idx=8,
+        candidate_ids=(7, 9),
+        local_success=True,
+    )
+    assert calls == [
+        (
+            ("PREBEGIN", "DISPATCH_READY", True),
+            {"detail": (8, (7, 9))},
+        )
+    ]
+
+
+def test_wrapper_phase_commit_is_slot_state_independent():
+    manager = object.__new__(Mxfp4StreamTransport)
+    calls = []
+    manager._stage_commit = lambda *args, **kwargs: calls.append(
+        (args, kwargs)
+    ) or args[2]
+    tickets = (
+        SimpleNamespace(ticket_id=11, expert_id=7),
+        SimpleNamespace(ticket_id=12, expert_id=9),
+    )
+
+    assert manager.confirm_wrapper_phase(
+        "LAYER_OUTPUT_READY",
+        tickets,
+        local_success=True,
+    )
+    assert calls == [
+        (
+            ("WRAPPER", "LAYER_OUTPUT_READY", True),
+            {"detail": ((11, 12), (7, 9))},
+        )
+    ]
+    with pytest.raises(ValueError, match="unsupported MXFP4 wrapper phase"):
+        manager.confirm_wrapper_phase(
+            "UNKNOWN",
+            tickets,
+            local_success=True,
+        )
+
+
+def test_ticket_creation_failure_aborts_before_any_writer_is_pumped(monkeypatch):
+    manager = object.__new__(Mxfp4StreamTransport)
+    manager.group_epoch = 0
+    manager._closed = False
+    manager._fatal_error = None
+    manager._active = {}
+    manager._pending = []
+    manager._pending_commits = {}
+    manager._next_ticket_id = 1
+    manager.weight_namespace = "weights"
+    stages = []
+    aborted = []
+    pumped = []
+    created = []
+
+    def stage_commit(op, stage, local_success, **_kwargs):
+        stages.append((op, stage, local_success))
+        return local_success
+
+    manager._stage_commit = stage_commit
+
+    def abort_partial_group():
+        aborted.append(True)
+        manager._active.clear()
+        manager._pending.clear()
+
+    manager._abort_candidates_internal = abort_partial_group
+    manager._pump_writer_submissions = lambda: pumped.append(True)
+
+    def create_ticket(_manager, ticket_id, _method, expert_id):
+        if created:
+            raise RuntimeError("synthetic CUDA event allocation failure")
+        ticket = SimpleNamespace(ticket_id=ticket_id, expert_id=expert_id)
+        created.append(ticket)
+        return ticket
+
+    monkeypatch.setattr(
+        _TRANSPORT,
+        "Mxfp4StreamTicket",
+        create_ticket,
+    )
+    method = SimpleNamespace(
+        global_num_experts=16,
+        kt_config=SimpleNamespace(layer_idx=8),
+    )
+
+    with pytest.raises(RuntimeError, match="ticket creation failed"):
+        manager.begin_candidates(method, (7, 9))
+
+    assert stages == [
+        ("BEGIN", "ENTER", True),
+        ("BEGIN", "TICKETS_CREATED", False),
+    ]
+    assert aborted == [True]
+    assert pumped == []
+    assert manager._next_ticket_id == 3
+
+
 def test_layout_rejects_a_cross_tensor_shape_mismatch():
     tensors = _raw_tensors()
     tensors["w2_weight_scale_inv"] = torch.empty(3, 64, 5)
@@ -419,13 +600,23 @@ def test_close_fences_before_host_unregister_and_retains_on_failure():
     assert "return False" in close
 
 
-def test_abort_preserves_irreversible_commits_for_later_publish():
+def test_abort_preserves_irreversible_commits_for_later_publish(monkeypatch):
     manager = object.__new__(Mxfp4StreamTransport)
     commit = object()
     manager._fatal_error = None
     manager._active = {}
     manager._pending = []
     manager._pending_commits = {("commit", 1): commit}
+    manager.tp_rank = 1
+    manager.transfer_stream = SimpleNamespace(synchronize=lambda: None)
+    manager.prepare_stream = SimpleNamespace(synchronize=lambda: None)
+    manager.layout = SimpleNamespace(device=torch.device("cpu"))
+    manager.slots = ()
+    stages = []
+    manager._stage_commit = lambda op, stage, *_args, **_kwargs: stages.append(
+        (op, stage)
+    ) or True
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args, **_kwargs: None)
 
     result = manager._abort_candidates_internal()
 
@@ -433,6 +624,7 @@ def test_abort_preserves_irreversible_commits_for_later_publish():
     assert result.pending_commits == (commit,)
     assert result.mapping_publish_required
     assert manager._pending_commits == {("commit", 1): commit}
+    assert stages == [("ABORT", "RECOVERY_FENCED")]
 
 
 def test_irreversible_commit_is_registered_before_active_ticket_is_removed():
