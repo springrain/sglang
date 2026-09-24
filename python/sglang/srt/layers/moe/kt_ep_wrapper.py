@@ -93,7 +93,6 @@ logger = logging.getLogger(__name__)
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
-_KT_STREAM_CAPACITY_WARNED: set[tuple[int, int]] = set()
 
 
 @dataclass
@@ -175,52 +174,25 @@ class KTExpertStreamExecution:
 
 @dataclass(frozen=True)
 class KTExpertPrebegunStream:
-    """A bounded stream plan whose writer tickets already precede CPU work.
+    """A stream plan whose complete ordered ticket group is already created.
 
-    The MXFP4 v1 transport has a fixed number of host/GPU staging slots.  Only
-    candidates with a writer submitted before the main CPU task can overlap
-    their H2D/prepare/wave-2 work with that task.  Remaining policy candidates
-    stay CPU-owned for this window instead of becoming a serialized tail.
+    The transport immediately submits up to its fixed staging depth and keeps
+    the remaining tickets pending.  As each in-flight candidate releases or
+    installs its slot, the next ticket is submitted in the same deterministic
+    order.  Every ticket remains GPU-owned for this window unless execution
+    fails and explicitly returns its unexecuted tail to late CPU fallback.
     """
 
     plan: KTExpertStreamPlan
     tickets: Tuple[Any, ...]
 
 
-def bound_stream_plan_to_prebegin_capacity(
-    plan: KTExpertStreamPlan,
-    capacity: int,
-    *,
-    fallback_reason: Optional[str] = None,
-) -> KTExpertStreamPlan:
-    """Limit current-window GPU ownership to writers that can pre-begin.
+def should_reserve_stream_writer_threads(
+    decayed_lfu_enabled: bool, stream_top_n: Optional[int]
+) -> bool:
+    """Reserve writer cores only for an active Stream-TopN transport."""
 
-    ``candidate_expert_ids`` and ``stream_hotset`` remain the complete policy
-    observation.  Only the executable ownership partition changes: overflow
-    candidates remain in the main CPU task, preserving exact-once execution
-    without enqueueing writers behind the long CPU GEMM.
-    """
-
-    if capacity < 0:
-        raise ValueError("stream prebegin capacity must be non-negative")
-
-    claimed = tuple(plan.streamed_expert_ids[:capacity])
-    if claimed == plan.streamed_expert_ids:
-        return plan
-
-    cpu_owned_set = set(plan.cpu_owned_candidate_ids)
-    cpu_owned_set.update(plan.streamed_expert_ids[capacity:])
-    cpu_owned = tuple(
-        expert_id
-        for expert_id in plan.candidate_expert_ids
-        if expert_id in cpu_owned_set
-    )
-    return replace(
-        plan,
-        streamed_expert_ids=claimed,
-        cpu_owned_candidate_ids=cpu_owned,
-        fallback_reason=fallback_reason or plan.fallback_reason,
-    )
+    return bool(decayed_lfu_enabled and stream_top_n)
 
 
 @dataclass
@@ -4546,6 +4518,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         self.kt_config.kt_enable_dynamic_expert_update
                         or self._decayed_lfu_enabled
                     ),
+                    reserve_stream_writer_threads=should_reserve_stream_writer_threads(
+                        self._decayed_lfu_enabled,
+                        self.kt_prefill_stream_top_n,
+                    ),
                 )
 
         # Registration happens during model construction, not on the first
@@ -4737,25 +4713,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "--kt-prefill-stream-top-n requires the MXFP4 streamed "
                 f"transport backend: {self._streamed_wave2_fallback_reason}"
             )
-        prebegin_capacity = int(getattr(transport, "prebegin_capacity", 0))
-        capacity_warning_key = (
-            int(self.kt_prefill_stream_top_n or 0), prebegin_capacity
-        )
-        if (
-            self.tp_rank == 0
-            and self.kt_prefill_stream_top_n is not None
-            and self.kt_prefill_stream_top_n > prebegin_capacity
-            and capacity_warning_key not in _KT_STREAM_CAPACITY_WARNED
-        ):
-            _KT_STREAM_CAPACITY_WARNED.add(capacity_warning_key)
-            logger.warning(
-                "KT prefill Stream-TopN=%d exceeds the MXFP4 eager staging "
-                "capacity=%d; each window streams only the first "
-                "%d missing hot experts and keeps overflow experts in the main "
-                "CPU task",
-                self.kt_prefill_stream_top_n,
-                prebegin_capacity,
-                prebegin_capacity,
+        if not getattr(transport, "rolling_window_supported", False):
+            raise RuntimeError(
+                "--kt-prefill-stream-top-n requires a streamed transport that "
+                "keeps the complete Top-N ticket group GPU-owned while rolling "
+                "through its fixed staging depth"
+            )
+        if int(getattr(transport, "staging_depth", 0)) <= 0:
+            raise RuntimeError(
+                "MXFP4 streamed transport reported an invalid staging depth"
             )
 
     def create_moe_runner(
@@ -5013,59 +4979,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
         return plan
 
-    def _bound_stream_plan_for_prebegin(
-        self, plan: KTExpertStreamPlan
-    ) -> KTExpertStreamPlan:
-        """Apply the transport's fail-closed eager-writer capacity."""
-
-        requested = tuple(plan.streamed_expert_ids)
-        if not requested:
-            return plan
-
-        transport = getattr(self, "_expert_stream_transport", None)
-        if transport is None or not getattr(transport, "supported", False):
-            reason = self._streamed_wave2_fallback_reason
-            capacity = 0
-        else:
-            declared_capacity = getattr(transport, "prebegin_capacity", None)
-            if declared_capacity is None:
-                reason = "stream transport does not declare prebegin capacity"
-                capacity = 0
-            else:
-                capacity = int(declared_capacity)
-                reason = (
-                    f"stream staging capacity {capacity} kept overflow "
-                    "candidates in the main CPU task"
-                    if capacity < len(requested)
-                    else None
-                )
-
-        effective = bound_stream_plan_to_prebegin_capacity(
-            plan,
-            capacity,
-            fallback_reason=reason,
-        )
-        state = self.expert_cache_state
-        if state is not None:
-            state.suppressed_stream_candidates += len(requested) - len(
-                effective.streamed_expert_ids
-            )
-            state.last_stream_plan = effective
-        return effective
-
     def _prebegin_stream_candidates(
         self, plan: KTExpertStreamPlan
     ) -> KTExpertPrebegunStream:
-        """Submit the bounded writer set before enqueueing the main CPU task."""
+        """Create the complete Top-N ticket group before the main CPU task."""
 
-        effective = KTEPWrapperMethod._bound_stream_plan_for_prebegin(
-            self, plan
-        )
-        claimed = tuple(effective.streamed_expert_ids)
+        claimed = tuple(plan.streamed_expert_ids)
         state = self.expert_cache_state
 
         if not claimed:
-            return KTExpertPrebegunStream(plan=effective, tickets=())
+            return KTExpertPrebegunStream(plan=plan, tickets=())
 
         transport = self._expert_stream_transport
         assert transport is not None and getattr(transport, "supported", False)
@@ -5083,8 +5006,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # failure can keep the complete candidate set on CPU without a
             # second late-fallback task.
             reason = f"stream transport begin failed: {exc}"
-            cpu_plan = bound_stream_plan_to_prebegin_capacity(
-                effective, 0, fallback_reason=reason
+            cpu_owned_set = set(plan.cpu_owned_candidate_ids)
+            cpu_owned_set.update(claimed)
+            cpu_plan = replace(
+                plan,
+                streamed_expert_ids=(),
+                cpu_owned_candidate_ids=tuple(
+                    expert_id
+                    for expert_id in plan.candidate_expert_ids
+                    if expert_id in cpu_owned_set
+                ),
+                fallback_reason=reason,
             )
             if state is not None:
                 state.suppressed_stream_candidates += len(claimed)
@@ -5129,7 +5061,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "stream ticket order validation failed on a TP peer"
             )
 
-        return KTExpertPrebegunStream(plan=effective, tickets=tickets)
+        return KTExpertPrebegunStream(plan=plan, tickets=tickets)
 
     def _execute_stream_candidates(
         self,
@@ -5901,11 +5833,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 fallback_reason=fallback_reason,
             )
 
-        # Step 5: Bound ownership first, while no transport ticket is active.
-        # Assignment filtering can therefore fail on any rank without leaking
-        # writers or staging slots.  TP commits the split before ticket creation.
-        if stream_plan is not None and stream_plan.streamed_expert_ids:
-            stream_plan = self._bound_stream_plan_for_prebegin(stream_plan)
+        # Step 5: Claim every missing member of the bounded Top-N hotset for
+        # current-window streaming.  The transport's staging depth limits only
+        # concurrent in-flight tickets; it does not change CPU/GPU ownership.
+        # Assignment filtering still completes before ticket creation so a
+        # rank-local failure cannot leak writers or staging slots.
         stream_candidate_ids = (
             stream_plan.streamed_expert_ids if stream_plan is not None else ()
         )
@@ -5973,9 +5905,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and getattr(dispatch_transport, "supported", False)
         )
 
-        # Pre-begin only the candidates backed by fixed staging slots.  Their
-        # tracked writers enter CPUInfer before the main CPU task.  A recoverable
-        # begin failure restores every candidate to that task before submission.
+        # Create the complete deterministic ticket group.  The fixed staging
+        # depth submits only its eager prefix before the main CPU task; remaining
+        # tickets stay pending and roll forward as earlier slots are released.
+        # A recoverable group-begin failure restores every candidate to CPU.
         prebegun_tickets: Tuple[Any, ...] = ()
         if stream_plan is not None and stream_candidate_ids:
             prebegun = self._prebegin_stream_candidates(stream_plan)
@@ -6030,9 +5963,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                 if stream_candidate_ids:
                     # Wait only for the D2H dependency and CUDA host callback
-                    # that enqueue the main CPU task.  Since writers were
-                    # submitted first, the FIFO is now writer(s) -> CPU main;
-                    # this does not wait for the CPU GEMM itself.
+                    # that enqueue the main CPU task.  Eager writers already
+                    # run on their dedicated writer queue, so this establishes
+                    # concurrent CPU-main/stream-loader progress without
+                    # waiting for the CPU GEMM itself.
                     if _no_cpu_stream:
                         torch.cuda.current_stream(x.device).synchronize()
                     else:
@@ -6139,8 +6073,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             raise prelaunch_error
 
         # Step 6: Each ready candidate immediately runs a private GPU wave 2.
-        # Host export precedes CPU main in the shared FIFO; its H2D, prepare,
-        # and wave 2 can then overlap the main CPU GEMM.
+        # The eager host-export prefix runs on the dedicated writer queue while
+        # CPU main computes non-selected misses.  Later tickets roll through the
+        # two staging slots in deterministic order.  Every successfully launched
+        # candidate is merged exactly once.
         stream_execution: Optional[KTExpertStreamExecution] = None
         stream_merge_error: Optional[Exception] = None
         stream_execute_error: Optional[Exception] = None

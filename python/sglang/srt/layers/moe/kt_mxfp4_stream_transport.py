@@ -15,9 +15,12 @@ The first implementation is intentionally narrow:
 * one streamed candidate per ticket (H2D -> prepare -> private wave-2);
 * optional D2D installation into a fixed resident Marlin slot.
 
-The pool is shared by compatible layers on one device.  A wrapper must finish
-each ticket with ``install`` or ``release`` before it can reuse that staging
-slot for a later candidate.
+The pool is shared by compatible layers on one device.  The two slots limit
+concurrent writer/H2D/prepare work, not the number of candidates in a window.
+``begin_candidates`` returns every requested ticket, eagerly submits at most
+two writers, and leaves the ordered suffix in ``CREATED``.  A wrapper must
+finish each launched ticket with ``install`` or ``release``; the next
+``wait_and_launch`` then rolls the freed slot to the next suffix ticket.
 """
 
 from __future__ import annotations
@@ -650,6 +653,7 @@ class Mxfp4StreamTransport:
 
     supported = True
     reason = "supported"
+    rolling_window_supported = True
 
     def __init__(
         self,
@@ -711,10 +715,16 @@ class Mxfp4StreamTransport:
         return tuple(self._pending_commits.values())
 
     @property
-    def prebegin_capacity(self) -> int:
-        """Number of writers that can be queued before the main CPU task."""
+    def staging_depth(self) -> int:
+        """Maximum number of candidates concurrently owning staging slots."""
 
         return len(self.slots)
+
+    @property
+    def prebegin_capacity(self) -> int:
+        """Compatibility alias for eager writer concurrency, not a Top-N cap."""
+
+        return self.staging_depth
 
     def _operation_token(
         self,
@@ -815,7 +825,13 @@ class Mxfp4StreamTransport:
     def begin_candidates(
         self, method: Any, candidate_ids: Sequence[int]
     ) -> tuple[Mxfp4StreamTicket, ...]:
-        """Create tickets and immediately submit writers for the first two."""
+        """Create every ticket and eagerly submit only one staging-depth prefix.
+
+        Tickets beyond :attr:`staging_depth` remain ordered in ``CREATED`` and
+        are submitted when an earlier ticket is finalized and its staging slot
+        becomes reusable.  Thus the returned tuple always has one ticket per
+        requested candidate regardless of the fixed pool depth.
+        """
 
         self.group_epoch += 1
         validation_error: Exception | None = None
@@ -921,11 +937,13 @@ class Mxfp4StreamTransport:
     ) -> bool:
         """Commit that every rank may enter the prebegun wait/launch sequence.
 
-        TP0 is the only rank that submits the main CPU expert task.  Once
-        writers are pre-begun, a local failure in filtering, submission, or the
-        CUDA callback boundary must be reported before a peer enters the next
-        ticket collective.  A failed commit is followed by a coordinated abort
-        on every rank.
+        The complete window is included: one staging-depth prefix must own the
+        fixed slots in ``WRITER_SUBMITTED`` while the remaining ordered suffix
+        must still be ``CREATED`` in ``_pending``.  TP0 is the only rank that
+        submits the main CPU expert task.  A local failure in filtering,
+        submission, or the CUDA callback boundary must be reported before a
+        peer enters the next ticket collective.  A failed commit is followed
+        by a coordinated abort on every rank.
         """
 
         ordered = tuple(tickets)
@@ -936,6 +954,10 @@ class Mxfp4StreamTransport:
         slot_claims = tuple(
             (ticket.slot_index, ticket.slot_generation) for ticket in ordered
         )
+        ticket_states = tuple(ticket.state.value for ticket in ordered)
+        eager_count = min(len(ordered), self.staging_depth)
+        eager = ordered[:eager_count]
+        deferred = ordered[eager_count:]
 
         def writer_is_submitted(ticket: Mxfp4StreamTicket) -> bool:
             if (
@@ -953,15 +975,30 @@ class Mxfp4StreamTransport:
                 and slot.state == StreamSlotState.WRITING
             )
 
-        local_valid = local_success and all(
-            writer_is_submitted(ticket) for ticket in ordered
+        def writer_is_deferred(ticket: Mxfp4StreamTicket) -> bool:
+            return (
+                ticket.manager is self
+                and ticket.ticket_id in self._active
+                and ticket.state == StreamTicketState.CREATED
+                and ticket.slot_index is None
+                and ticket.slot_generation == -1
+            )
+
+        claimed_slots = tuple(ticket.slot_index for ticket in eager)
+        local_valid = (
+            local_success
+            and tuple(self._active.values()) == ordered
+            and all(writer_is_submitted(ticket) for ticket in eager)
+            and all(writer_is_deferred(ticket) for ticket in deferred)
+            and tuple(self._pending) == deferred
+            and len(set(claimed_slots)) == len(claimed_slots)
         )
         return self._stage_commit(
             "PRELAUNCH",
             "CPU_MAIN_ORDERED",
             local_valid,
             ticket=ordered[0],
-            detail=(ticket_ids, expert_ids, slot_claims),
+            detail=(ticket_ids, expert_ids, ticket_states, slot_claims),
         )
 
     def confirm_wrapper_phase(
@@ -1005,6 +1042,53 @@ class Mxfp4StreamTransport:
                 return
             ticket = self._pending.pop(0)
             self._submit_writer(ticket, slot)
+
+    def _refill_writer_submissions_for_wait(
+        self, ticket: Mxfp4StreamTicket
+    ) -> None:
+        """Collectively refill every free slot before the current wave starts.
+
+        This is intentionally called for both eager ``WRITER_SUBMITTED``
+        tickets and deferred ``CREATED`` tickets.  After ticket N is finalized,
+        ticket N+1's wait entry can therefore submit ticket N+2 before waiting
+        for or launching N+1, keeping the fixed-depth pipeline full.
+
+        Refill happens before the current wave is launched.  A later writer
+        submission failure can consequently abort the still-unlaunched current
+        ticket and its suffix without turning an already-produced GPU output
+        into an ambiguous ordinary failure.
+        """
+
+        pending = tuple(self._pending)
+        free_slots = tuple(
+            slot for slot in self.slots if slot.state == StreamSlotState.FREE
+        )
+        pending_valid = all(
+            pending_ticket.manager is self
+            and pending_ticket.ticket_id in self._active
+            and pending_ticket.state == StreamTicketState.CREATED
+            and pending_ticket.slot_index is None
+            and pending_ticket.slot_generation == -1
+            for pending_ticket in pending
+        )
+        current_turn_valid = ticket.state != StreamTicketState.CREATED or (
+            bool(pending) and pending[0] is ticket and bool(free_slots)
+        )
+        if not self._stage_commit(
+            "WAIT_LAUNCH",
+            "REFILL_PLAN",
+            pending_valid and current_turn_valid,
+            ticket=ticket,
+            detail=(
+                tuple(pending_ticket.ticket_id for pending_ticket in pending),
+                tuple(pending_ticket.expert_id for pending_ticket in pending),
+                tuple((slot.index, slot.generation) for slot in free_slots),
+            ),
+        ):
+            raise RuntimeError(
+                f"ticket {ticket.ticket_id} cannot enter the rolling refill turn"
+            )
+        self._pump_writer_submissions()
 
     def _submit_writer(
         self, ticket: Mxfp4StreamTicket, slot: _GpuStreamSlot
@@ -1135,10 +1219,7 @@ class Mxfp4StreamTransport:
             )
             self._abort_candidates_internal()
             raise RuntimeError("MXFP4 streamed backend is unavailable") from backend_error
-        if ticket.state == StreamTicketState.CREATED:
-            # More than two candidates wait here until an earlier ticket has
-            # released one of the fixed slots.
-            self._pump_writer_submissions()
+        self._refill_writer_submissions_for_wait(ticket)
         if not self._stage_commit(
             "WAIT_LAUNCH",
             "WRITER_AVAILABLE",
@@ -1869,10 +1950,15 @@ class Mxfp4StreamTransport:
 class UnsupportedMxfp4StreamTransport:
     supported: bool
     reason: str
+    rolling_window_supported = False
+
+    @property
+    def staging_depth(self) -> int:
+        return 0
 
     @property
     def prebegin_capacity(self) -> int:
-        return 0
+        return self.staging_depth
 
     def begin_candidates(self, method: Any, candidate_ids: Sequence[int]):
         raise RuntimeError(self.reason)
@@ -1930,6 +2016,26 @@ def probe_mxfp4_stream_transport(
             return Mxfp4StreamCapability(
                 False,
                 "kt-kernel lacks non-blocking CPU callback error reporting",
+            )
+        if not getattr(moe, "_kt_pool_aware_writer", False):
+            return Mxfp4StreamCapability(
+                False,
+                "selected MXFP4 CPU backend lacks an independent pool-aware writer",
+            )
+        writer_preflight = getattr(
+            wrapper, "ensure_mxfp4_stream_writer", None
+        )
+        if not callable(writer_preflight):
+            return Mxfp4StreamCapability(
+                False,
+                "kt-kernel lacks MXFP4 writer-pool preflight support",
+            )
+        try:
+            writer_preflight()
+        except Exception as exc:  # noqa: BLE001 - capability must fail closed
+            return Mxfp4StreamCapability(
+                False,
+                f"MXFP4 independent writer preflight failed: {exc}",
             )
     return Mxfp4StreamCapability(True, "supported")
 

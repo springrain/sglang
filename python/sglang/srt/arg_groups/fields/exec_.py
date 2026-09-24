@@ -808,7 +808,7 @@ class ExecMoe(msgspec.Struct):
     ] = "AMXINT4"
     kt_cpuinfer: A[
         Optional[int],
-        "[ktransformers parameter] The number of CPUInfer threads; required when KT is enabled.",
+        "[ktransformers parameter] Total CPUInfer thread budget; required when KT is enabled. Active MXFP4 Stream-TopN internally reserves one writer thread per --kt-threadpool-count and assigns the remainder to the main expert GEMM.",
     ] = None
     kt_threadpool_count: A[
         int,
@@ -832,7 +832,7 @@ class ExecMoe(msgspec.Struct):
     ] = None
     kt_prefill_stream_top_n: A[
         Optional[int],
-        "[ktransformers parameter] Maximum current-prefill hotset per cache-managed MoE layer and chunk. The MXFP4 v1 transport eagerly streams at most its two fixed staging slots and keeps overflow hot experts in the main CPU task. Only valid with --kt-expert-placement-strategy decayed-lfu; defaults to min(4, --kt-num-gpu-experts).",
+        "[ktransformers parameter] Maximum number of missing hot experts selected for streaming in each cache-managed MoE layer and prefill chunk. The MXFP4 v1 transport reuses two fixed staging slots as a concurrency pipeline; staging depth does not reduce this per-window total. Only valid with --kt-expert-placement-strategy decayed-lfu; defaults to min(4, --kt-num-gpu-experts).",
     ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],

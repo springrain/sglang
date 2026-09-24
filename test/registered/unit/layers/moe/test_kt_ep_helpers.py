@@ -19,6 +19,27 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 kt_ep = pytest.importorskip("sglang.srt.layers.moe.kt_ep_wrapper")
 
 
+@pytest.mark.parametrize(
+    ("decayed_lfu_enabled", "stream_top_n", "expected"),
+    [
+        (False, 0, False),
+        (False, 4, False),
+        (True, 0, False),
+        (True, None, False),
+        (True, 4, True),
+    ],
+)
+def test_stream_writer_core_reservation_is_scoped_to_active_streaming(
+    decayed_lfu_enabled, stream_top_n, expected
+):
+    assert (
+        kt_ep.should_reserve_stream_writer_threads(
+            decayed_lfu_enabled, stream_top_n
+        )
+        is expected
+    )
+
+
 def _parse_server_args(extra: list[str]) -> ServerArgs:
     import argparse
 
@@ -257,31 +278,7 @@ def test_stream_execution_partition_rejects_duplicate_or_missing_ownership():
         kt_ep.validate_stream_execution_partition((4, 5), (4,), ())
 
 
-def test_stream_plan_capacity_spills_tail_into_the_main_cpu_task():
-    plan = kt_ep.KTExpertStreamPlan(
-        layer_idx=8,
-        epoch=1,
-        stream_hotset=(2, 3, 4, 5),
-        candidate_expert_ids=(2, 3, 4, 5),
-        streamed_expert_ids=(2, 3, 4, 5),
-        cpu_owned_candidate_ids=(),
-        streamed_wave2_supported=True,
-    )
-
-    bounded = kt_ep.bound_stream_plan_to_prebegin_capacity(
-        plan,
-        2,
-        fallback_reason="two staging slots",
-    )
-
-    assert bounded.stream_hotset == plan.stream_hotset
-    assert bounded.candidate_expert_ids == plan.candidate_expert_ids
-    assert bounded.streamed_expert_ids == (2, 3)
-    assert bounded.cpu_owned_candidate_ids == (4, 5)
-    assert bounded.fallback_reason == "two staging slots"
-
-
-def test_stream_prebegin_is_reused_without_a_second_writer_submission():
+def test_stream_prebegin_keeps_all_candidates_gpu_owned_with_two_staging_slots():
     plan = kt_ep.KTExpertStreamPlan(
         layer_idx=8,
         epoch=1,
@@ -336,10 +333,10 @@ def test_stream_prebegin_is_reused_without_a_second_writer_submission():
     )
 
     prebegun = kt_ep.KTEPWrapperMethod._prebegin_stream_candidates(method, plan)
-    assert prebegun.plan.streamed_expert_ids == (2, 3)
-    assert prebegun.plan.cpu_owned_candidate_ids == (4, 5)
-    assert transport.begin_calls == [(2, 3)]
-    assert state.suppressed_stream_candidates == 2
+    assert prebegun.plan.streamed_expert_ids == (2, 3, 4, 5)
+    assert prebegun.plan.cpu_owned_candidate_ids == ()
+    assert transport.begin_calls == [(2, 3, 4, 5)]
+    assert state.suppressed_stream_candidates == 0
 
     hidden_states = torch.zeros((2, 3), dtype=torch.float32)
     execution = kt_ep.KTEPWrapperMethod._execute_stream_candidates(
@@ -352,9 +349,9 @@ def test_stream_prebegin_is_reused_without_a_second_writer_submission():
         prebegun_tickets=prebegun.tickets,
     )
 
-    assert transport.begin_calls == [(2, 3)]
-    assert execution.successful_expert_ids == (2, 3)
-    assert torch.equal(execution.output, torch.full_like(hidden_states, 2.0))
+    assert transport.begin_calls == [(2, 3, 4, 5)]
+    assert execution.successful_expert_ids == (2, 3, 4, 5)
+    assert torch.equal(execution.output, torch.full_like(hidden_states, 4.0))
     assert all(ticket.released for ticket in transport.tickets)
 
 
@@ -397,7 +394,7 @@ def test_stream_prebegin_failure_keeps_all_candidates_in_main_cpu_task():
     assert state.suppressed_stream_candidates == 2
 
 
-def test_stream_transport_without_capacity_fails_closed_to_main_cpu():
+def test_stream_transport_capacity_is_not_an_ownership_limit():
     plan = kt_ep.KTExpertStreamPlan(
         layer_idx=8,
         epoch=1,
@@ -411,27 +408,33 @@ def test_stream_transport_without_capacity_fails_closed_to_main_cpu():
     class CapacitylessTransport:
         supported = True
 
-        def begin_candidates(self, *_args, **_kwargs):
-            raise AssertionError("capacity-less transport must not submit writers")
+        def __init__(self):
+            self.begin_calls = []
+
+        def begin_candidates(self, _method, candidate_ids):
+            ids = tuple(candidate_ids)
+            self.begin_calls.append(ids)
+            return tuple(SimpleNamespace(expert_id=expert_id) for expert_id in ids)
 
     state = SimpleNamespace(
         suppressed_stream_candidates=0,
         last_stream_plan=plan,
     )
+    transport = CapacitylessTransport()
     method = SimpleNamespace(
-        _expert_stream_transport=CapacitylessTransport(),
+        _expert_stream_transport=transport,
         _streamed_wave2_fallback_reason="unsupported",
         expert_cache_state=state,
+        tp_rank=0,
+        kt_config=SimpleNamespace(layer_idx=8),
     )
 
-    bounded = kt_ep.KTEPWrapperMethod._bound_stream_plan_for_prebegin(
-        method, plan
-    )
+    prebegun = kt_ep.KTEPWrapperMethod._prebegin_stream_candidates(method, plan)
 
-    assert bounded.streamed_expert_ids == ()
-    assert bounded.cpu_owned_candidate_ids == (2, 3)
-    assert "does not declare prebegin capacity" in bounded.fallback_reason
-    assert state.suppressed_stream_candidates == 2
+    assert prebegun.plan is plan
+    assert tuple(ticket.expert_id for ticket in prebegun.tickets) == (2, 3)
+    assert transport.begin_calls == [(2, 3)]
+    assert state.suppressed_stream_candidates == 0
 
 
 def test_stream_prebegin_does_not_hide_a_fail_stopped_transport():
@@ -565,6 +568,87 @@ def test_stream_dispatcher_returns_failed_tail_for_one_late_cpu_task():
     assert result.installed_replacements == ()
     assert tickets[0].released
     assert transport.aborted == (tickets[1],)
+
+
+def test_stream_dispatcher_top4_failure_returns_unexecuted_tail_once():
+    plan = kt_ep.KTExpertStreamPlan(
+        layer_idx=8,
+        epoch=1,
+        stream_hotset=(2, 3, 4, 5),
+        candidate_expert_ids=(2, 3, 4, 5),
+        streamed_expert_ids=(2, 3, 4, 5),
+        cpu_owned_candidate_ids=(),
+        streamed_wave2_supported=True,
+    )
+
+    class FakeTicket:
+        def __init__(self, expert_id, *, fail=False, must_not_launch=False):
+            self.expert_id = expert_id
+            self.fail = fail
+            self.must_not_launch = must_not_launch
+            self.launched = False
+            self.released = False
+
+        def wait_and_launch(self, **kwargs):
+            if self.must_not_launch:
+                raise AssertionError("tail ticket must remain unexecuted")
+            self.launched = True
+            if self.fail:
+                raise RuntimeError("synthetic rolling H2D failure")
+            return SimpleNamespace(output=torch.ones_like(kwargs["hidden_states"]))
+
+        def release(self):
+            self.released = True
+
+    tickets = (
+        FakeTicket(2),
+        FakeTicket(3),
+        FakeTicket(4, fail=True),
+        FakeTicket(5, must_not_launch=True),
+    )
+
+    class FakeTransport:
+        supported = True
+
+        def __init__(self):
+            self.aborted = None
+
+        def begin_candidates(self, _method, candidate_ids):
+            assert tuple(candidate_ids) == (2, 3, 4, 5)
+            return tickets
+
+        def abort_candidates(self, remaining=None):
+            self.aborted = None if remaining is None else tuple(remaining)
+
+    transport = FakeTransport()
+    method = SimpleNamespace(
+        _expert_stream_transport=transport,
+        _streamed_wave2_fallback_reason="unsupported",
+        expert_cache_state=SimpleNamespace(
+            last_window_counts=(0, 0, 8, 7, 6, 5),
+            plan_persistent_replacements=lambda *_args, **_kwargs: (),
+        ),
+        tp_rank=0,
+        kt_config=SimpleNamespace(layer_idx=8),
+    )
+    hidden_states = torch.zeros((2, 3), dtype=torch.float32)
+
+    result = kt_ep.KTEPWrapperMethod._execute_stream_candidates(
+        method,
+        layer=SimpleNamespace(moe_runner_config=SimpleNamespace(swiglu_limit=None)),
+        plan=plan,
+        hidden_states=hidden_states,
+        topk_ids=torch.tensor([[2, 3], [4, 5]]),
+        topk_weights=torch.ones((2, 2)),
+    )
+
+    assert torch.equal(result.output, torch.full_like(hidden_states, 2.0))
+    assert result.successful_expert_ids == (2, 3)
+    assert result.failed_expert_ids == (4, 5)
+    assert tickets[0].released and tickets[1].released
+    assert tickets[2].launched
+    assert not tickets[3].launched
+    assert transport.aborted == tickets[2:]
 
 
 def test_stream_dispatcher_rejects_an_active_persistent_victim():
@@ -815,6 +899,27 @@ def test_decayed_lfu_cache_state_claims_candidates_before_cpu_submit():
     assert plan.cpu_owned_candidate_ids == ()
     assert state.epoch == 1
     assert state.suppressed_stream_candidates == 0
+
+
+def test_decayed_lfu_top_ten_claims_all_missing_candidates():
+    state = kt_ep.KTExpertCacheState.create(
+        layer_idx=8,
+        num_experts=20,
+        capacity=10,
+        stream_top_n=10,
+        resident_expert_ids=tuple(range(10)),
+        reference_assignments=200,
+    )
+
+    plan = state.record_prefill_window(
+        tuple([0] * 10 + list(range(20, 10, -1))),
+        streamed_wave2_supported=True,
+    )
+
+    assert plan.stream_hotset == tuple(range(10, 20))
+    assert plan.candidate_expert_ids == tuple(range(10, 20))
+    assert plan.streamed_expert_ids == tuple(range(10, 20))
+    assert plan.cpu_owned_candidate_ids == ()
 
 
 def test_decayed_lfu_promotion_is_hysteretic_and_incremental():

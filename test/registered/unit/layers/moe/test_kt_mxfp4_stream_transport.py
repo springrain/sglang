@@ -66,10 +66,12 @@ def test_layout_is_single_expert_and_writer_compatible():
     assert layout.spec("w13_weight_scale_inv").gpu_dtype == torch.float32
 
 
-def test_prebegin_capacity_matches_the_fixed_staging_pool():
+def test_staging_depth_has_a_compatibility_prebegin_alias():
     manager = object.__new__(Mxfp4StreamTransport)
     manager.slots = (object(), object())
 
+    assert manager.rolling_window_supported
+    assert manager.staging_depth == 2
     assert manager.prebegin_capacity == 2
 
 
@@ -111,6 +113,7 @@ def test_cpu_main_ordering_commit_covers_ticket_order_and_failure():
         ),
     )
     manager._active = {11: ticket0, 12: ticket1}
+    manager._pending = []
 
     assert manager.confirm_cpu_main_ordered(
         (ticket0, ticket1), local_success=True
@@ -122,7 +125,12 @@ def test_cpu_main_ordering_commit_covers_ticket_order_and_failure():
             True,
             {
                 "ticket": ticket0,
-                "detail": ((11, 12), (7, 9), ((0, 3), (1, 4))),
+                "detail": (
+                    (11, 12),
+                    (7, 9),
+                    ("WRITER_SUBMITTED", "WRITER_SUBMITTED"),
+                    ((0, 3), (1, 4)),
+                ),
             },
         )
     ]
@@ -137,6 +145,258 @@ def test_cpu_main_ordering_commit_covers_ticket_order_and_failure():
         (ticket0, ticket1), local_success=True
     )
     assert calls[-1][2] is False
+
+
+def test_begin_candidates_keeps_overflow_as_ordered_created_tickets(monkeypatch):
+    manager = object.__new__(Mxfp4StreamTransport)
+    manager.group_epoch = 0
+    manager._closed = False
+    manager._fatal_error = None
+    manager._active = {}
+    manager._pending = []
+    manager._pending_commits = {}
+    manager._next_ticket_id = 1
+    manager.weight_namespace = "weights"
+    manager.slots = tuple(
+        SimpleNamespace(
+            index=index,
+            state=StreamSlotState.FREE,
+            ticket_id=None,
+            generation=10 + index,
+        )
+        for index in range(2)
+    )
+    manager._stage_commit = lambda _op, _stage, local_success, **_kwargs: (
+        local_success
+    )
+    submissions = []
+
+    def create_ticket(ticket_manager, ticket_id, method, expert_id):
+        return SimpleNamespace(
+            manager=ticket_manager,
+            ticket_id=ticket_id,
+            method=method,
+            expert_id=expert_id,
+            state=StreamTicketState.CREATED,
+            slot_index=None,
+            slot_generation=-1,
+            writer_completion=None,
+        )
+
+    def submit_writer(ticket, slot):
+        slot.state = StreamSlotState.WRITING
+        slot.ticket_id = ticket.ticket_id
+        slot.generation += 1
+        ticket.slot_index = slot.index
+        ticket.slot_generation = slot.generation
+        ticket.state = StreamTicketState.WRITER_SUBMITTED
+        submissions.append((ticket.ticket_id, slot.index, slot.generation))
+
+    monkeypatch.setattr(_TRANSPORT, "Mxfp4StreamTicket", create_ticket)
+    manager._submit_writer = submit_writer
+    method = SimpleNamespace(
+        global_num_experts=16,
+        kt_config=SimpleNamespace(layer_idx=8),
+    )
+
+    tickets = manager.begin_candidates(method, (7, 9, 11, 13))
+
+    assert len(tickets) == 4
+    assert [ticket.state for ticket in tickets] == [
+        StreamTicketState.WRITER_SUBMITTED,
+        StreamTicketState.WRITER_SUBMITTED,
+        StreamTicketState.CREATED,
+        StreamTicketState.CREATED,
+    ]
+    assert submissions == [(1, 0, 11), (2, 1, 12)]
+    assert tuple(manager._pending) == tickets[2:]
+    assert tuple(manager._active.values()) == tickets
+
+
+def test_cpu_main_ordering_accepts_eager_prefix_and_created_suffix():
+    manager = object.__new__(Mxfp4StreamTransport)
+    calls = []
+    manager._stage_commit = lambda op, stage, local_success, **kwargs: calls.append(
+        (op, stage, local_success, kwargs)
+    ) or local_success
+    tickets = tuple(
+        SimpleNamespace(
+            manager=manager,
+            ticket_id=11 + index,
+            expert_id=7 + 2 * index,
+            state=(
+                StreamTicketState.WRITER_SUBMITTED
+                if index < 2
+                else StreamTicketState.CREATED
+            ),
+            slot_index=index if index < 2 else None,
+            slot_generation=3 + index if index < 2 else -1,
+        )
+        for index in range(4)
+    )
+    manager.slots = tuple(
+        SimpleNamespace(
+            ticket_id=tickets[index].ticket_id,
+            generation=tickets[index].slot_generation,
+            state=StreamSlotState.WRITING,
+        )
+        for index in range(2)
+    )
+    manager._active = {ticket.ticket_id: ticket for ticket in tickets}
+    manager._pending = list(tickets[2:])
+
+    assert manager.confirm_cpu_main_ordered(tickets, local_success=True)
+    assert calls[-1][2] is True
+    assert calls[-1][3]["detail"] == (
+        (11, 12, 13, 14),
+        (7, 9, 11, 13),
+        (
+            "WRITER_SUBMITTED",
+            "WRITER_SUBMITTED",
+            "CREATED",
+            "CREATED",
+        ),
+        ((0, 3), (1, 4), (None, -1), (None, -1)),
+    )
+
+    manager._pending.reverse()
+    assert not manager.confirm_cpu_main_ordered(tickets, local_success=True)
+    assert calls[-1][2] is False
+
+
+def test_each_wait_refills_a_slot_released_by_the_previous_candidate():
+    manager = object.__new__(Mxfp4StreamTransport)
+    tickets = [
+        SimpleNamespace(
+            manager=manager,
+            ticket_id=index + 1,
+            expert_id=20 + index,
+            state=(
+                StreamTicketState.WRITER_SUBMITTED
+                if index < 2
+                else StreamTicketState.CREATED
+            ),
+            slot_index=index if index < 2 else None,
+            slot_generation=5 + index if index < 2 else -1,
+        )
+        for index in range(4)
+    ]
+    manager.slots = tuple(
+        SimpleNamespace(
+            index=index,
+            state=StreamSlotState.WRITING,
+            ticket_id=tickets[index].ticket_id,
+            generation=tickets[index].slot_generation,
+            reuse_event=object(),
+        )
+        for index in range(2)
+    )
+    manager._active = {ticket.ticket_id: ticket for ticket in tickets}
+    manager._pending = tickets[2:].copy()
+    submissions = []
+    refill_stages = []
+
+    def stage_commit(op, stage, local_success, **kwargs):
+        refill_stages.append((op, stage, local_success, kwargs))
+        return local_success
+
+    manager._stage_commit = stage_commit
+
+    def submit_writer(ticket, slot):
+        slot.state = StreamSlotState.WRITING
+        slot.ticket_id = ticket.ticket_id
+        slot.generation += 1
+        ticket.slot_index = slot.index
+        ticket.slot_generation = slot.generation
+        ticket.state = StreamTicketState.WRITER_SUBMITTED
+        submissions.append((ticket.ticket_id, slot.index, slot.generation))
+
+    manager._submit_writer = submit_writer
+
+    # Both slots are occupied at ticket 0's entry, so no deferred writer is
+    # submitted yet.
+    manager._refill_writer_submissions_for_wait(tickets[0])
+    assert submissions == []
+
+    # Finalizing ticket 0 frees slot 0.  Ticket 1 is already writer-submitted,
+    # but its wait entry must immediately backfill slot 0 with ticket 2.
+    manager._retire_ticket(tickets[0], manager.slots[0])
+    manager._refill_writer_submissions_for_wait(tickets[1])
+    assert submissions == [(3, 0, 6)]
+    assert manager.slots[0].ticket_id == 3
+    assert manager.slots[1].ticket_id == 2
+    assert manager._pending == [tickets[3]]
+
+    # The same rolling rule keeps two in flight after ticket 1 finalizes.
+    manager._retire_ticket(tickets[1], manager.slots[1])
+    manager._refill_writer_submissions_for_wait(tickets[2])
+
+    assert submissions == [(3, 0, 6), (4, 1, 7)]
+    assert [slot.ticket_id for slot in manager.slots] == [3, 4]
+    assert [ticket.slot_generation for ticket in tickets[2:]] == [6, 7]
+    assert manager._pending == []
+    assert set(manager._active) == {3, 4}
+    assert [stage[:3] for stage in refill_stages] == [
+        ("WAIT_LAUNCH", "REFILL_PLAN", True),
+        ("WAIT_LAUNCH", "REFILL_PLAN", True),
+        ("WAIT_LAUNCH", "REFILL_PLAN", True),
+    ]
+    assert refill_stages[1][3]["detail"] == (
+        (3, 4),
+        (22, 23),
+        ((0, 5),),
+    )
+
+
+def test_refill_consensus_precedes_writer_pump():
+    source = MODULE.read_text(encoding="utf-8")
+    refill = source[
+        source.index("    def _refill_writer_submissions_for_wait(") : source.index(
+            "    def _submit_writer("
+        )
+    ]
+
+    assert refill.index('"REFILL_PLAN"') < refill.index(
+        "self._pump_writer_submissions()"
+    )
+
+
+def test_refill_rejects_an_out_of_order_created_ticket_without_pumping():
+    manager = object.__new__(Mxfp4StreamTransport)
+    head = SimpleNamespace(
+        manager=manager,
+        ticket_id=3,
+        expert_id=22,
+        state=StreamTicketState.CREATED,
+        slot_index=None,
+        slot_generation=-1,
+    )
+    later = SimpleNamespace(
+        manager=manager,
+        ticket_id=4,
+        expert_id=23,
+        state=StreamTicketState.CREATED,
+        slot_index=None,
+        slot_generation=-1,
+    )
+    manager._active = {3: head, 4: later}
+    manager._pending = [head, later]
+    manager.slots = (
+        SimpleNamespace(index=0, generation=7, state=StreamSlotState.FREE),
+        SimpleNamespace(index=1, generation=8, state=StreamSlotState.WRITING),
+    )
+    pumped = []
+    manager._pump_writer_submissions = lambda: pumped.append(True)
+    stages = []
+    manager._stage_commit = lambda op, stage, local_success, **kwargs: stages.append(
+        (op, stage, local_success, kwargs)
+    ) or local_success
+
+    with pytest.raises(RuntimeError, match="rolling refill turn"):
+        manager._refill_writer_submissions_for_wait(later)
+
+    assert pumped == []
+    assert stages[0][:3] == ("WAIT_LAUNCH", "REFILL_PLAN", False)
 
 
 def test_dispatch_ready_commit_precedes_ticket_creation():

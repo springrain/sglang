@@ -78,6 +78,23 @@ def test_resident_hits_reduce_candidates_without_backfill():
     assert select_stream_candidates(hotset, set(hotset)) == ()
 
 
+def test_stream_top_ten_keeps_every_missing_hotset_member():
+    counts = list(range(20, 8, -1))
+    hotset = stable_stream_top_n(counts, [0.0] * len(counts), 10)
+
+    assert hotset == tuple(range(10))
+    assert select_stream_candidates(hotset, {1, 4}) == (
+        0,
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+    )
+
+
 def test_victim_plan_is_safe_bounded_and_deterministic():
     residents = (
         # Expired and inactive: selected first despite a higher reuse signal.

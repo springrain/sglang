@@ -229,7 +229,7 @@ def validate_kt_args(server_args: Any) -> None:
                 "--kt-expert-placement-strategy decayed-lfu cannot yet be "
                 "combined with two-batch or single-batch overlap."
             )
-    resolve_prefill_stream_top_n(
+    effective_stream_top_n = resolve_prefill_stream_top_n(
         cfg.kt_expert_placement_strategy,
         cfg.kt_num_gpu_experts,
         cfg.kt_prefill_stream_top_n,
@@ -257,6 +257,17 @@ def validate_kt_args(server_args: Any) -> None:
             raise ValueError(
                 "--kt-cpuinfer must be at least --kt-threadpool-count "
                 f"(got {cfg.kt_cpuinfer} and {cfg.kt_threadpool_count})."
+            )
+        if (
+            cfg.kt_method.upper() == "MXFP4"
+            and cfg.kt_expert_placement_strategy == DECAYED_LFU_STRATEGY
+            and effective_stream_top_n > 0
+            and cfg.kt_cpuinfer < 2 * cfg.kt_threadpool_count
+        ):
+            raise ValueError(
+                "active MXFP4 Stream-TopN requires --kt-cpuinfer to provide "
+                "at least two threads per --kt-threadpool-count (one main "
+                "worker and one reserved writer worker)."
             )
 
     if cfg.kt_enable_dynamic_expert_update and not (

@@ -260,10 +260,40 @@ class TestKTValidation(unittest.TestCase):
         validate_kt_args(
             ServerArgs(
                 model_path="dummy",
+                kt_num_gpu_experts=32,
+                kt_prefill_stream_top_n=10,
+                kt_expert_placement_strategy="decayed-lfu",
+            )
+        )
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
                 kt_num_gpu_experts=8,
                 kt_prefill_stream_top_n=0,
                 kt_expert_placement_strategy="decayed-lfu",
             )
+        )
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
+                kt_weight_path="/weights",
+                kt_method="MXFP4",
+                kt_cpuinfer=1,
+                kt_threadpool_count=1,
+                kt_num_gpu_experts=8,
+                kt_prefill_stream_top_n=0,
+                kt_expert_placement_strategy="decayed-lfu",
+            )
+        )
+        self.assert_invalid(
+            "at least two threads per",
+            kt_weight_path="/weights",
+            kt_method="MXFP4",
+            kt_cpuinfer=1,
+            kt_threadpool_count=1,
+            kt_num_gpu_experts=8,
+            kt_prefill_stream_top_n=1,
+            kt_expert_placement_strategy="decayed-lfu",
         )
         self.assert_invalid(
             "only valid with",
