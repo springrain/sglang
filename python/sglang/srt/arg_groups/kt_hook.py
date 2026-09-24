@@ -11,6 +11,10 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kt_expert_cache_policy import (
+    DECAYED_LFU_STRATEGY,
+    resolve_prefill_stream_top_n,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -73,6 +77,18 @@ def handle_kt_compatibility(server_args: Any) -> None:
         )
         if env_field.get() and not getattr(cfg, arg_name):
             declared[arg_name] = True
+
+    if (
+        cfg.kt_expert_placement_strategy == DECAYED_LFU_STRATEGY
+        and cfg.kt_num_gpu_experts is not None
+        and cfg.kt_num_gpu_experts > 0
+        and cfg.kt_prefill_stream_top_n is None
+    ):
+        declared["kt_prefill_stream_top_n"] = resolve_prefill_stream_top_n(
+            cfg.kt_expert_placement_strategy,
+            cfg.kt_num_gpu_experts,
+            cfg.kt_prefill_stream_top_n,
+        )
 
     if declared:
         declare_resolution(server_args, "handle_kt_compatibility", **declared)
@@ -171,13 +187,53 @@ def validate_kt_args(server_args: Any) -> None:
     ):
         raise ValueError("--kt-gpu-prefill-token-threshold must be non-negative.")
 
-    placement_strategies = {"frequency", "front-loading", "uniform", "random"}
+    placement_strategies = {
+        "frequency",
+        "front-loading",
+        "uniform",
+        "random",
+        DECAYED_LFU_STRATEGY,
+    }
     if cfg.kt_expert_placement_strategy not in placement_strategies:
         raise ValueError(
             "--kt-expert-placement-strategy must be one of "
             f"{sorted(placement_strategies)}, got "
             f"{cfg.kt_expert_placement_strategy!r}."
         )
+
+    if cfg.kt_expert_placement_strategy == DECAYED_LFU_STRATEGY:
+        if cfg.enable_dp_attention:
+            raise ValueError(
+                "--kt-expert-placement-strategy decayed-lfu cannot yet be "
+                "combined with --enable-dp-attention because its prefill "
+                "route histogram assumes contiguous leading prefill rows."
+            )
+        if cfg.kt_gpu_experts_ratio is not None:
+            raise ValueError(
+                "--kt-expert-placement-strategy decayed-lfu requires fixed "
+                "per-layer --kt-num-gpu-experts and cannot be combined with "
+                "--kt-gpu-experts-ratio."
+            )
+        if cfg.kt_enable_dynamic_expert_update:
+            raise ValueError(
+                "--kt-expert-placement-strategy decayed-lfu cannot be combined "
+                "with legacy --kt-enable-dynamic-expert-update."
+            )
+        if cfg.kt_max_deferred_experts_per_token is not None:
+            raise ValueError(
+                "--kt-expert-placement-strategy decayed-lfu cannot yet be "
+                "combined with --kt-max-deferred-experts-per-token."
+            )
+        if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+            raise ValueError(
+                "--kt-expert-placement-strategy decayed-lfu cannot yet be "
+                "combined with two-batch or single-batch overlap."
+            )
+    effective_stream_top_n = resolve_prefill_stream_top_n(
+        cfg.kt_expert_placement_strategy,
+        cfg.kt_num_gpu_experts,
+        cfg.kt_prefill_stream_top_n,
+    )
 
     if cfg.kt_weight_path is not None and (
         cfg.kt_num_gpu_experts is None and cfg.kt_gpu_experts_ratio is None
@@ -213,6 +269,26 @@ def validate_kt_args(server_args: Any) -> None:
             raise ValueError(
                 "--kt-cpuinfer must be at least --kt-threadpool-count "
                 f"(got {cfg.kt_cpuinfer} and {cfg.kt_threadpool_count})."
+            )
+        if (
+            cfg.kt_expert_placement_strategy == DECAYED_LFU_STRATEGY
+            and effective_stream_top_n > 0
+            and cfg.kt_method.upper() != "MXFP4"
+        ):
+            raise ValueError(
+                "active Stream-TopN currently requires --kt-method MXFP4; "
+                f"got {cfg.kt_method!r}."
+            )
+        if (
+            cfg.kt_method.upper() == "MXFP4"
+            and cfg.kt_expert_placement_strategy == DECAYED_LFU_STRATEGY
+            and effective_stream_top_n > 0
+            and cfg.kt_cpuinfer < 2 * cfg.kt_threadpool_count
+        ):
+            raise ValueError(
+                "active MXFP4 Stream-TopN requires --kt-cpuinfer to provide "
+                "at least two threads per --kt-threadpool-count (one main "
+                "worker and one reserved writer worker)."
             )
 
     if cfg.kt_enable_dynamic_expert_update and not (

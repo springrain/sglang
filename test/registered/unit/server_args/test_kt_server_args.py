@@ -30,6 +30,7 @@ KT_DOWNSTREAM_FIELDS = (
     "kt_numa_nodes",
     "kt_gpu_experts_ratio",
     "kt_num_gpu_layers",
+    "kt_prefill_stream_top_n",
     "kt_gpu_prefill_token_threshold",
     "record_kt_gpu_expert_distribution",
     "kt_enable_dynamic_expert_update",
@@ -67,6 +68,8 @@ class TestKTFieldMigration(unittest.TestCase):
                 "0.5",
                 "--kt-num-gpu-layers",
                 "3",
+                "--kt-prefill-stream-top-n",
+                "2",
                 "--kt-gpu-prefill-token-threshold",
                 "128",
                 "--record-kt-gpu-expert-distribution",
@@ -83,6 +86,7 @@ class TestKTFieldMigration(unittest.TestCase):
         self.assertEqual(args.kt_numa_nodes, [0, 1])
         self.assertEqual(args.kt_gpu_experts_ratio, 0.5)
         self.assertEqual(args.kt_num_gpu_layers, 3)
+        self.assertEqual(args.kt_prefill_stream_top_n, 2)
         self.assertEqual(args.kt_gpu_prefill_token_threshold, 128)
         self.assertTrue(args.record_kt_gpu_expert_distribution)
         self.assertTrue(args.kt_enable_dynamic_expert_update)
@@ -100,6 +104,7 @@ class TestKTFieldMigration(unittest.TestCase):
             "kt_num_gpu_experts",
             "kt_gpu_experts_ratio",
             "kt_num_gpu_layers",
+            "kt_prefill_stream_top_n",
             "kt_max_deferred_experts_per_token",
             "kt_gpu_prefill_token_threshold",
             "record_kt_gpu_expert_distribution",
@@ -243,6 +248,127 @@ class TestKTValidation(unittest.TestCase):
             "requires a positive",
             kt_enable_dynamic_expert_update=True,
         )
+
+    def test_decayed_lfu_stream_width_constraints(self):
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
+                kt_num_gpu_experts=8,
+                kt_expert_placement_strategy="decayed-lfu",
+            )
+        )
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
+                kt_num_gpu_experts=32,
+                kt_prefill_stream_top_n=10,
+                kt_expert_placement_strategy="decayed-lfu",
+            )
+        )
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
+                kt_num_gpu_experts=8,
+                kt_prefill_stream_top_n=0,
+                kt_expert_placement_strategy="decayed-lfu",
+            )
+        )
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
+                kt_weight_path="/weights",
+                kt_method="MXFP4",
+                kt_cpuinfer=1,
+                kt_threadpool_count=1,
+                kt_num_gpu_experts=8,
+                kt_prefill_stream_top_n=0,
+                kt_expert_placement_strategy="decayed-lfu",
+            )
+        )
+        self.assert_invalid(
+            "at least two threads per",
+            kt_weight_path="/weights",
+            kt_method="MXFP4",
+            kt_cpuinfer=1,
+            kt_threadpool_count=1,
+            kt_num_gpu_experts=8,
+            kt_prefill_stream_top_n=1,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "requires --kt-method MXFP4",
+            kt_weight_path="/weights",
+            kt_method="AMXINT4",
+            kt_cpuinfer=2,
+            kt_threadpool_count=1,
+            kt_num_gpu_experts=8,
+            kt_prefill_stream_top_n=1,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "only valid with",
+            kt_num_gpu_experts=8,
+            kt_prefill_stream_top_n=1,
+        )
+        self.assert_invalid(
+            "must satisfy 0 <= N <=",
+            kt_num_gpu_experts=8,
+            kt_prefill_stream_top_n=9,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "requires a positive",
+            kt_num_gpu_experts=0,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "cannot be combined with --kt-gpu-experts-ratio",
+            kt_num_gpu_experts=8,
+            kt_gpu_experts_ratio=0.5,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "legacy --kt-enable-dynamic-expert-update",
+            kt_num_gpu_experts=8,
+            kt_enable_dynamic_expert_update=True,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "--kt-max-deferred-experts-per-token",
+            kt_num_gpu_experts=8,
+            kt_max_deferred_experts_per_token=0,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "single-batch overlap",
+            kt_num_gpu_experts=8,
+            enable_single_batch_overlap=True,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        self.assert_invalid(
+            "cannot yet be combined with --enable-dp-attention",
+            kt_num_gpu_experts=8,
+            enable_dp_attention=True,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+
+    def test_decayed_lfu_resolves_default_stream_width(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_num_gpu_experts=32,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        args.resolve_once()
+        self.assertIsNone(args.kt_prefill_stream_top_n)
+        self.assertEqual(resolution_result(args, "kt_prefill_stream_top_n"), 4)
+
+        small = ServerArgs(
+            model_path="dummy",
+            kt_num_gpu_experts=2,
+            kt_expert_placement_strategy="decayed-lfu",
+        )
+        small.resolve_once()
+        self.assertEqual(resolution_result(small, "kt_prefill_stream_top_n"), 2)
 
     def test_server_lifecycle_invokes_kt_validation(self):
         args = ServerArgs(

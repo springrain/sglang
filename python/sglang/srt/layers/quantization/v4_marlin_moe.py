@@ -10,13 +10,12 @@ stream so steady-state prefill does not allocate or transpose weights.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.kernels.ops.quantization.gptq_marlin_repack import mxfp4_marlin_repack
 
@@ -32,12 +31,11 @@ def make_kt_mxfp4_marlin_method(gpu_method, prefix: str = ""):
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
         Mxfp4MarlinMoEMethod,
     )
-    if not torch.cuda.is_available():
-        return gpu_method
+
     # Match the old KT layerwise backend whitelist.  SM90 keeps the current
     # FlashInfer backend; KT's direct prepared-weight Marlin path was validated
     # for Ada (SM89) and consumer Blackwell (SM120).
-    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+    if not get_v4_mxfp4_marlin_streaming_capability().available:
         return gpu_method
 
     if isinstance(gpu_method, Mxfp4MarlinMoEMethod):
@@ -63,6 +61,117 @@ def make_kt_mxfp4_marlin_method(gpu_method, prefix: str = ""):
 V4_FP4_GROUP_SIZE = 32
 _MARLIN_TILE = 16
 _MAX_THREAD_N = 256
+_KT_V4_MARLIN_STREAMING_COMPUTE_CAPABILITIES = frozenset({(8, 9), (12, 0)})
+_V4_MARLIN_ACTIVATION_TYPES = {"silu": 0, "swiglu_oai": 1, "situ": 2}
+
+
+def normalize_v4_mxfp4_activation(
+    *,
+    activation: str | None = None,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float = 0.0,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
+) -> dict[str, float | int]:
+    """Validate and normalize the shared KT CPU/GPU activation contract."""
+
+    limit = 0.0 if swiglu_limit is None else float(swiglu_limit)
+    alpha = float(swiglu_alpha)
+    beta = 0.0 if situ_beta is None else float(situ_beta)
+    linear_beta = (
+        0.0 if situ_linear_beta is None else float(situ_linear_beta)
+    )
+    activation = activation or ("swiglu_oai" if alpha > 0.0 else "silu")
+
+    if activation not in _V4_MARLIN_ACTIVATION_TYPES:
+        raise ValueError(f"unsupported V4 Marlin activation: {activation!r}")
+    if not math.isfinite(limit) or limit < 0.0:
+        raise ValueError("swiglu_limit must be finite and non-negative")
+    if not math.isfinite(alpha) or alpha < 0.0:
+        raise ValueError("swiglu_alpha must be finite and non-negative")
+    if not math.isfinite(beta) or beta < 0.0:
+        raise ValueError("situ_beta must be finite and non-negative")
+    if not math.isfinite(linear_beta) or linear_beta < 0.0:
+        raise ValueError("situ_linear_beta must be finite and non-negative")
+
+    if activation == "situ":
+        if beta <= 0.0:
+            raise ValueError("SiTU requires a finite positive situ_beta")
+        if alpha != 0.0 or limit != 0.0:
+            raise ValueError("SiTU must not reuse SwiGLU-OAI alpha/clamp fields")
+    elif situ_beta is not None or situ_linear_beta is not None:
+        raise ValueError("SiTU beta parameters require activation='situ'")
+    elif activation == "swiglu_oai" and alpha <= 0.0:
+        raise ValueError("SwiGLU-OAI requires a finite positive swiglu_alpha")
+    elif activation == "silu" and alpha != 0.0:
+        raise ValueError("plain SiLU cannot use swiglu_alpha")
+
+    return {
+        "activation_type": _V4_MARLIN_ACTIVATION_TYPES[activation],
+        "swiglu_limit": limit,
+        "swiglu_alpha": alpha,
+        "situ_beta": beta,
+        "situ_linear_beta": linear_beta,
+    }
+
+
+@dataclass(frozen=True)
+class V4MarlinStreamingCapability:
+    """Runtime capability reported to KT's streamed-expert scheduler.
+
+    The first implementation deliberately exposes only the backend contract
+    that is already implemented and numerically covered here.  Scheduling,
+    staging-pool depth, and persistent resident publication remain owned by
+    the KT wrapper.
+    """
+
+    available: bool
+    reason: str
+    single_expert_prepare: bool = True
+    caller_owned_output: bool = True
+    streamed_ready_group: bool = True
+
+
+def get_v4_mxfp4_marlin_streaming_capability(
+    device: torch.device | str | int | None = None,
+) -> V4MarlinStreamingCapability:
+    """Return an explicit, non-destructive streaming capability result."""
+    if not torch.cuda.is_available():
+        return V4MarlinStreamingCapability(False, "CUDA is not available")
+
+    if isinstance(device, int):
+        resolved_device = torch.device("cuda", device)
+    elif device is None:
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        resolved_device = torch.device(device)
+    if resolved_device.type != "cuda":
+        return V4MarlinStreamingCapability(
+            False, f"V4 MXFP4 Marlin requires a CUDA device, got {resolved_device}"
+        )
+
+    compute_capability = torch.cuda.get_device_capability(resolved_device)
+    if compute_capability not in _KT_V4_MARLIN_STREAMING_COMPUTE_CAPABILITIES:
+        supported = ", ".join(
+            f"SM{major}{minor}"
+            for major, minor in sorted(_KT_V4_MARLIN_STREAMING_COMPUTE_CAPABILITIES)
+        )
+        return V4MarlinStreamingCapability(
+            False,
+            "KT V4 MXFP4 streamed Marlin is validated only on "
+            f"{supported}; got SM{compute_capability[0]}{compute_capability[1]}",
+        )
+    return V4MarlinStreamingCapability(True, "supported")
+
+
+def require_v4_mxfp4_marlin_streaming_support(
+    device: torch.device | str | int | None = None,
+) -> V4MarlinStreamingCapability:
+    """Fail fast unless the validated KT streamed-Marlin path is available."""
+    capability = get_v4_mxfp4_marlin_streaming_capability(device)
+    if not capability.available:
+        raise RuntimeError(capability.reason)
+    return capability
 
 
 @dataclass
@@ -118,7 +227,7 @@ def _swizzle_e8m0_scales(
     *,
     size_k: int,
     size_n: int,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     experts = src.shape[0]
     expected = (experts, size_n, size_k // V4_FP4_GROUP_SIZE)
@@ -126,9 +235,7 @@ def _swizzle_e8m0_scales(
         raise ValueError(f"expected scales {expected}, got {tuple(src.shape)}")
     output_shape = (experts, size_k // V4_FP4_GROUP_SIZE, size_n)
     if out is None:
-        out = torch.empty(
-            output_shape, dtype=torch.float8_e8m0fnu, device=src.device
-        )
+        out = torch.empty(output_shape, dtype=torch.float8_e8m0fnu, device=src.device)
     elif (
         tuple(out.shape) != output_shape
         or out.dtype != torch.float8_e8m0fnu
@@ -206,13 +313,9 @@ def allocate_v4_mxfp4_marlin(
     )
     return V4MarlinPreparedWeights(
         w13=torch.empty(w13, dtype=torch.int32, device=device),
-        w13_scale=torch.empty(
-            w13_scale, dtype=torch.float8_e8m0fnu, device=device
-        ),
+        w13_scale=torch.empty(w13_scale, dtype=torch.float8_e8m0fnu, device=device),
         w2=torch.empty(w2, dtype=torch.int32, device=device),
-        w2_scale=torch.empty(
-            w2_scale, dtype=torch.float8_e8m0fnu, device=device
-        ),
+        w2_scale=torch.empty(w2_scale, dtype=torch.float8_e8m0fnu, device=device),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -225,9 +328,14 @@ def prepare_v4_mxfp4_marlin(
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
     *,
-    out: Optional[V4MarlinPreparedWeights] = None,
+    out: V4MarlinPreparedWeights | None = None,
 ) -> V4MarlinPreparedWeights:
     """Prepare native DSV4 weights on the current CUDA stream."""
+    raw_tensors = (w13, w13_scale, w2, w2_scale)
+    if any(tensor.device != w13.device for tensor in raw_tensors):
+        raise ValueError("all raw V4 MXFP4 tensors must be on the same device")
+    if any(not tensor.is_contiguous() for tensor in raw_tensors):
+        raise ValueError("all raw V4 MXFP4 tensors must be contiguous")
     if w13.ndim != 3 or w2.ndim != 3:
         raise ValueError("V4 expert weights must be rank 3")
     experts = w13.shape[0]
@@ -240,7 +348,10 @@ def prepare_v4_mxfp4_marlin(
     _validate_dimensions(experts, hidden_size, intermediate_size)
     expected_w13_scale = (experts, 2 * intermediate_size, hidden_size // 32)
     expected_w2_scale = (experts, hidden_size, intermediate_size // 32)
-    if tuple(w13_scale.shape) != expected_w13_scale or tuple(w2_scale.shape) != expected_w2_scale:
+    if (
+        tuple(w13_scale.shape) != expected_w13_scale
+        or tuple(w2_scale.shape) != expected_w2_scale
+    ):
         raise ValueError(
             f"unexpected scale shapes {tuple(w13_scale.shape)}/{tuple(w2_scale.shape)}"
         )
@@ -268,7 +379,10 @@ def prepare_v4_mxfp4_marlin(
             or out.num_experts != experts
         ):
             raise ValueError("prepared output metadata does not match raw weights")
-        if any(t.device != w13.device for t in (out.w13, out.w13_scale, out.w2, out.w2_scale)):
+        if any(
+            t.device != w13.device
+            for t in (out.w13, out.w13_scale, out.w2, out.w2_scale)
+        ):
             raise ValueError("prepared output must be on the raw weight device")
 
     mxfp4_marlin_repack(w13, hidden_size, 2 * intermediate_size, out.w13)
@@ -288,6 +402,87 @@ def prepare_v4_mxfp4_marlin(
     return out
 
 
+def view_v4_mxfp4_marlin_slot(
+    prepared: V4MarlinPreparedWeights, slot_index: int
+) -> V4MarlinPreparedWeights:
+    """Return a one-expert view without allocating or changing addresses."""
+    if not 0 <= slot_index < prepared.num_experts:
+        raise IndexError(
+            f"slot_index {slot_index} is outside [0, {prepared.num_experts})"
+        )
+    expected = _prepared_shapes(
+        prepared.num_experts,
+        prepared.hidden_size,
+        prepared.intermediate_size,
+    )
+    actual = (
+        tuple(prepared.w13.shape),
+        tuple(prepared.w13_scale.shape),
+        tuple(prepared.w2.shape),
+        tuple(prepared.w2_scale.shape),
+    )
+    if actual != tuple(map(tuple, expected)):
+        raise ValueError(
+            f"prepared storage shapes {actual} do not match metadata {expected}"
+        )
+    tensors = (
+        prepared.w13,
+        prepared.w13_scale,
+        prepared.w2,
+        prepared.w2_scale,
+    )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError(
+            "prepared storage must be contiguous before taking a slot view"
+        )
+
+    return V4MarlinPreparedWeights(
+        w13=prepared.w13[slot_index : slot_index + 1],
+        w13_scale=prepared.w13_scale[slot_index : slot_index + 1],
+        w2=prepared.w2[slot_index : slot_index + 1],
+        w2_scale=prepared.w2_scale[slot_index : slot_index + 1],
+        hidden_size=prepared.hidden_size,
+        intermediate_size=prepared.intermediate_size,
+        num_experts=1,
+    )
+
+
+def _add_single_expert_dimension(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim == 2:
+        return tensor.unsqueeze(0)
+    if tensor.ndim == 3 and tensor.shape[0] == 1:
+        return tensor
+    raise ValueError(
+        f"{name} must describe exactly one expert as rank 2 or [1, ...], "
+        f"got {tuple(tensor.shape)}"
+    )
+
+
+def prepare_v4_mxfp4_marlin_expert(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    out: V4MarlinPreparedWeights,
+    slot_index: int = 0,
+) -> V4MarlinPreparedWeights:
+    """Prepare one raw expert directly into one caller-owned prepared slot.
+
+    ``out`` may be the full resident/staging image.  Only ``slot_index`` is
+    written; the returned object is a one-expert view suitable for a streamed
+    ready-group runner.  The operation is ordered on the current CUDA stream.
+    """
+    slot = view_v4_mxfp4_marlin_slot(out, slot_index)
+    return prepare_v4_mxfp4_marlin(
+        _add_single_expert_dimension("w13", w13),
+        _add_single_expert_dimension("w13_scale", w13_scale),
+        _add_single_expert_dimension("w2", w2),
+        _add_single_expert_dimension("w2_scale", w2_scale),
+        out=slot,
+    )
+
+
 @triton.jit
 def _sanitize_topk_kernel(
     ids_in, weights_in, ids_out, weights_out, total, experts, BLOCK: tl.constexpr
@@ -302,8 +497,19 @@ def _sanitize_topk_kernel(
 
 
 @triton.jit
-def _swiglu_kernel(
-    inp, out, total, n, limit, HAS_LIMIT: tl.constexpr, BLOCK: tl.constexpr
+def _gated_activation_kernel(
+    inp,
+    out,
+    total,
+    n,
+    swiglu_limit,
+    swiglu_alpha,
+    situ_beta,
+    situ_linear_beta,
+    ACTIVATION_TYPE: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    HAS_SITU_LINEAR_BETA: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < total
@@ -311,10 +517,21 @@ def _swiglu_kernel(
     col = offsets - row * n
     gate = tl.load(inp + row * (2 * n) + col, mask=mask, other=0.0).to(tl.float32)
     up = tl.load(inp + row * (2 * n) + n + col, mask=mask, other=0.0).to(tl.float32)
-    if HAS_LIMIT:
-        gate = tl.minimum(gate, limit)
-        up = tl.maximum(-limit, tl.minimum(up, limit))
-    value = gate * tl.sigmoid(gate) * up
+    if ACTIVATION_TYPE == 2:
+        gate_tanh = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
+        gate = situ_beta * gate_tanh * tl.sigmoid(gate)
+        if HAS_SITU_LINEAR_BETA:
+            up_tanh = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
+            up = situ_linear_beta * up_tanh
+        value = gate * up
+    else:
+        if HAS_LIMIT:
+            gate = tl.minimum(gate, swiglu_limit)
+            up = tl.maximum(-swiglu_limit, tl.minimum(up, swiglu_limit))
+        if ACTIVATION_TYPE == 1:
+            value = gate * tl.sigmoid(gate * swiglu_alpha) * (up + 1.0)
+        else:
+            value = gate * tl.sigmoid(gate) * up
     tl.store(out + offsets, value, mask=mask)
 
 
@@ -441,11 +658,17 @@ def apply_v4_marlin_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     routed_scaling_factor: float = 1.0,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
+    activation: str | None = None,
+    swiglu_alpha: float = 0.0,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
 ) -> torch.Tensor:
     """Execute DSV4 MXFP4 MoE with deterministic non-atomic Marlin GEMMs."""
     if hidden_states.dtype != torch.bfloat16:
-        raise TypeError(f"V4 Marlin requires BF16 activations, got {hidden_states.dtype}")
+        raise TypeError(
+            f"V4 Marlin requires BF16 activations, got {hidden_states.dtype}"
+        )
     if not hidden_states.is_contiguous():
         hidden_states = hidden_states.contiguous()
     m, k = hidden_states.shape
@@ -455,6 +678,13 @@ def apply_v4_marlin_moe(
         return torch.zeros_like(hidden_states)
     if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
         raise ValueError("topk ids/weights must be matching rank-2 tensors")
+    activation_contract = normalize_v4_mxfp4_activation(
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
     topk = topk_ids.shape[1]
     workspace = _get_workspace(hidden_states, prepared, topk)
     n = prepared.intermediate_size
@@ -493,22 +723,22 @@ def apply_v4_marlin_moe(
     intermediate2 = workspace.intermediate2[:routed_rows].view(routed_rows, n)
     fp4_type = scalar_types.float4_e2m1f
 
-    common = dict(
-        b_bias_or_none=None,
-        global_scale_or_none=None,
-        b_zeros_or_none=None,
-        g_idx_or_none=None,
-        perm_or_none=None,
-        workspace=workspace.locks,
-        sorted_token_ids=workspace.sorted_ids,
-        expert_ids=workspace.expert_ids,
-        num_tokens_post_padded=workspace.num_tokens_post_pad,
-        use_atomic_add=False,
-        use_fp32_reduce=True,
-        c_tmp_or_none=workspace.c_tmp,
-        empty_tensor_or_none=workspace.empty,
-        initialize_output=True,
-    )
+    common = {
+        "b_bias_or_none": None,
+        "global_scale_or_none": None,
+        "b_zeros_or_none": None,
+        "g_idx_or_none": None,
+        "perm_or_none": None,
+        "workspace": workspace.locks,
+        "sorted_token_ids": workspace.sorted_ids,
+        "expert_ids": workspace.expert_ids,
+        "num_tokens_post_padded": workspace.num_tokens_post_pad,
+        "use_atomic_add": False,
+        "use_fp32_reduce": True,
+        "c_tmp_or_none": workspace.c_tmp,
+        "empty_tensor_or_none": workspace.empty,
+        "initialize_output": True,
+    }
     moe_wna16_marlin_gemm(
         hidden_states,
         intermediate1,
@@ -526,13 +756,18 @@ def apply_v4_marlin_moe(
         **common,
     )
 
-    _swiglu_kernel[(triton.cdiv(routed_rows * n, 256),)](
+    _gated_activation_kernel[(triton.cdiv(routed_rows * n, 256),)](
         intermediate1,
         intermediate2,
         routed_rows * n,
         n,
-        0.0 if swiglu_limit is None else swiglu_limit,
-        HAS_LIMIT=swiglu_limit is not None,
+        activation_contract["swiglu_limit"],
+        activation_contract["swiglu_alpha"],
+        activation_contract["situ_beta"],
+        activation_contract["situ_linear_beta"],
+        ACTIVATION_TYPE=activation_contract["activation_type"],
+        HAS_LIMIT=activation_contract["swiglu_limit"] > 0.0,
+        HAS_SITU_LINEAR_BETA=activation_contract["situ_linear_beta"] > 0.0,
         BLOCK=256,
     )
 
@@ -564,3 +799,116 @@ def apply_v4_marlin_moe(
         BLOCK=256,
     )
     return output
+
+
+def remap_v4_mxfp4_streamed_assignments(
+    *,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    logical_expert_ids: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Filter logical assignments and remap them to staging-local IDs.
+
+    Candidate order is authoritative: ``logical_expert_ids[i]`` must refer to
+    prepared staging slot ``i``.  Non-candidate assignments become ``(-1, 0)``
+    so this wave contributes only the assignments claimed by the stream
+    ticket and can be added to the resident/CPU outputs exactly once.
+    """
+    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        raise ValueError("topk ids/weights must be matching rank-2 tensors")
+    if topk_ids.device != topk_weights.device:
+        raise ValueError("topk ids/weights must be on the same device")
+
+    candidate_ids = tuple(int(expert_id) for expert_id in logical_expert_ids)
+    if not candidate_ids:
+        raise ValueError("logical_expert_ids must not be empty")
+    if any(expert_id < 0 for expert_id in candidate_ids):
+        raise ValueError("logical_expert_ids must be non-negative")
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise ValueError("logical_expert_ids must be unique")
+
+    candidates = torch.tensor(
+        candidate_ids, dtype=topk_ids.dtype, device=topk_ids.device
+    )
+    matches = topk_ids.unsqueeze(-1).eq(candidates.view(1, 1, -1))
+    claimed = matches.any(dim=-1)
+    local_ids = matches.to(torch.int32).argmax(dim=-1)
+    local_ids = local_ids.masked_fill(~claimed, -1)
+    streamed_weights = topk_weights.masked_fill(~claimed, 0)
+    return local_ids, streamed_weights
+
+
+def apply_v4_mxfp4_marlin_streamed_experts(
+    *,
+    hidden_states: torch.Tensor,
+    prepared_staging: V4MarlinPreparedWeights,
+    logical_expert_ids: Sequence[int],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
+    swiglu_limit: float | None = None,
+    activation: str | None = None,
+    swiglu_alpha: float = 0.0,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run a candidate-private MXFP4 wave from prepared staging weights.
+
+    This is the first-version Python-level streamed runner.  It reuses the
+    existing deterministic Marlin MoE kernels, while making the logical to
+    staging-local mapping explicit.  The result owns its storage (or is copied
+    into caller-owned ``out``), so a later ready-group cannot overwrite it via
+    the internal workspace cache.
+    """
+    candidate_ids = tuple(int(expert_id) for expert_id in logical_expert_ids)
+    if len(candidate_ids) != prepared_staging.num_experts:
+        raise ValueError(
+            "logical_expert_ids count must match prepared staging slots: "
+            f"{len(candidate_ids)} != {prepared_staging.num_experts}"
+        )
+    if any(
+        tensor.device != hidden_states.device
+        for tensor in (
+            prepared_staging.w13,
+            prepared_staging.w13_scale,
+            prepared_staging.w2,
+            prepared_staging.w2_scale,
+            topk_ids,
+            topk_weights,
+        )
+    ):
+        raise ValueError(
+            "activations, routing tensors, and staging must share a device"
+        )
+
+    local_ids, streamed_weights = remap_v4_mxfp4_streamed_assignments(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        logical_expert_ids=candidate_ids,
+    )
+    result = apply_v4_marlin_moe(
+        hidden_states=hidden_states,
+        prepared=prepared_staging,
+        topk_weights=streamed_weights,
+        topk_ids=local_ids,
+        routed_scaling_factor=routed_scaling_factor,
+        swiglu_limit=swiglu_limit,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    if out is None:
+        return result.clone()
+    if (
+        tuple(out.shape) != tuple(hidden_states.shape)
+        or out.dtype != hidden_states.dtype
+        or out.device != hidden_states.device
+    ):
+        raise ValueError(
+            "streamed output must match hidden_states shape/dtype/device, got "
+            f"{tuple(out.shape)} {out.dtype} on {out.device}"
+        )
+    out.copy_(result)
+    return out

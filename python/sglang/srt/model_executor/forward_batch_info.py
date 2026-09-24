@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    set_prefill_num_tokens,
     world_dp_gather_enabled,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -203,6 +204,28 @@ class ForwardMode(IntEnum):
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
+
+
+def compute_prefill_num_tokens(
+    forward_mode: ForwardMode,
+    extend_num_tokens: int | None,
+    mix_running_indices_cpu: torch.Tensor | None,
+) -> int:
+    """Return the leading hidden-state rows that are true prefill work.
+
+    ``ScheduleBatch.mix_with_running`` appends one decode row per running
+    request after the prefill rows.  Fail closed when MIXED metadata is
+    unavailable rather than polluting prefill-only routing statistics.
+    """
+
+    total_extend_tokens = int(extend_num_tokens or 0)
+    if forward_mode.is_mixed():
+        if mix_running_indices_cpu is None:
+            return 0
+        return max(total_extend_tokens - int(mix_running_indices_cpu.numel()), 0)
+    if forward_mode.is_extend_without_speculative():
+        return total_extend_tokens
+    return 0
 
 
 @total_ordering
@@ -465,6 +488,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    # Number of leading hidden-state rows belonging to real prefill work.
+    # MIXED batches append running decode rows after these rows.
+    prefill_num_tokens: int = 0
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
@@ -811,6 +837,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        prefill_num_tokens = compute_prefill_num_tokens(
+            batch.forward_mode,
+            batch.extend_num_tokens,
+            batch.mix_running_indices_cpu,
+        )
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -838,6 +870,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
+            prefill_num_tokens=prefill_num_tokens,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
@@ -1447,6 +1480,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.global_num_tokens_gpu,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
+        set_prefill_num_tokens(self.prefill_num_tokens)
 
         bs = self.batch_size
 
@@ -1716,6 +1750,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.layers.communicator import get_attn_tp_context
 
         # Pure TP+SP has no MLP-sync pass, so stamp the decision here.
+        set_is_extend_in_batch(self.is_extend_in_batch)
+        set_prefill_num_tokens(self.prefill_num_tokens)
         self.attn_tp_sequence_sharded = model_runner.attn_tp_sequence_sharded(
             self._forward_num_tokens()
         )

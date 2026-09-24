@@ -37,19 +37,29 @@ import math
 import os
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+)
+from sglang.srt.kt_expert_cache_policy import (
+    DECAYED_LFU_STRATEGY,
+    Replacement,
+    ResidentSlot,
+    plan_victim_replacements,
+    resolve_prefill_stream_top_n,
+    select_stream_candidates,
+    stable_stream_top_n,
+    update_decayed_lfu,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
@@ -102,6 +112,8 @@ class KTConfig:
         num_layers: Total number of layers in the model (optional)
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
+        kt_expert_placement_strategy: Static placement or runtime cache policy
+        kt_prefill_stream_top_n: Maximum current-window streaming hotset size
         expert_lora_path: Optional PEFT adapter directory for KT CPU expert LoRA
     """
 
@@ -117,6 +129,8 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    kt_expert_placement_strategy: str = "uniform"
+    kt_prefill_stream_top_n: Optional[int] = None
     expert_lora_path: Optional[str] = None
 
 
@@ -133,6 +147,290 @@ def _should_pack_all_experts_on_load(config: KTConfig) -> bool:
         and bool(config.gpu_prefill_token_threshold)
         and config.gpu_prefill_token_threshold > 0
     )
+
+
+@dataclass(frozen=True)
+class KTExpertStreamPlan:
+    """Immutable observation/ownership plan for one prefill window.
+
+    ``candidate_expert_ids`` records what the policy would like to stream.
+    ``streamed_expert_ids`` records only candidates for which the runtime has
+    actually claimed GPU wave-2 ownership.  A candidate must stay in
+    ``cpu_owned_candidate_ids`` until that claim is backed by a complete loader
+    and streamed-runner capability; this is the exact-once safety boundary.
+    """
+
+    layer_idx: int
+    epoch: int
+    stream_hotset: Tuple[int, ...]
+    candidate_expert_ids: Tuple[int, ...]
+    streamed_expert_ids: Tuple[int, ...]
+    cpu_owned_candidate_ids: Tuple[int, ...]
+    streamed_wave2_supported: bool
+    fallback_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class KTExpertStreamExecution:
+    """Current-window wave-2 result before late CPU fallback is submitted.
+
+    ``successful_expert_ids`` and ``failed_expert_ids`` are an exact ordered
+    partition of the candidates claimed by ``KTExpertStreamPlan``.  Only
+    successful IDs contribute ``output``; failed IDs must be routed through a
+    late CPU task before the layer result is complete.
+    """
+
+    output: torch.Tensor
+    successful_expert_ids: Tuple[int, ...]
+    failed_expert_ids: Tuple[int, ...]
+    installed_replacements: Tuple[Replacement, ...]
+    install_commits: Tuple[Any, ...] = ()
+    fallback_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class KTExpertPrebegunStream:
+    """A stream plan whose complete ordered ticket group is already created.
+
+    The transport immediately submits up to its fixed staging depth and keeps
+    the remaining tickets pending.  As each in-flight candidate releases or
+    installs its slot, the next ticket is submitted in the same deterministic
+    order.  Every ticket remains GPU-owned for this window unless execution
+    fails and explicitly returns its unexecuted tail to late CPU fallback.
+    """
+
+    plan: KTExpertStreamPlan
+    tickets: Tuple[Any, ...]
+
+
+def should_reserve_stream_writer_threads(
+    decayed_lfu_enabled: bool, stream_top_n: Optional[int]
+) -> bool:
+    """Reserve writer cores only for an active Stream-TopN transport."""
+
+    return bool(decayed_lfu_enabled and stream_top_n)
+
+
+@dataclass
+class KTExpertCacheState:
+    """Per-layer Decayed-LFU state owned by a cache-managed KT wrapper."""
+
+    layer_idx: int
+    num_experts: int
+    capacity: int
+    stream_top_n: int
+    resident_expert_ids: Tuple[int, ...]
+    reference_assignments: int
+    reuse_signal: Tuple[float, ...]
+    lifetime_assignments: Tuple[int, ...]
+    last_access_epoch: Tuple[int, ...]
+    resident_since_epoch: Tuple[int, ...]
+    epoch: int = 0
+    observed_windows: int = 0
+    suppressed_stream_candidates: int = 0
+    last_stream_plan: Optional[KTExpertStreamPlan] = None
+    last_window_counts: Optional[Tuple[int, ...]] = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        layer_idx: int,
+        num_experts: int,
+        capacity: int,
+        stream_top_n: int,
+        resident_expert_ids: Tuple[int, ...],
+        reference_assignments: int,
+    ) -> "KTExpertCacheState":
+        if num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if capacity <= 0 or capacity != len(resident_expert_ids):
+            raise ValueError(
+                "capacity must be positive and match resident_expert_ids"
+            )
+        if len(set(resident_expert_ids)) != len(resident_expert_ids):
+            raise ValueError("resident expert IDs must be unique")
+        if any(
+            expert_id < 0 or expert_id >= num_experts
+            for expert_id in resident_expert_ids
+        ):
+            raise ValueError("resident expert ID is outside the logical range")
+        if stream_top_n < 0 or stream_top_n > capacity:
+            raise ValueError("stream_top_n must be between zero and capacity")
+        return cls(
+            layer_idx=layer_idx,
+            num_experts=num_experts,
+            capacity=capacity,
+            stream_top_n=stream_top_n,
+            resident_expert_ids=resident_expert_ids,
+            reference_assignments=max(int(reference_assignments), 1),
+            reuse_signal=(0.0,) * num_experts,
+            lifetime_assignments=(0,) * num_experts,
+            last_access_epoch=(-1,) * num_experts,
+            resident_since_epoch=(0,) * capacity,
+        )
+
+    def record_prefill_window(
+        self,
+        window_counts: Tuple[int, ...],
+        *,
+        streamed_wave2_supported: bool,
+        fallback_reason: Optional[str] = None,
+    ) -> KTExpertStreamPlan:
+        """Advance one prefill window and produce an exact-once plan.
+
+        A complete streamed backend claims every missing member of the bounded
+        current-window hotset before the main CPU task is submitted.  A frozen
+        or unsupported runtime leaves the same candidates CPU-owned.  The set
+        is never backfilled beyond ``stream_hotset``.
+        """
+
+        if len(window_counts) != self.num_experts:
+            raise ValueError(
+                "window_counts must contain one value per logical expert."
+            )
+        next_epoch = self.epoch + 1
+        self.reuse_signal = update_decayed_lfu(
+            self.reuse_signal,
+            window_counts,
+            decay=0.5,
+            reference_assignments=self.reference_assignments,
+        )
+        self.lifetime_assignments = tuple(
+            old_count + int(window_count)
+            for old_count, window_count in zip(
+                self.lifetime_assignments, window_counts
+            )
+        )
+        self.last_access_epoch = tuple(
+            next_epoch if int(window_count) > 0 else last_epoch
+            for last_epoch, window_count in zip(
+                self.last_access_epoch, window_counts
+            )
+        )
+
+        stream_hotset = stable_stream_top_n(
+            window_counts,
+            self.reuse_signal,
+            self.stream_top_n,
+        )
+        candidate_expert_ids = select_stream_candidates(
+            stream_hotset,
+            self.resident_expert_ids,
+        )
+        streamed_expert_ids = (
+            candidate_expert_ids if streamed_wave2_supported else ()
+        )
+        cpu_owned_candidate_ids = (
+            () if streamed_wave2_supported else candidate_expert_ids
+        )
+        plan = KTExpertStreamPlan(
+            layer_idx=self.layer_idx,
+            epoch=next_epoch,
+            stream_hotset=stream_hotset,
+            candidate_expert_ids=candidate_expert_ids,
+            streamed_expert_ids=streamed_expert_ids,
+            cpu_owned_candidate_ids=cpu_owned_candidate_ids,
+            streamed_wave2_supported=streamed_wave2_supported,
+            fallback_reason=fallback_reason,
+        )
+
+        self.epoch = next_epoch
+        self.observed_windows += 1
+        if not streamed_wave2_supported:
+            self.suppressed_stream_candidates += len(candidate_expert_ids)
+        self.last_stream_plan = plan
+        self.last_window_counts = tuple(int(value) for value in window_counts)
+        return plan
+
+    def plan_persistent_replacements(
+        self,
+        successful_candidate_ids: Tuple[int, ...],
+        window_counts: Tuple[int, ...],
+        *,
+        hysteresis: float = 0.25,
+        min_residency_windows: int = 2,
+        idle_expire_windows: int = 4,
+    ) -> Tuple[Replacement, ...]:
+        """Choose bounded victim slots for successfully streamed candidates.
+
+        Streaming the current chunk and admitting an expert into the persistent
+        resident set are deliberately separate decisions.  The candidate must
+        beat its paired victim by the configured reuse-signal hysteresis; a
+        candidate that is useful only for this window can therefore execute in
+        wave 2 without perturbing the long-lived cache.
+        """
+
+        if len(window_counts) != self.num_experts:
+            raise ValueError(
+                "window_counts must contain one value per logical expert."
+            )
+        if hysteresis < 0:
+            raise ValueError("hysteresis must be non-negative")
+
+        resident_slots = tuple(
+            ResidentSlot(
+                slot_id=slot_id,
+                expert_id=expert_id,
+                reuse_signal=self.reuse_signal[expert_id],
+                last_access_epoch=self.last_access_epoch[expert_id],
+                resident_since_epoch=self.resident_since_epoch[slot_id],
+            )
+            for slot_id, expert_id in enumerate(self.resident_expert_ids)
+        )
+        proposed = plan_victim_replacements(
+            successful_candidate_ids,
+            resident_slots,
+            current_active_expert_ids=(
+                expert_id
+                for expert_id, count in enumerate(window_counts)
+                if int(count) > 0
+            ),
+            stream_hotset=(
+                self.last_stream_plan.stream_hotset
+                if self.last_stream_plan is not None
+                else ()
+            ),
+            current_epoch=self.epoch,
+            min_residency_windows=min_residency_windows,
+            idle_expire_windows=idle_expire_windows,
+            max_replacements=len(successful_candidate_ids),
+        )
+        admitted = []
+        for replacement in proposed:
+            candidate_score = self.reuse_signal[
+                replacement.candidate_expert_id
+            ]
+            victim_score = self.reuse_signal[replacement.victim_expert_id]
+            if candidate_score > victim_score * (1.0 + hysteresis):
+                admitted.append(replacement)
+        return tuple(admitted)
+
+    def commit_persistent_replacements(
+        self, replacements: Tuple[Replacement, ...]
+    ) -> None:
+        """Publish already-installed replacements in the policy snapshot."""
+
+        residents = list(self.resident_expert_ids)
+        resident_since = list(self.resident_since_epoch)
+        seen_slots = set()
+        for replacement in replacements:
+            if replacement.slot_id in seen_slots:
+                raise ValueError("replacement slots must be unique")
+            if not 0 <= replacement.slot_id < self.capacity:
+                raise ValueError("replacement slot is outside cache capacity")
+            if residents[replacement.slot_id] != replacement.victim_expert_id:
+                raise RuntimeError(
+                    "resident slot changed before persistent replacement commit"
+                )
+            if replacement.candidate_expert_id in residents:
+                raise RuntimeError("replacement candidate is already resident")
+            seen_slots.add(replacement.slot_id)
+            residents[replacement.slot_id] = replacement.candidate_expert_id
+            resident_since[replacement.slot_id] = self.epoch
+
+        self.resident_expert_ids = tuple(residents)
+        self.resident_since_epoch = tuple(resident_since)
 
 
 @dataclass
@@ -1074,6 +1372,7 @@ class SharedFullContext:
         tp_world_size = get_tensor_model_parallel_world_size()
         do_write = tp_rank == 0 and wrapper is not None
 
+        pending_write = None
         if do_write:
             # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
             w13_packed_buf = self.cpu_buffers["w13_weight_packed"]
@@ -1114,7 +1413,7 @@ class SharedFullContext:
                     ptr + slot * w2_scale_expert_nbytes
                     for ptr in self.all_rank_buffer_ptrs["w2_weight_scale"]
                 ]
-                wrapper.submit_write_weight_scale_to_buffer(
+                return wrapper.submit_write_weight_scale_to_buffer(
                     tp_world_size,
                     expert_id,
                     w13_packed_ptrs,
@@ -1124,19 +1423,19 @@ class SharedFullContext:
                 )
 
             # Submit expert 0 ahead of time
-            submit_write_expert(0)
+            pending_write = submit_write_expert(0)
 
         for e in range(num_experts):
             # Sync write for expert e, submit write for expert e+1
             if do_write:
-                wrapper.sync_write_weight_scale_to_buffer()
+                wrapper.sync_write_weight_scale_to_buffer(pending_write)
                 if e + 1 < num_experts:
                     # Before writing to slot (e+1)%2, make sure the previous
                     # copy from that slot has completed to avoid overwriting
                     # pinned host memory while DMA is in-flight.
                     if e > 0:
                         events[e - 1].synchronize()
-                    submit_write_expert(e + 1)
+                    pending_write = submit_write_expert(e + 1)
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
@@ -1271,6 +1570,7 @@ class SharedFullContext:
         tp_world_size = get_tensor_model_parallel_world_size()
         do_write = tp_rank == 0 and wrapper is not None
 
+        pending_write = None
         if do_write:
             # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
             w13_weight_buf = self.cpu_buffers["w13_weight"]
@@ -1310,7 +1610,7 @@ class SharedFullContext:
                     ptr + slot * w2_scale_expert_nbytes
                     for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
                 ]
-                wrapper.submit_write_weight_scale_to_buffer(
+                return wrapper.submit_write_weight_scale_to_buffer(
                     tp_world_size,
                     expert_id,
                     w13_weight_ptrs,
@@ -1320,20 +1620,22 @@ class SharedFullContext:
                 )
 
             # Submit first CPU expert ahead of time
-            submit_write_expert(cpu_expert_ids[0], 0)
+            pending_write = submit_write_expert(cpu_expert_ids[0], 0)
 
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
 
             # Sync write for expert e, submit write for next CPU expert
             if do_write:
-                wrapper.sync_write_weight_scale_to_buffer()
+                wrapper.sync_write_weight_scale_to_buffer(pending_write)
                 if idx + 1 < len(cpu_expert_ids):
                     next_slot = (idx + 1) % 2
                     # Before writing to next_slot, ensure copy from that slot is complete.
                     if idx > 0:
                         events[idx - 1].synchronize()
-                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+                    pending_write = submit_write_expert(
+                        cpu_expert_ids[idx + 1], next_slot
+                    )
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
@@ -1519,6 +1821,7 @@ class SharedFullContext:
         tp_world_size = get_tensor_model_parallel_world_size()
         do_write = tp_rank == 0 and wrapper is not None
 
+        pending_write = None
         if do_write:
             # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
             w13_weight_buf = self.cpu_buffers["w13_weight"]
@@ -1558,7 +1861,7 @@ class SharedFullContext:
                     ptr + slot * w2_scale_expert_nbytes
                     for ptr in self.all_rank_buffer_ptrs["w2_weight_scale"]
                 ]
-                wrapper.submit_write_weight_scale_to_buffer(
+                return wrapper.submit_write_weight_scale_to_buffer(
                     tp_world_size,
                     expert_id,
                     w13_weight_ptrs,
@@ -1568,20 +1871,22 @@ class SharedFullContext:
                 )
 
             # Submit first CPU expert ahead of time
-            submit_write_expert(cpu_expert_ids[0], 0)
+            pending_write = submit_write_expert(cpu_expert_ids[0], 0)
 
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
 
             # Sync write for expert e, submit write for next CPU expert
             if do_write:
-                wrapper.sync_write_weight_scale_to_buffer()
+                wrapper.sync_write_weight_scale_to_buffer(pending_write)
                 if idx + 1 < len(cpu_expert_ids):
                     next_slot = (idx + 1) % 2
                     # Before writing to next_slot, ensure copy from that slot is complete.
                     if idx > 0:
                         events[idx - 1].synchronize()
-                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+                    pending_write = submit_write_expert(
+                        cpu_expert_ids[idx + 1], next_slot
+                    )
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
@@ -1684,6 +1989,7 @@ class SharedFullContext:
         tp_world_size = get_tensor_model_parallel_world_size()
         do_write = tp_rank == 0 and wrapper is not None
 
+        pending_write = None
         if do_write:
             # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
             w13_weight_buf = self.cpu_buffers["w13_weight"]
@@ -1710,7 +2016,7 @@ class SharedFullContext:
                 # For BF16, we pass empty scale pointer lists (no scales)
                 w13_scale_ptrs = [0] * tp_world_size
                 w2_scale_ptrs = [0] * tp_world_size
-                wrapper.submit_write_weight_scale_to_buffer(
+                return wrapper.submit_write_weight_scale_to_buffer(
                     tp_world_size,
                     expert_id,
                     w13_weight_ptrs,
@@ -1720,20 +2026,22 @@ class SharedFullContext:
                 )
 
             # Submit first CPU expert ahead of time
-            submit_write_expert(cpu_expert_ids[0], 0)
+            pending_write = submit_write_expert(cpu_expert_ids[0], 0)
 
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
 
             # Sync write for expert e, submit write for next CPU expert
             if do_write:
-                wrapper.sync_write_weight_scale_to_buffer()
+                wrapper.sync_write_weight_scale_to_buffer(pending_write)
                 if idx + 1 < len(cpu_expert_ids):
                     next_slot = (idx + 1) % 2
                     # Before writing to next_slot, ensure copy from that slot is complete.
                     if idx > 0:
                         events[idx - 1].synchronize()
-                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+                    pending_write = submit_write_expert(
+                        cpu_expert_ids[idx + 1], next_slot
+                    )
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
@@ -2091,7 +2399,7 @@ class _Mxfp4LayerwisePrefillManager:
         def rank_pointers(name: str) -> List[int]:
             return [ptr + offsets[name] for ptr in pointers[name]]
 
-        method.wrapper.submit_write_weight_scale_to_buffer(
+        completion = method.wrapper.submit_write_weight_scale_to_buffer(
             get_tensor_model_parallel_world_size(),
             expert_id,
             rank_pointers("w13_weight"),
@@ -2099,7 +2407,7 @@ class _Mxfp4LayerwisePrefillManager:
             rank_pointers("w2_weight"),
             rank_pointers("w2_weight_scale_inv"),
         )
-        method.wrapper.sync_write_weight_scale_to_buffer()
+        method.wrapper.sync_write_weight_scale_to_buffer(completion)
 
     def _postprocess_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         from sglang.srt.layers.quantization.v4_marlin_moe import (
@@ -3313,9 +3621,15 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 
-    elif strategy == "uniform":
+    elif strategy in ("uniform", DECAYED_LFU_STRATEGY):
         if tp_rank == 0:
-            logger.info("Using uniform strategy for GPU expert placement")
+            if strategy == DECAYED_LFU_STRATEGY:
+                logger.info(
+                    "Using per-layer uniform cold-start placement for "
+                    "decayed-lfu expert cache"
+                )
+            else:
+                logger.info("Using uniform strategy for GPU expert placement")
             masks = generate_uniform_masks(
                 num_layers, num_experts, num_gpu_experts,
                 first_k_dense_replace, moe_layer_freq
@@ -3441,6 +3755,8 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=get_exec().moe.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=get_exec().moe.kt_enable_dynamic_expert_update,
+        kt_expert_placement_strategy=get_exec().moe.kt_expert_placement_strategy,
+        kt_prefill_stream_top_n=get_exec().moe.kt_prefill_stream_top_n,
         expert_lora_path=get_exec().moe.kt_expert_lora_path,
     )
 
@@ -3522,6 +3838,7 @@ def resolve_kt_cpu_activation(moe_runner_config, kt_method: str) -> dict:
     activation = getattr(moe_runner_config, "activation", "silu") or "silu"
     method = (kt_method or "").upper()
     alpha = getattr(moe_runner_config, "gemm1_alpha", None)
+    oai_beta = getattr(moe_runner_config, "gemm1_beta", None)
     clamp = getattr(moe_runner_config, "gemm1_clamp_limit", None)
     swiglu_limit = getattr(moe_runner_config, "swiglu_limit", None)
 
@@ -3562,12 +3879,25 @@ def resolve_kt_cpu_activation(moe_runner_config, kt_method: str) -> dict:
     supports_shared_activation = (
         method in _KT_NATIVE_SWIGLU_METHODS or method == "LLAMAFILE"
     )
-    limit = float(clamp if clamp is not None else (swiglu_limit or 0.0))
     swiglu_alpha = float(alpha) if alpha is not None else 0.0
     if not math.isfinite(swiglu_alpha) or swiglu_alpha < 0.0:
         raise ValueError(
             f"KT CPU SwiGLU alpha must be finite and non-negative, got {swiglu_alpha}."
         )
+    if swiglu_alpha > 0.0:
+        if oai_beta is not None and float(oai_beta) != 1.0:
+            raise ValueError(
+                "KT CPU SwiGLU-OAI supports only gemm1_beta=1.0; "
+                f"got {oai_beta}."
+            )
+        limit = float(clamp if clamp is not None else (swiglu_limit or 0.0))
+    else:
+        if clamp is not None and float(clamp) != 0.0:
+            raise ValueError(
+                "plain SiLU gemm1_clamp_limit uses a post-SiLU clamp that "
+                "cannot be represented by KT swiglu_limit"
+            )
+        limit = float(swiglu_limit or 0.0)
     if not math.isfinite(limit) or limit < 0.0:
         raise ValueError(
             f"KT CPU SwiGLU clamp limit must be finite and non-negative, got {limit}."
@@ -3593,6 +3923,74 @@ def resolve_kt_cpu_activation(moe_runner_config, kt_method: str) -> dict:
         "swiglu_alpha": swiglu_alpha,
         "swiglu_limit": limit,
     }
+
+
+def validate_kt_v4_mxfp4_activation(
+    moe_runner_config, activation_kwargs: Dict[str, Any]
+) -> None:
+    """Validate layout details specific to KT's direct V4 Marlin path."""
+
+    activation = activation_kwargs["activation"]
+    if activation in ("swiglu_oai", "situ") and bool(
+        getattr(moe_runner_config, "gate_up_interleaved", True)
+    ):
+        raise ValueError(
+            "KT V4 Marlin SiTU/SwiGLU-OAI requires split gate/up weights "
+            "(gate_up_interleaved=False)."
+        )
+
+
+def filter_expert_assignments(
+    topk_ids: torch.Tensor,
+    expert_ids: Tuple[int, ...],
+    *,
+    keep_selected: bool,
+) -> torch.Tensor:
+    """Build immutable per-call CPU ownership IDs.
+
+    Persistent residency remains encoded by the KT wrapper's pinned mask.
+    This helper handles only transient stream-ticket ownership: the main CPU
+    task excludes selected candidates, while a late fallback keeps exactly
+    those candidates.  The original routing tensor is never modified.
+    """
+
+    if not expert_ids:
+        return topk_ids if not keep_selected else torch.full_like(topk_ids, -1)
+    selected = torch.tensor(
+        expert_ids,
+        dtype=topk_ids.dtype,
+        device=topk_ids.device,
+    )
+    matches = topk_ids.unsqueeze(-1).eq(selected.view(1, 1, -1)).any(dim=-1)
+    if keep_selected:
+        return topk_ids.masked_fill(~matches, -1)
+    return topk_ids.masked_fill(matches, -1)
+
+
+def validate_stream_execution_partition(
+    candidate_expert_ids: Sequence[int],
+    successful_expert_ids: Sequence[int],
+    failed_expert_ids: Sequence[int],
+) -> None:
+    """Require one and only one terminal owner for every stream candidate."""
+
+    candidates = tuple(int(expert_id) for expert_id in candidate_expert_ids)
+    successful = tuple(int(expert_id) for expert_id in successful_expert_ids)
+    failed = tuple(int(expert_id) for expert_id in failed_expert_ids)
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("stream candidate IDs must be unique")
+    if len(set(successful)) != len(successful):
+        raise ValueError("successful stream expert IDs must be unique")
+    if len(set(failed)) != len(failed):
+        raise ValueError("failed stream expert IDs must be unique")
+    if set(successful).intersection(failed):
+        raise RuntimeError("a stream candidate cannot be both GPU and CPU owned")
+    terminal = successful + failed
+    if len(terminal) != len(candidates) or set(terminal) != set(candidates):
+        raise RuntimeError(
+            "stream candidates must terminate exactly once as GPU success or "
+            "late CPU fallback"
+        )
 
 
 def select_top_experts_from_batch(
@@ -3640,6 +4038,44 @@ def select_top_experts_from_batch(
     selected_experts = selected_indices.sort()[0]
 
     return selected_experts
+
+
+def count_expert_route_assignments(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Count valid logical assignments with fixed-shape device temporaries."""
+
+    if num_experts < 0:
+        raise ValueError("num_experts must be non-negative")
+    flat_ids = topk_ids.detach().reshape(-1)
+    if out is None:
+        counts = torch.zeros(
+            num_experts,
+            dtype=torch.int64,
+            device=topk_ids.device,
+        )
+    else:
+        if (
+            tuple(out.shape) != (num_experts,)
+            or out.dtype != torch.int64
+            or out.device != topk_ids.device
+        ):
+            raise ValueError(
+                "route-count output must be int64 [num_experts] on the routing device"
+            )
+        counts = out
+        counts.zero_()
+    if num_experts == 0 or flat_ids.numel() == 0:
+        return counts
+
+    valid = (flat_ids >= 0) & (flat_ids < num_experts)
+    safe_ids = torch.where(valid, flat_ids, torch.zeros_like(flat_ids)).to(
+        dtype=torch.int64
+    )
+    counts.scatter_add_(0, safe_ids, valid.to(dtype=torch.int64))
+    return counts
 
 
 def copy_experts_weights_int4(
@@ -3951,21 +4387,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "kt_kernel is not installed. To use KTransformers EP wrapper, please install kt_kernel."
             )
 
+        decayed_lfu_requested = (
+            kt_config.kt_expert_placement_strategy == DECAYED_LFU_STRATEGY
+        )
         if (
             (kt_config.method or "").upper() == "MXFP4"
-            and kt_config.kt_enable_dynamic_expert_update
+            and (
+                kt_config.kt_enable_dynamic_expert_update
+                or decayed_lfu_requested
+            )
         ):
             if not torch.cuda.is_available():
                 raise ValueError(
-                    "MXFP4 dynamic expert update requires a CUDA GPU; "
-                    "pure CPU/NEON execution cannot update GPU expert placement."
+                    "MXFP4 dynamic expert placement requires a CUDA GPU; "
+                    "pure CPU/NEON execution cannot update GPU expert slots."
                 )
             if int(kt_config.gpu_experts_mask.sum().item()) <= 0:
                 raise ValueError(
-                    "MXFP4 dynamic expert update requires at least one GPU expert; "
+                    "MXFP4 dynamic expert placement requires at least one GPU expert; "
                     "set --kt-num-gpu-experts to a positive value."
                 )
-            if not kt_config.gpu_prefill_token_threshold or kt_config.gpu_prefill_token_threshold <= 0:
+            if (
+                kt_config.kt_enable_dynamic_expert_update
+                and (
+                    not kt_config.gpu_prefill_token_threshold
+                    or kt_config.gpu_prefill_token_threshold <= 0
+                )
+            ):
                 raise ValueError(
                     "MXFP4 dynamic expert update requires a positive "
                     "--kt-gpu-prefill-token-threshold."
@@ -3979,7 +4427,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             if dynamic_gpu_method.__class__.__name__ != "Mxfp4MarlinMoEMethod":
                 raise ValueError(
-                    "MXFP4 dynamic expert update currently supports only the "
+                    "MXFP4 dynamic expert placement currently supports only the "
                     "KT Marlin backend on SM89/SM120; FlashInfer, TRT-LLM, "
                     "Humming, generic MXFP4, and CPU-only ARM paths are not supported."
                 )
@@ -3991,6 +4439,26 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
         self._uses_compact_gpu_expert_rows = False
         self._enable_compact_gpu_expert_rows(self.gpu_method)
+        self._decayed_lfu_enabled = decayed_lfu_requested
+        if self._decayed_lfu_enabled and kt_config.kt_enable_dynamic_expert_update:
+            raise ValueError(
+                "decayed-lfu cannot be combined with the legacy "
+                "--kt-enable-dynamic-expert-update controller."
+            )
+        self.kt_prefill_stream_top_n = resolve_prefill_stream_top_n(
+            kt_config.kt_expert_placement_strategy,
+            self.num_gpu_experts,
+            kt_config.kt_prefill_stream_top_n,
+        )
+        # Resolved after weights are loaded, because transport capability
+        # depends on the concrete MXFP4 layout and tracked writer binding.
+        self._streamed_wave2_supported = False
+        self._streamed_wave2_fallback_reason = (
+            "stream transport has not been initialized"
+        )
+        self._expert_stream_transport: Optional[Any] = None
+        self.expert_cache_state: Optional[KTExpertCacheState] = None
+        self._kt_activation_kwargs: Optional[Dict[str, Any]] = None
         self.kt_expert_lora_path = kt_config.expert_lora_path
         self.kt_expert_lora_enabled = bool(self.kt_expert_lora_path)
         self.kt_expert_lora_weights: Optional[KTExpertLoraWeights] = None
@@ -4051,6 +4519,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # main stream for GPU computation (initialized in create_weights)
         self._cpu_stream: Optional[torch.cuda.Stream] = None
         self._sync_done_event: Optional[torch.cuda.Event] = None  # CPU computation done
+        self._cache_policy_stream: Optional[torch.cuda.Stream] = None
+        self._cache_policy_counts: Optional[torch.Tensor] = None
 
         # Shared staging buffer reference (initialized in create_weights, shared across all layers)
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
@@ -4096,6 +4566,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # top_k: number of experts selected per token
         num_experts_per_tok = layer.top_k
 
+        if self._decayed_lfu_enabled:
+            assert self.kt_prefill_stream_top_n is not None
+            self.expert_cache_state = KTExpertCacheState.create(
+                layer_idx=self.kt_config.layer_idx,
+                num_experts=num_experts,
+                capacity=self.num_gpu_experts,
+                stream_top_n=self.kt_prefill_stream_top_n,
+                resident_expert_ids=tuple(
+                    int(expert_id) for expert_id in self.gpu_index_to_logical.tolist()
+                ),
+                reference_assignments=max(
+                    int(self._staging_buffer_max_size) * int(num_experts_per_tok),
+                    1,
+                ),
+            )
         # intermediate_size_full: full intermediate size before TP partitioning
         intermediate_size_full = (
             layer.intermediate_size_per_partition * layer.moe_tp_size
@@ -4131,6 +4616,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+        if self._decayed_lfu_enabled and target_device.type == "cuda":
+            self._cache_policy_stream = torch.cuda.Stream(device=target_device)
+            self._cache_policy_counts = torch.zeros(
+                num_experts,
+                dtype=torch.int64,
+                device=target_device,
+            )
 
         # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
         if self.tp_rank == 0:
@@ -4145,16 +4637,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 device=target_device,
             )
 
+        # Resolve one shared activation contract for the CPU experts, resident
+        # V4 Marlin wave, and streamed V4 Marlin wave.  Keeping this normalized
+        # object on the selected GPU method prevents the two execution owners
+        # from silently diverging for SiTU or SwiGLU-OAI models.
+        _mrc = getattr(layer, "moe_runner_config", None)
+        self._kt_activation_kwargs = resolve_kt_cpu_activation(
+            _mrc, self.kt_config.method
+        )
+        if (
+            (self.kt_config.method or "").upper() == "MXFP4"
+            and (
+                self._decayed_lfu_enabled
+                or self.kt_config.kt_enable_dynamic_expert_update
+            )
+        ):
+            validate_kt_v4_mxfp4_activation(
+                _mrc, self._kt_activation_kwargs
+            )
+        if hasattr(self.gpu_method, "_kt_activation_kwargs"):
+            self.gpu_method._kt_activation_kwargs = dict(
+                self._kt_activation_kwargs
+            )
+
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
         if self.tp_rank == 0:
-            # Source of truth is MoeRunnerConfig, populated by the model file
-            # from HF config. Keep K3 SiTU explicit instead of overloading the
-            # legacy SwiGLU-OAI alpha/limit pair.
-            _mrc = getattr(layer, "moe_runner_config", None)
-            _kt_activation_kwargs = resolve_kt_cpu_activation(
-                _mrc, self.kt_config.method
-            )
             common_wrapper_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -4170,8 +4678,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
             if self.kt_expert_lora_enabled:
                 if (
-                    _kt_activation_kwargs["activation"] != "silu"
-                    or _kt_activation_kwargs["swiglu_limit"] != 0.0
+                    self._kt_activation_kwargs["activation"] != "silu"
+                    or self._kt_activation_kwargs["swiglu_limit"] != 0.0
                 ):
                     raise ValueError(
                         "--kt-expert-lora-path uses KT SFT wrappers, which do not "
@@ -4196,17 +4704,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             else:
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
-                    **_kt_activation_kwargs,
+                    **self._kt_activation_kwargs,
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
-                    pack_all_experts_on_load=_should_pack_all_experts_on_load(
-                        self.kt_config
+                    pack_all_experts_on_load=(
+                        _should_pack_all_experts_on_load(self.kt_config)
+                        or self._decayed_lfu_enabled
+                    ),
+                    reserve_stream_writer_threads=should_reserve_stream_writer_threads(
+                        self._decayed_lfu_enabled,
+                        self.kt_prefill_stream_top_n,
                     ),
                 )
 
         # Registration happens during model construction, not on the first
         # request, so layer N can identify and prepare N+1 immediately.
-        _register_mxfp4_prefill_layer(self, layer)
+        if not self._decayed_lfu_enabled:
+            _register_mxfp4_prefill_layer(self, layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -4349,6 +4863,62 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     lora.rank,
                     lora.alpha,
                 )
+
+        self._initialize_expert_stream_transport(layer)
+
+    def _initialize_expert_stream_transport(
+        self, layer: torch.nn.Module
+    ) -> None:
+        """Resolve the fail-closed v1 streamed-expert backend after loading."""
+
+        if not getattr(self, "_decayed_lfu_enabled", False):
+            return
+        if not self.kt_prefill_stream_top_n:
+            self._streamed_wave2_supported = False
+            self._streamed_wave2_fallback_reason = (
+                "streaming is disabled by --kt-prefill-stream-top-n=0"
+            )
+            return
+
+        # Persistent promotion must update both the prepared resident slot and
+        # its canonical raw image.  KT Marlin deliberately keeps these raw
+        # attributes alive, so retain an address-stable physical-slot view.
+        raw_names = _Mxfp4PrefillSlot.RAW_NAMES
+        if not hasattr(layer, "_kt_mxfp4_raw_weights") and all(
+            hasattr(layer, name) for name in raw_names
+        ):
+            layer._kt_mxfp4_raw_weights = {
+                name: getattr(layer, name).detach() for name in raw_names
+            }
+
+        from sglang.srt.layers.moe.kt_mxfp4_stream_transport import (
+            get_or_create_mxfp4_stream_transport,
+        )
+
+        transport = get_or_create_mxfp4_stream_transport(self, layer)
+        self._expert_stream_transport = transport
+        self._streamed_wave2_supported = bool(
+            getattr(transport, "supported", False)
+        )
+        self._streamed_wave2_fallback_reason = str(
+            getattr(transport, "reason", "stream transport is unsupported")
+        )
+        if not self._streamed_wave2_supported:
+            raise RuntimeError(
+                "--kt-expert-placement-strategy decayed-lfu with a positive "
+                "--kt-prefill-stream-top-n requires the MXFP4 streamed "
+                f"transport backend: {self._streamed_wave2_fallback_reason}"
+            )
+        if not getattr(transport, "rolling_window_supported", False):
+            raise RuntimeError(
+                "--kt-prefill-stream-top-n requires a streamed transport that "
+                "keeps the complete Top-N ticket group GPU-owned while rolling "
+                "through its fixed staging depth"
+            )
+        if int(getattr(transport, "staging_depth", 0)) <= 0:
+            raise RuntimeError(
+                "MXFP4 streamed transport reported an invalid staging depth"
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -4515,6 +5085,606 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return self._sync_cpu_forward(staged_hidden_states)
 
+    def _prefill_cache_token_count(self, num_tokens: int) -> int:
+        """Return the leading route rows that are real prefill evidence."""
+
+        if not self._decayed_lfu_enabled or num_tokens <= 0:
+            return 0
+        from sglang.srt.layers.dp_attention import get_prefill_num_tokens
+
+        return min(max(get_prefill_num_tokens(), 0), num_tokens)
+
+    def _should_record_prefill_cache_window(self, num_tokens: int) -> bool:
+        """Return whether this call may advance the prefill-only policy state."""
+
+        return self._prefill_cache_token_count(num_tokens) > 0
+
+    def _submit_prefill_cache_histogram(
+        self,
+        topk_ids: torch.Tensor,
+        prefill_num_tokens: int,
+    ) -> torch.Tensor:
+        """Queue the fixed-size route histogram without blocking GPU wave 1."""
+
+        state = self.expert_cache_state
+        if state is None:
+            raise RuntimeError("decayed-lfu cache state was not initialized")
+
+        prefill_topk_ids = topk_ids[:prefill_num_tokens]
+        cache_stream = self._cache_policy_stream
+        if cache_stream is None:
+            return count_expert_route_assignments(
+                prefill_topk_ids,
+                state.num_experts,
+                out=self._cache_policy_counts,
+            )
+
+        producer_stream = torch.cuda.current_stream(prefill_topk_ids.device)
+        cache_stream.wait_stream(producer_stream)
+        with torch.cuda.stream(cache_stream):
+            window_counts_tensor = count_expert_route_assignments(
+                prefill_topk_ids,
+                state.num_experts,
+                out=self._cache_policy_counts,
+            )
+            if (
+                dist.is_initialized()
+                and get_tensor_model_parallel_world_size() > 1
+            ):
+                # TP0 is the authoritative policy source.  Broadcasting the
+                # fixed-size histogram on the policy stream makes candidate
+                # and victim ordering deterministic on every rank without
+                # transferring the full route tensor to the host.
+                dist.broadcast(
+                    window_counts_tensor,
+                    src=get_tp_group().first_rank,
+                    group=get_tp_group().device_group,
+                )
+            prefill_topk_ids.record_stream(cache_stream)
+        return window_counts_tensor
+
+    def _finish_prefill_cache_window(
+        self,
+        window_counts_tensor: torch.Tensor,
+        *,
+        allow_streaming: bool,
+        fallback_reason: Optional[str] = None,
+    ) -> KTExpertStreamPlan:
+        """Finish policy planning after resident GPU wave 1 has been launched."""
+
+        state = self.expert_cache_state
+        if state is None:
+            raise RuntimeError("decayed-lfu cache state was not initialized")
+
+        # Only the fixed-size [num_experts] histogram crosses to the host for
+        # the v1 pure-Python policy; the full [tokens, top-k] route tensor never
+        # leaves the device.
+        if self._cache_policy_stream is not None:
+            self._cache_policy_stream.synchronize()
+        window_counts = tuple(
+            int(value) for value in window_counts_tensor.to(device="cpu").tolist()
+        )
+        plan = state.record_prefill_window(
+            window_counts,
+            streamed_wave2_supported=(
+                self._streamed_wave2_supported and allow_streaming
+            ),
+            fallback_reason=fallback_reason if not allow_streaming else None,
+        )
+        if logger.isEnabledFor(logging.DEBUG) and self.tp_rank == 0:
+            logger.debug(
+                "KT decayed-lfu observation: layer=%d epoch=%d hotset=%s "
+                "candidates=%s streamed=%s cpu_owned=%s reason=%s",
+                plan.layer_idx,
+                plan.epoch,
+                plan.stream_hotset,
+                plan.candidate_expert_ids,
+                plan.streamed_expert_ids,
+                plan.cpu_owned_candidate_ids,
+                plan.fallback_reason,
+            )
+        return plan
+
+    def _prebegin_stream_candidates(
+        self, plan: KTExpertStreamPlan
+    ) -> KTExpertPrebegunStream:
+        """Create the complete Top-N ticket group before the main CPU task."""
+
+        claimed = tuple(plan.streamed_expert_ids)
+        state = self.expert_cache_state
+
+        if not claimed:
+            return KTExpertPrebegunStream(plan=plan, tickets=())
+
+        transport = self._expert_stream_transport
+        assert transport is not None and getattr(transport, "supported", False)
+        try:
+            tickets = tuple(transport.begin_candidates(self, claimed))
+        except Exception as exc:  # noqa: BLE001 - recover into the main CPU task
+            if (
+                getattr(transport, "fail_stopped", False)
+                or getattr(transport, "irreversible_pending", False)
+                or getattr(exc, "fail_stop", False)
+            ):
+                raise
+            # begin_candidates owns partial-submission cleanup.  No candidate
+            # has been removed from the CPU task yet, so a recoverable begin
+            # failure can keep the complete candidate set on CPU without a
+            # second late-fallback task.
+            reason = f"stream transport begin failed: {exc}"
+            cpu_owned_set = set(plan.cpu_owned_candidate_ids)
+            cpu_owned_set.update(claimed)
+            cpu_plan = replace(
+                plan,
+                streamed_expert_ids=(),
+                cpu_owned_candidate_ids=tuple(
+                    expert_id
+                    for expert_id in plan.candidate_expert_ids
+                    if expert_id in cpu_owned_set
+                ),
+                fallback_reason=reason,
+            )
+            if state is not None:
+                state.suppressed_stream_candidates += len(claimed)
+                state.last_stream_plan = cpu_plan
+            if self.tp_rank == 0:
+                logger.warning(
+                    "KT stream prebegin failed at layer %d; candidates remain "
+                    "in the main CPU task: %s",
+                    self.kt_config.layer_idx,
+                    exc,
+                )
+            return KTExpertPrebegunStream(plan=cpu_plan, tickets=())
+
+        ticket_ids = tuple(int(ticket.expert_id) for ticket in tickets)
+        ticket_order_valid = ticket_ids == claimed
+        confirm_wrapper_phase = getattr(
+            transport, "confirm_wrapper_phase", None
+        )
+        if confirm_wrapper_phase is None:
+            if (
+                dist.is_initialized()
+                and get_tensor_model_parallel_world_size() > 1
+            ):
+                raise RuntimeError(
+                    "stream transport lacks TP ticket-order consensus"
+                )
+            ticket_order_ready = ticket_order_valid
+        else:
+            ticket_order_ready = confirm_wrapper_phase(
+                "PREBEGIN_TICKET_ORDER",
+                tickets,
+                local_success=ticket_order_valid,
+            )
+        if not ticket_order_ready:
+            transport.abort_candidates(tickets)
+            if not ticket_order_valid:
+                raise RuntimeError(
+                    "stream transport returned tickets in a different "
+                    "candidate order"
+                )
+            raise RuntimeError(
+                "stream ticket order validation failed on a TP peer"
+            )
+
+        return KTExpertPrebegunStream(plan=plan, tickets=tickets)
+
+    def _execute_stream_candidates(
+        self,
+        *,
+        layer: torch.nn.Module,
+        plan: KTExpertStreamPlan,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        victim_safe_event: Optional[torch.cuda.Event] = None,
+        prebegun_tickets: Optional[Sequence[Any]] = None,
+    ) -> KTExpertStreamExecution:
+        """Drive candidate tickets one-by-one and preserve exact ownership.
+
+        The main CPU task has already excluded every ID in
+        ``plan.streamed_expert_ids`` before this method is entered.  A ticket
+        failure therefore does not rejoin that task; it is returned in
+        ``failed_expert_ids`` for one late CPU fallback submission.
+        """
+
+        candidates = tuple(plan.streamed_expert_ids)
+        if not candidates:
+            return KTExpertStreamExecution(
+                output=torch.zeros_like(hidden_states),
+                successful_expert_ids=(),
+                failed_expert_ids=(),
+                installed_replacements=(),
+            )
+
+        transport = getattr(self, "_expert_stream_transport", None)
+        if transport is None or not getattr(transport, "supported", False):
+            validate_stream_execution_partition(candidates, (), candidates)
+            return KTExpertStreamExecution(
+                output=torch.zeros_like(hidden_states),
+                successful_expert_ids=(),
+                failed_expert_ids=candidates,
+                installed_replacements=(),
+                fallback_reason=self._streamed_wave2_fallback_reason,
+            )
+
+        def commit_wrapper_phase(
+            phase: str,
+            phase_tickets: Sequence[Any],
+            *,
+            local_success: bool,
+        ) -> bool:
+            confirm = getattr(transport, "confirm_wrapper_phase", None)
+            if confirm is not None:
+                return bool(
+                    confirm(
+                        phase,
+                        phase_tickets,
+                        local_success=local_success,
+                    )
+                )
+            if (
+                dist.is_initialized()
+                and get_tensor_model_parallel_world_size() > 1
+            ):
+                raise RuntimeError(
+                    "stream transport lacks TP wrapper-phase consensus"
+                )
+            return local_success
+
+        if prebegun_tickets is None:
+            try:
+                tickets = tuple(transport.begin_candidates(self, candidates))
+            except Exception as exc:
+                # Compatibility path for direct helper callers.  Production
+                # pre-begins before the main CPU task and therefore keeps a
+                # failed begin in that task instead of creating late fallback.
+                validate_stream_execution_partition(candidates, (), candidates)
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "KT stream begin failed at layer %d; falling back to CPU: %s",
+                        self.kt_config.layer_idx,
+                        exc,
+                    )
+                return KTExpertStreamExecution(
+                    output=torch.zeros_like(hidden_states),
+                    successful_expert_ids=(),
+                    failed_expert_ids=candidates,
+                    installed_replacements=(),
+                    fallback_reason=f"transport begin failed: {exc}",
+                )
+        else:
+            tickets = tuple(prebegun_tickets)
+
+        state = self.expert_cache_state
+        plan_error: Optional[Exception] = None
+        proposed: Tuple[Replacement, ...] = ()
+        replacement_by_candidate: Dict[int, Replacement] = {}
+        output: Optional[torch.Tensor] = None
+        try:
+            ticket_ids = tuple(int(ticket.expert_id) for ticket in tickets)
+            if ticket_ids != candidates:
+                raise RuntimeError(
+                    "stream transport returned tickets in a different "
+                    "candidate order"
+                )
+            output = torch.zeros_like(hidden_states)
+            if state is None or state.last_window_counts is None:
+                raise RuntimeError(
+                    "stream candidates have no cache-policy snapshot"
+                )
+            proposed = state.plan_persistent_replacements(
+                candidates, state.last_window_counts
+            )
+            for replacement in proposed:
+                victim_count = int(
+                    state.last_window_counts[replacement.victim_expert_id]
+                )
+                if victim_count > 0:
+                    # This is a hard runtime invariant, not merely a policy
+                    # preference.  Validate the complete plan before launching
+                    # wave 2 or an irreversible install.
+                    raise RuntimeError(
+                        "persistent replacement selected an expert active in "
+                        "the current window: "
+                        f"victim={replacement.victim_expert_id}, "
+                        f"route_count={victim_count}"
+                    )
+            replacement_by_candidate = {
+                replacement.candidate_expert_id: replacement
+                for replacement in proposed
+            }
+        except Exception as exc:  # noqa: BLE001 - TP commits before abort
+            plan_error = exc
+
+        plan_ready = commit_wrapper_phase(
+            "EXECUTION_PLAN_READY",
+            tickets,
+            local_success=plan_error is None,
+        )
+        if not plan_ready:
+            transport.abort_candidates(tickets)
+            if plan_error is not None:
+                raise plan_error
+            raise RuntimeError(
+                "KT stream execution plan failed on a TP peer"
+            )
+        assert state is not None and state.last_window_counts is not None
+        assert output is not None
+
+        successful: List[int] = []
+        failed: List[int] = []
+        installed: List[Replacement] = []
+        install_commits: List[Any] = []
+        fallback_reason = None
+        activation_kwargs = getattr(self, "_kt_activation_kwargs", None)
+        if activation_kwargs is None:
+            activation_kwargs = resolve_kt_cpu_activation(
+                getattr(layer, "moe_runner_config", None),
+                getattr(self.kt_config, "method", "MXFP4"),
+            )
+        resident_prepared = getattr(layer, "_v4_marlin_weights", None)
+        resident_raw = getattr(layer, "_kt_mxfp4_raw_weights", None)
+
+        for position, ticket in enumerate(tickets):
+            try:
+                wave = ticket.wait_and_launch(
+                    hidden_states=hidden_states,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    out=None,
+                    # The outer model applies KT's routed scaling after CPU and
+                    # GPU contributions have been merged.
+                    routed_scaling_factor=1.0,
+                    **activation_kwargs,
+                )
+            except Exception as exc:
+                if getattr(transport, "fail_stopped", False) or getattr(
+                    exc, "fail_stop", False
+                ):
+                    raise
+                failed.extend(candidates[position:])
+                fallback_reason = f"stream candidate failed: {exc}"
+                try:
+                    transport.abort_candidates(tickets[position:])
+                except Exception:
+                    # A failed abort means staging safety is unknown; CPU
+                    # fallback could then race poisoned GPU state, so fail-stop.
+                    logger.exception("KT stream transport abort failed")
+                    raise
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "KT stream candidate %d failed at layer %d; remaining "
+                        "candidates fall back to CPU: %s",
+                        ticket.expert_id,
+                        self.kt_config.layer_idx,
+                        exc,
+                    )
+                break
+
+            wave_output_valid = not (
+                wave.output.shape != hidden_states.shape
+                or wave.output.dtype != hidden_states.dtype
+                or wave.output.device != hidden_states.device
+            )
+            wave_valid_on_all_ranks = commit_wrapper_phase(
+                "WAVE_OUTPUT_VALID",
+                (ticket,),
+                local_success=wave_output_valid,
+            )
+            if not wave_valid_on_all_ranks:
+                shape_error = RuntimeError(
+                    "streamed expert output must match the layer hidden-state tensor"
+                )
+                failed.extend(candidates[position:])
+                fallback_reason = str(shape_error)
+                transport.abort_candidates(tickets[position:])
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "KT stream candidate %d returned an invalid output at "
+                        "layer %d; remaining candidates fall back to CPU",
+                        ticket.expert_id,
+                        self.kt_config.layer_idx,
+                    )
+                break
+            merge_error: Optional[Exception] = None
+            try:
+                output.add_(wave.output)
+            except Exception as exc:
+                merge_error = exc
+            wave_merged_on_all_ranks = commit_wrapper_phase(
+                "WAVE_OUTPUT_MERGED",
+                (ticket,),
+                local_success=merge_error is None,
+            )
+            if not wave_merged_on_all_ranks:
+                fatal_error = merge_error or RuntimeError(
+                    "streamed wave output merge failed on a TP peer"
+                )
+                transport.mark_fatal(
+                    "streamed wave output could not be merged safely",
+                    cause=fatal_error,
+                )
+                raise RuntimeError(
+                    "streamed wave output could not be merged on every TP rank"
+                ) from fatal_error
+            expert_id = int(ticket.expert_id)
+            successful.append(expert_id)
+
+            replacement = replacement_by_candidate.get(expert_id)
+            try:
+                if replacement is None:
+                    ticket.release()
+                    continue
+                if resident_prepared is None or resident_raw is None:
+                    raise RuntimeError(
+                        "persistent MXFP4 promotion requires prepared and raw "
+                        "resident slot storage"
+                    )
+                if victim_safe_event is None:
+                    raise RuntimeError(
+                        "persistent MXFP4 promotion requires the resident "
+                        "wave-1 victim-safe event"
+                    )
+                # Installation is destructive once its first D2D copy is
+                # queued.  The transport marks any post-copy failure fatal.
+                commit = ticket.install(
+                    resident_prepared,
+                    replacement.slot_id,
+                    resident_raw=resident_raw,
+                    victim_safe_event=victim_safe_event,
+                    install_stream=torch.cuda.current_stream(
+                        hidden_states.device
+                    ),
+                )
+                installed.append(replacement)
+                install_commits.append(commit)
+            except Exception as exc:  # noqa: BLE001 - classify transport state
+                if getattr(transport, "fail_stopped", False) or getattr(
+                    exc, "fail_stop", False
+                ):
+                    raise
+                # Wave 2 already produced a private, successfully merged
+                # output for this candidate.  It remains GPU-owned exactly
+                # once; only later, not-yet-launched candidates fall back.
+                failed.extend(candidates[position + 1 :])
+                fallback_reason = f"stream ticket finalization failed: {exc}"
+                try:
+                    transport.abort_candidates(tickets[position + 1 :])
+                except Exception:
+                    logger.exception(
+                        "KT stream transport could not abort remaining tickets"
+                    )
+                    raise
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "KT stream candidate %d computed successfully but its "
+                        "ticket finalization failed at layer %d; remaining "
+                        "candidates fall back to CPU: %s",
+                        expert_id,
+                        self.kt_config.layer_idx,
+                        exc,
+                    )
+                break
+
+        successful_tuple = tuple(successful)
+        failed_tuple = tuple(failed)
+        validate_stream_execution_partition(
+            candidates, successful_tuple, failed_tuple
+        )
+        return KTExpertStreamExecution(
+            output=output,
+            successful_expert_ids=successful_tuple,
+            failed_expert_ids=failed_tuple,
+            installed_replacements=tuple(installed),
+            install_commits=tuple(install_commits),
+            fallback_reason=fallback_reason,
+        )
+
+    def _publish_stream_replacements(
+        self,
+        replacements: Tuple[Replacement, ...],
+        install_commits: Tuple[Any, ...] = (),
+        precondition_error: Optional[Exception] = None,
+    ) -> None:
+        """Publish installed physical slots with in-place, TP-consistent maps."""
+
+        if not replacements:
+            return
+        state = getattr(self, "expert_cache_state", None)
+        publish_error: Optional[Exception] = precondition_error
+        try:
+            if publish_error is not None:
+                raise publish_error
+            if state is None:
+                raise RuntimeError(
+                    "cannot publish replacements without cache state"
+                )
+            commits_required = bool(
+                getattr(self, "_streamed_wave2_supported", False)
+            )
+            if len(install_commits) != len(replacements) and (
+                commits_required or install_commits
+            ):
+                raise RuntimeError(
+                    "every installed replacement must carry one transport commit"
+                )
+
+            residents = list(state.resident_expert_ids)
+            for replacement in replacements:
+                if (
+                    residents[replacement.slot_id]
+                    != replacement.victim_expert_id
+                ):
+                    raise RuntimeError(
+                        "resident mapping changed before stream publish"
+                    )
+                residents[replacement.slot_id] = (
+                    replacement.candidate_expert_id
+                )
+
+            if install_commits:
+                publish_stream = torch.cuda.current_stream(
+                    self.gpu_experts_mask_cuda.device
+                )
+                for commit in install_commits:
+                    if not getattr(commit, "mapping_publish_allowed", False):
+                        raise RuntimeError(
+                            "transport rejected mapping publication for an "
+                            "irreversible resident install"
+                        )
+                    publish_stream.wait_event(commit.install_event)
+            resident_ids = torch.tensor(residents, dtype=torch.int32, device="cpu")
+            next_mask = torch.zeros_like(self.gpu_experts_mask, device="cpu")
+            next_mask[resident_ids.to(dtype=torch.int64)] = True
+            next_logical_to_gpu = torch.full_like(
+                self.logical_to_gpu_index, -1, device="cpu"
+            )
+            next_logical_to_gpu[resident_ids.to(dtype=torch.int64)] = torch.arange(
+                len(residents), dtype=torch.int32, device="cpu"
+            )
+
+            # Keep every graph-visible and C++-visible address stable.
+            self.gpu_experts_mask.copy_(next_mask)
+            self.logical_to_gpu_index.copy_(next_logical_to_gpu)
+            self.gpu_index_to_logical.copy_(resident_ids)
+            self.gpu_experts_mask_cuda.copy_(next_mask, non_blocking=True)
+            self.logical_to_gpu_index_cuda.copy_(
+                next_logical_to_gpu, non_blocking=True
+            )
+            if self.tp_rank == 0:
+                update_kt_wrapper_masks(self.wrapper, next_mask)
+            # The policy snapshot is part of the same metadata transaction.
+            # A local state-commit exception must participate in the transport
+            # publish acknowledgement as local_success=False.
+            state.commit_persistent_replacements(replacements)
+        except Exception as exc:  # noqa: BLE001 - publish-ack must still run
+            publish_error = exc
+
+        acknowledgement_error: Optional[Exception] = None
+        if install_commits:
+            for commit in install_commits:
+                try:
+                    # Every TP rank enters this operation in the same commit
+                    # order even when its local metadata write failed.  The
+                    # transport performs the success consensus and fail-stops
+                    # all peers before any can continue with old metadata.
+                    commit.ticket.confirm_mapping_published(
+                        commit,
+                        local_success=publish_error is None,
+                        local_error=publish_error,
+                    )
+                except Exception as exc:  # noqa: BLE001 - irreversible commit
+                    if acknowledgement_error is None:
+                        acknowledgement_error = exc
+
+        if publish_error is not None or acknowledgement_error is not None:
+            cause = acknowledgement_error or publish_error
+            raise RuntimeError(
+                "KT resident bytes were installed but mapping publication "
+                "failed; runtime is fail-stopped"
+            ) from cause
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -4617,7 +5787,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 and _v4_aligned
             )
         _full_gpu_gate = (
-            self.gpu_prefill_token_threshold > 0
+            not self._decayed_lfu_enabled
+            and self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
         )
@@ -4752,36 +5923,46 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if topk_output is not dispatch_output.topk_output:
             dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
-        # Step 1: Copy hidden_states to staging buffer and submit CPU computation
-        # Staging buffer allows GPU computation to proceed without waiting for D2H copy
+        if self._decayed_lfu_enabled:
+            transport = getattr(self, "_expert_stream_transport", None)
+            if transport is not None and (
+                getattr(transport, "fail_stopped", False)
+                or getattr(transport, "irreversible_pending", False)
+            ):
+                raise RuntimeError(
+                    "KT streamed-expert transport has an unpublished or fatal "
+                    "resident install; refusing to launch another resident wave"
+                ) from getattr(transport, "fatal_reason", None)
+
+        # Step 1: Stage hidden states and fork the CPU stream at the copy point.
+        # This dependency must be established before resident GPU wave 1 is
+        # launched; otherwise the CPU path would accidentally wait for wave 1.
         staging_buffer = None
+        _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
         if self.tp_rank == 0 and self._cpu_stream is not None:
-            # Use shared staging buffer (shared across all MoE layers to save GPU memory)
-            assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
+            assert self._shared_staging_buffer is not None, (
+                "Shared staging buffer not initialized"
+            )
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
-
-            # Copy to staging buffer on main stream
             staging_buffer.copy_(x, non_blocking=True)
-
-            # SGLANG_KT_HYBRID_NO_CPU_STREAM=1 collapses cpu_stream onto main stream.
-            _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
             if not _no_cpu_stream:
-                # Fork to cpu_stream (waits for staging copy to complete)
                 self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
-            from contextlib import nullcontext as _ctx_null
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
-            with _stream_ctx:
-                # Submit uses staging_buffer, so GPU can modify original x freely
-                self._submit_with_staged_input(
-                    layer, dispatch_output, staging_buffer
-                )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
             _kt_t_after_submit = time.perf_counter()
 
-        # Step 2: Prepare GPU computation by masking and remapping expert IDs
-        # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
+        # Step 2: Start the fixed-size route histogram before wave 1.  Its side
+        # stream only depends on routing/copy work already queued on main.
+        pending_cache_counts = None
+        prefill_cache_tokens = self._prefill_cache_token_count(num_tokens)
+        if prefill_cache_tokens > 0:
+            pending_cache_counts = self._submit_prefill_cache_histogram(
+                topk_output.topk_ids,
+                prefill_cache_tokens,
+            )
+
+        # Step 3: Snapshot the resident mapping and launch resident GPU wave 1.
         topk_ids = topk_output.topk_ids
         masked_topk_ids = mask_and_remap_expert_ids(
             topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
@@ -4797,8 +5978,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 torch.cuda.synchronize(x.device)
             _kt_t_after_mask = time.perf_counter()
 
-        # Step 3: Execute GPU expert computation on main stream
-        # No wait needed - staging buffer decouples CPU and GPU data access
+        # No wait is needed: the staging copy decouples CPU input ownership.
         # When num_gpu_experts == 0 the gpu_method's weights have shapes that
         # are incompatible with its own apply() (e.g. on SM_120 with V4 Flash
         # where the only routed-expert quant method available, the FP8 fused
@@ -4834,31 +6014,525 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
+        resident_wave_done_event = None
+        if (
+            pending_cache_counts is not None
+            and prefill_cache_tokens == num_tokens
+            and self._streamed_wave2_supported
+        ):
+            resident_wave_done_event = torch.cuda.Event()
+            resident_wave_done_event.record(torch.cuda.current_stream(x.device))
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
             _kt_t_after_gpu = time.perf_counter()
 
-        # Step 4: Sync CPU results on cpu_stream, then synchronize streams
+        # Step 4: Finalize Top-N only after wave 1 is in flight.  Mixed batches
+        # still contribute their leading prefill rows to history, but strict
+        # decode freeze prevents loader, wave 2, and persistent publication.
+        stream_plan = None
+        if pending_cache_counts is not None:
+            pure_prefill_window = prefill_cache_tokens == num_tokens
+            allow_streaming = (
+                pure_prefill_window
+                and self._streamed_wave2_supported
+                and os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") != "1"
+            )
+            if not pure_prefill_window:
+                fallback_reason = "mixed prefill/decode batch is frozen"
+            elif not self._streamed_wave2_supported:
+                fallback_reason = self._streamed_wave2_fallback_reason
+            else:
+                fallback_reason = "GPU MoE diagnostic bypass is active"
+            stream_plan = self._finish_prefill_cache_window(
+                pending_cache_counts,
+                allow_streaming=allow_streaming,
+                fallback_reason=fallback_reason,
+            )
+
+        # Step 5: Claim every missing member of the bounded Top-N hotset for
+        # current-window streaming.  The transport's staging depth limits only
+        # concurrent in-flight tickets; it does not change CPU/GPU ownership.
+        # Assignment filtering still completes before ticket creation so a
+        # rank-local failure cannot leak writers or staging slots.
+        stream_candidate_ids = (
+            stream_plan.streamed_expert_ids if stream_plan is not None else ()
+        )
+
+        def build_cpu_dispatch(candidate_ids: Sequence[int]):
+            if (
+                self.tp_rank == 0
+                and self._cpu_stream is not None
+                and not _no_cpu_stream
+            ):
+                # The CPU stream was forked at the staged-input copy point,
+                # after routing was ready but before resident wave 1.  Queue
+                # the ownership filter on that same stream so CPU submission
+                # waits for the filter without waiting for resident GPU work.
+                with torch.cuda.stream(self._cpu_stream):
+                    cpu_topk_ids = filter_expert_assignments(
+                        topk_ids,
+                        candidate_ids,
+                        keep_selected=False,
+                    )
+            else:
+                cpu_topk_ids = filter_expert_assignments(
+                    topk_ids,
+                    candidate_ids,
+                    keep_selected=False,
+                )
+            cpu_topk_output = topk_output._replace(topk_ids=cpu_topk_ids)
+            return dispatch_output._replace(
+                topk_output=cpu_topk_output
+            )
+
+        dispatch_error: Optional[Exception] = None
+        cpu_dispatch_output = None
+        try:
+            cpu_dispatch_output = build_cpu_dispatch(stream_candidate_ids)
+        except Exception as exc:  # noqa: BLE001 - TP commits before begin
+            dispatch_error = exc
+
+        dispatch_transport = self._expert_stream_transport
+        if (
+            stream_plan is not None
+            and dispatch_transport is not None
+            and getattr(dispatch_transport, "supported", False)
+        ):
+            transport = dispatch_transport
+            dispatch_ready = transport.confirm_dispatch_ready(
+                layer_idx=self.kt_config.layer_idx,
+                candidate_ids=stream_candidate_ids,
+                local_success=dispatch_error is None,
+            )
+            if not dispatch_ready:
+                if dispatch_error is not None:
+                    raise RuntimeError(
+                        "KT stream assignment filtering failed before prebegin"
+                    ) from dispatch_error
+                raise RuntimeError(
+                    "KT stream assignment filtering failed on a TP peer"
+                )
+        if dispatch_error is not None:
+            raise dispatch_error
+        assert cpu_dispatch_output is not None
+        stream_control_active = bool(
+            stream_plan is not None
+            and dispatch_transport is not None
+            and getattr(dispatch_transport, "supported", False)
+        )
+
+        # Create the complete deterministic ticket group.  The fixed staging
+        # depth submits only its eager prefix before the main CPU task; remaining
+        # tickets stay pending and roll forward as earlier slots are released.
+        # A recoverable group-begin failure restores every candidate to CPU.
+        prebegun_tickets: Tuple[Any, ...] = ()
+        if stream_plan is not None and stream_candidate_ids:
+            prebegun = self._prebegin_stream_candidates(stream_plan)
+            stream_plan = prebegun.plan
+            prebegun_tickets = prebegun.tickets
+            stream_candidate_ids = stream_plan.streamed_expert_ids
+            if not prebegun_tickets:
+                fallback_dispatch_error: Optional[Exception] = None
+                try:
+                    cpu_dispatch_output = build_cpu_dispatch(
+                        stream_candidate_ids
+                    )
+                except Exception as exc:  # TP fallback commit below
+                    fallback_dispatch_error = exc
+                transport = self._expert_stream_transport
+                assert transport is not None
+                fallback_dispatch_ready = transport.confirm_dispatch_ready(
+                    layer_idx=self.kt_config.layer_idx,
+                    candidate_ids=stream_candidate_ids,
+                    local_success=fallback_dispatch_error is None,
+                )
+                if not fallback_dispatch_ready:
+                    if fallback_dispatch_error is not None:
+                        raise RuntimeError(
+                            "KT fallback CPU dispatch rebuild failed"
+                        ) from fallback_dispatch_error
+                    raise RuntimeError(
+                        "KT fallback CPU dispatch rebuild failed on a TP peer"
+                    )
+                assert cpu_dispatch_output is not None
+
+        prelaunch_error: Optional[Exception] = None
+        cpu_submit_attempted = False
+        try:
+            if self.tp_rank == 0:
+                if self._cpu_stream is None or self.wrapper is None:
+                    raise RuntimeError(
+                        "TP0 cannot submit the KT main CPU task without its "
+                        "CPU stream and wrapper"
+                    )
+                from contextlib import nullcontext as _ctx_null
+
+                _stream_ctx = (
+                    _ctx_null()
+                    if _no_cpu_stream
+                    else torch.cuda.stream(self._cpu_stream)
+                )
+                cpu_submit_attempted = True
+                with _stream_ctx:
+                    self._submit_with_staged_input(
+                        layer, cpu_dispatch_output, staging_buffer
+                    )
+                if stream_candidate_ids:
+                    # Wait only for the D2H dependency and CUDA host callback
+                    # that enqueue the main CPU task.  Eager writers already
+                    # run on their dedicated writer queue, so this establishes
+                    # concurrent CPU-main/stream-loader progress without
+                    # waiting for the CPU GEMM itself.
+                    if _no_cpu_stream:
+                        torch.cuda.current_stream(x.device).synchronize()
+                    else:
+                        self._cpu_stream.synchronize()
+                    # ForwardBindings records a CUDA-host-callback enqueue
+                    # failure in CPUInfer instead of throwing through CUDA.
+                    # Consume only that latched error; do not drain or wait for
+                    # the asynchronously running CPU GEMM.
+                    self.wrapper.cpu_infer.rethrow_pending_callback_exception()
+        except Exception as exc:  # noqa: BLE001 - TP must abort in one order
+            prelaunch_error = exc
+
+        if prebegun_tickets:
+            transport = self._expert_stream_transport
+            assert transport is not None
+            consensus_error: Optional[Exception] = None
+            cpu_main_ordered = False
+            try:
+                cpu_main_ordered = transport.confirm_cpu_main_ordered(
+                    prebegun_tickets,
+                    local_success=prelaunch_error is None,
+                )
+            except Exception as exc:  # noqa: BLE001 - abort/fail-stop below
+                consensus_error = exc
+
+            if consensus_error is not None or not cpu_main_ordered:
+                cpu_drain_error: Optional[Exception] = None
+                if (
+                    self.tp_rank == 0
+                    and cpu_submit_attempted
+                    and self.wrapper is not None
+                ):
+                    try:
+                        # Failure-only cleanup: the peer must wait until the
+                        # untracked main CPU task can no longer read shared
+                        # staging or the pinned expert mask.
+                        self.wrapper.cpu_infer.sync()
+                    except Exception as exc:  # queue is drained before throw
+                        cpu_drain_error = exc
+                if getattr(transport, "fail_stopped", False):
+                    cause = consensus_error or prelaunch_error or cpu_drain_error
+                    raise RuntimeError(
+                        "KT stream prelaunch fail-stopped after TP mismatch"
+                    ) from cause
+                try:
+                    transport.abort_candidates(prebegun_tickets)
+                except Exception:
+                    logger.exception(
+                        "KT stream transport could not abort after prelaunch failure"
+                    )
+                    raise
+                if prelaunch_error is not None:
+                    raise RuntimeError(
+                        "KT main CPU task could not be ordered after prebegun writers"
+                    ) from prelaunch_error
+                if cpu_drain_error is not None:
+                    raise RuntimeError(
+                        "KT main CPU task failed while draining a rejected prelaunch"
+                    ) from cpu_drain_error
+                if consensus_error is not None:
+                    raise RuntimeError(
+                        "KT stream prelaunch consensus failed"
+                    ) from consensus_error
+                raise RuntimeError(
+                    "KT main CPU task ordering failed on a TP peer"
+                )
+
+        if stream_control_active and not prebegun_tickets:
+            transport = self._expert_stream_transport
+            assert transport is not None
+            fallback_consensus_error: Optional[Exception] = None
+            try:
+                cpu_main_ordered = transport.confirm_wrapper_phase(
+                    "CPU_MAIN_FALLBACK_ORDERED",
+                    (),
+                    local_success=prelaunch_error is None,
+                )
+            except Exception as exc:
+                fallback_consensus_error = exc
+                cpu_main_ordered = False
+            if fallback_consensus_error is not None or not cpu_main_ordered:
+                if (
+                    self.tp_rank == 0
+                    and cpu_submit_attempted
+                    and self.wrapper is not None
+                ):
+                    try:
+                        self.wrapper.cpu_infer.sync()
+                    except Exception:
+                        pass
+                if fallback_consensus_error is not None:
+                    raise RuntimeError(
+                        "KT fallback CPU ordering consensus failed"
+                    ) from fallback_consensus_error
+                if prelaunch_error is not None:
+                    raise RuntimeError(
+                        "KT fallback CPU task failed after stream prebegin"
+                    ) from prelaunch_error
+                raise RuntimeError(
+                    "KT fallback CPU task failed on a TP peer"
+                )
+
+        if prelaunch_error is not None:
+            raise prelaunch_error
+
+        # Step 6: Each ready candidate immediately runs a private GPU wave 2.
+        # The eager host-export prefix runs on the dedicated writer queue while
+        # CPU main computes non-selected misses.  Later tickets roll through the
+        # two staging slots in deterministic order.  Every successfully launched
+        # candidate is merged exactly once.
+        stream_execution: Optional[KTExpertStreamExecution] = None
+        stream_merge_error: Optional[Exception] = None
+        stream_execute_error: Optional[Exception] = None
+        if stream_plan is not None and stream_candidate_ids:
+            try:
+                stream_execution = self._execute_stream_candidates(
+                    layer=layer,
+                    plan=stream_plan,
+                    hidden_states=x,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_output.topk_weights,
+                    victim_safe_event=resident_wave_done_event,
+                    prebegun_tickets=prebegun_tickets,
+                )
+            except Exception as exc:  # TP status and CPU drain below
+                stream_execute_error = exc
+            if stream_execute_error is None:
+                assert stream_execution is not None
+                try:
+                    output.add_(stream_execution.output)
+                except Exception as exc:  # publish must ack pending installs
+                    stream_merge_error = exc
+
+        if stream_execute_error is not None:
+            transport = self._expert_stream_transport
+            assert transport is not None
+            cpu_drain_error: Optional[Exception] = None
+            if self.tp_rank == 0 and self.wrapper is not None:
+                try:
+                    self.wrapper.cpu_infer.sync()
+                except Exception as exc:  # queue is drained before throw
+                    cpu_drain_error = exc
+            if not getattr(transport, "fail_stopped", False):
+                transport.confirm_wrapper_phase(
+                    "LAYER_OUTPUT_READY",
+                    prebegun_tickets,
+                    local_success=False,
+                )
+                transport.mark_fatal(
+                    "stream execution failed before layer output commit",
+                    cause=stream_execute_error,
+                )
+            if cpu_drain_error is not None:
+                raise RuntimeError(
+                    "KT main CPU task failed while draining a stream error"
+                ) from cpu_drain_error
+            raise RuntimeError("KT streamed expert execution failed") from stream_execute_error
+
+        installed_replacements = (
+            stream_execution.installed_replacements
+            if stream_execution is not None
+            else ()
+        )
+        install_commits = (
+            stream_execution.install_commits
+            if stream_execution is not None
+            else ()
+        )
+        failed_stream_experts = (
+            stream_execution.failed_expert_ids
+            if stream_execution is not None
+            else ()
+        )
+
+        # Step 7: Drain the main CPU task before publishing any installed
+        # resident bytes.  Publication happens before late fallback so a later
+        # CPU error cannot leave new slot bytes behind the old logical mapping.
+        main_cpu_error: Optional[Exception] = stream_merge_error
         if self.tp_rank == 0 and self._cpu_stream is not None:
-            _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
             from contextlib import nullcontext as _ctx_null
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
-            with _stream_ctx:
-                # Use staging_buffer for sync to get correct buffer reference
-                _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                cpu_output = self._sync_with_staged_input(staging_buffer)
-                if _kt_t_sync_pre is not None:
-                    _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
-                if not _no_cpu_stream:
-                    self._sync_done_event.record(self._cpu_stream)
+
+            _stream_ctx = (
+                _ctx_null()
+                if _no_cpu_stream
+                else torch.cuda.stream(self._cpu_stream)
+            )
+            cpu_output = None
+            _kt_t_sync_pre = (
+                time.perf_counter() if _kt_t_apply_start is not None else None
+            )
+            try:
+                with _stream_ctx:
+                    cpu_output = self._sync_with_staged_input(staging_buffer)
+                    if not _no_cpu_stream:
+                        self._sync_done_event.record(self._cpu_stream)
+
+                # The C++ backend reads a pinned mask by pointer.  An installed
+                # replacement cannot publish that mask until the current CPU
+                # task has definitely stopped reading it.  An earlier merge
+                # error also forces this wait so no background CPU task escapes
+                # while the layer unwinds.
+                if install_commits or main_cpu_error is not None:
+                    if _no_cpu_stream:
+                        torch.cuda.current_stream(x.device).synchronize()
+                    else:
+                        self._cpu_stream.synchronize()
+            except Exception as exc:  # noqa: BLE001 - publish ack must run
+                if main_cpu_error is None:
+                    main_cpu_error = exc
+            if _kt_t_sync_pre is not None:
+                _kt_t_cpu_wait_ms = (
+                    time.perf_counter() - _kt_t_sync_pre
+                ) * 1000.0
             if _kt_timing:
                 _kt_t_after_sync = time.perf_counter()
 
-            # Main stream waits for cpu_stream to complete before merging results
-            if not _no_cpu_stream:
-                torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
-            output = output + cpu_output
+            if main_cpu_error is None:
+                try:
+                    assert cpu_output is not None
+                    if not _no_cpu_stream:
+                        torch.cuda.current_stream(x.device).wait_event(
+                            self._sync_done_event
+                        )
+                    output.add_(cpu_output)
+                except Exception as exc:  # publish ack must still run
+                    main_cpu_error = exc
+
+        if (
+            main_cpu_error is not None
+            and self.tp_rank == 0
+            and self.wrapper is not None
+        ):
+            try:
+                self.wrapper.cpu_infer.sync()
+            except Exception:
+                # TaskQueue drains before rethrowing.  Preserve the first layer
+                # error while still establishing the shared-buffer lifetime.
+                pass
+            try:
+                if _no_cpu_stream:
+                    torch.cuda.current_stream(x.device).synchronize()
+                elif self._cpu_stream is not None:
+                    self._cpu_stream.synchronize()
+            except Exception:
+                pass
+
+        layer_output_ready = True
+        if stream_control_active:
+            transport = self._expert_stream_transport
+            assert transport is not None
+            layer_output_ready = transport.confirm_wrapper_phase(
+                "LAYER_OUTPUT_READY",
+                prebegun_tickets,
+                local_success=main_cpu_error is None,
+            )
+            if not layer_output_ready and main_cpu_error is None:
+                main_cpu_error = RuntimeError(
+                    "KT layer output failed on a TP peer"
+                )
+            if not layer_output_ready:
+                transport.mark_fatal(
+                    "layer output failed before resident publication",
+                    cause=main_cpu_error,
+                )
+
+        # Publication starts only after every rank commits a valid layer output.
+        # A failed layer-output phase has already fail-stopped every rank, so no
+        # peer may enter a per-commit publish acknowledgement alone.
+        if layer_output_ready:
+            self._publish_stream_replacements(
+                installed_replacements,
+                install_commits,
+                precondition_error=main_cpu_error,
+            )
+        if main_cpu_error is not None:
+            raise RuntimeError(
+                "KT layer output failed before resident publication"
+            ) from main_cpu_error
+
+        # Step 8: Run one late CPU task for every recoverable stream failure.
+        # The merge event protects the shared KT output buffer before that task
+        # reuses it.  Failed IDs were never installed or published.
+        late_fallback_error: Optional[Exception] = None
+        if self.tp_rank == 0 and self._cpu_stream is not None:
+            if failed_stream_experts:
+                try:
+                    fallback_topk_ids = filter_expert_assignments(
+                        topk_ids,
+                        failed_stream_experts,
+                        keep_selected=True,
+                    )
+                    fallback_dispatch_output = dispatch_output._replace(
+                        topk_output=topk_output._replace(
+                            topk_ids=fallback_topk_ids
+                        )
+                    )
+                    from contextlib import nullcontext as _ctx_null
+
+                    _fallback_stream_ctx = (
+                        _ctx_null()
+                        if _no_cpu_stream
+                        else torch.cuda.stream(self._cpu_stream)
+                    )
+                    if not _no_cpu_stream:
+                        # Wait for both the prior main-output merge and the
+                        # fallback filter kernel queued above.
+                        self._cpu_stream.wait_stream(
+                            torch.cuda.current_stream(x.device)
+                        )
+                    with _fallback_stream_ctx:
+                        self._submit_with_staged_input(
+                            layer, fallback_dispatch_output, staging_buffer
+                        )
+                        fallback_output = self._sync_with_staged_input(
+                            staging_buffer
+                        )
+                        if not _no_cpu_stream:
+                            self._sync_done_event.record(self._cpu_stream)
+                    if not _no_cpu_stream:
+                        self._cpu_stream.synchronize()
+                        torch.cuda.current_stream(x.device).wait_event(
+                            self._sync_done_event
+                        )
+                    else:
+                        torch.cuda.current_stream(x.device).synchronize()
+                    if self.wrapper is not None:
+                        self.wrapper.cpu_infer.rethrow_pending_callback_exception()
+                    output.add_(fallback_output)
+                except Exception as exc:  # all ranks commit below
+                    late_fallback_error = exc
+                    if self.wrapper is not None:
+                        try:
+                            self.wrapper.cpu_infer.sync()
+                        except Exception:
+                            pass
+        if failed_stream_experts and prebegun_tickets:
+            transport = self._expert_stream_transport
+            assert transport is not None
+            fallback_ready = transport.confirm_wrapper_phase(
+                "LATE_FALLBACK_READY",
+                prebegun_tickets,
+                local_success=late_fallback_error is None,
+            )
+            if not fallback_ready and late_fallback_error is None:
+                late_fallback_error = RuntimeError(
+                    "KT late CPU fallback failed on a TP peer"
+                )
+        if late_fallback_error is not None:
+            raise RuntimeError("KT late CPU fallback failed") from late_fallback_error
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU

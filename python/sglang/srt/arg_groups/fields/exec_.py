@@ -808,7 +808,7 @@ class ExecMoe(msgspec.Struct):
     ] = "AMXINT4"
     kt_cpuinfer: A[
         Optional[int],
-        "[ktransformers parameter] The number of CPUInfer threads; required when KT is enabled.",
+        "[ktransformers parameter] Total CPUInfer thread budget; required when KT is enabled. Active MXFP4 Stream-TopN internally reserves one writer thread per --kt-threadpool-count and assigns the remainder to the main expert GEMM.",
     ] = None
     kt_threadpool_count: A[
         int,
@@ -830,6 +830,10 @@ class ExecMoe(msgspec.Struct):
         Optional[int],
         "[ktransformers parameter] First N layers (by global layer index, 0-based) run routed experts entirely on GPU, bypassing the KT CPU path.",
     ] = None
+    kt_prefill_stream_top_n: A[
+        Optional[int],
+        "[ktransformers parameter] Maximum number of missing hot experts selected for streaming in each cache-managed MoE layer and prefill chunk. The MXFP4 v1 transport reuses two fixed staging slots as a concurrency pipeline; staging depth does not reduce this per-window total. Only valid with --kt-expert-placement-strategy decayed-lfu; defaults to min(4, --kt-num-gpu-experts).",
+    ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
@@ -849,8 +853,14 @@ class ExecMoe(msgspec.Struct):
     kt_expert_placement_strategy: A[
         str,
         Arg(
-            help="[ktransformers parameter] Initial GPU expert placement strategy.",
-            choices=["frequency", "front-loading", "uniform", "random"],
+            help="[ktransformers parameter] GPU expert placement and runtime scheduling strategy.",
+            choices=[
+                "frequency",
+                "front-loading",
+                "uniform",
+                "random",
+                "decayed-lfu",
+            ],
         ),
     ] = "uniform"
     kt_lora_path: A[

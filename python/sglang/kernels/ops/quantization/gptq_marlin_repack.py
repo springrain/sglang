@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -53,7 +53,7 @@ def mxfp4_marlin_repack(
     b_q_weight: torch.Tensor,
     size_k: int,
     size_n: int,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Repack native ``[N, K // 2]`` MXFP4 bytes directly into Marlin layout.
 
@@ -72,6 +72,8 @@ def mxfp4_marlin_repack(
         raise ValueError(
             f"expected weight shape {expected_input_shape}, got {tuple(b_q_weight.shape)}"
         )
+    if not b_q_weight.is_contiguous():
+        raise ValueError("MXFP4 input must be contiguous")
 
     b_q_weight = b_q_weight.view(torch.uint8)
     matrix_shape = (size_k // _TILE_SIZE, size_n * _TILE_SIZE // 8)
@@ -80,9 +82,15 @@ def mxfp4_marlin_repack(
     )
     if out is None:
         out = torch.empty(expected_shape, dtype=torch.int32, device=b_q_weight.device)
-    elif tuple(out.shape) != expected_shape or out.dtype != torch.int32:
+    elif (
+        tuple(out.shape) != expected_shape
+        or out.dtype != torch.int32
+        or out.device != b_q_weight.device
+        or not out.is_contiguous()
+    ):
         raise ValueError(
-            f"out must be int32 {expected_shape}, got {out.dtype} {tuple(out.shape)}"
+            f"out must be contiguous int32 {expected_shape} on {b_q_weight.device}, "
+            f"got {out.dtype} {tuple(out.shape)} on {out.device}"
         )
 
     module = _jit_gptq_marlin_repack_module()

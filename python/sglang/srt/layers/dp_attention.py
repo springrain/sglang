@@ -340,6 +340,14 @@ def get_is_extend_in_batch() -> bool:
     return get_forward().is_extend_in_batch
 
 
+def set_prefill_num_tokens(prefill_num_tokens: int):
+    get_forward().set("prefill_num_tokens", int(prefill_num_tokens))
+
+
+def get_prefill_num_tokens() -> int:
+    return int(get_forward().prefill_num_tokens)
+
+
 def is_dp_max_padding() -> bool:
     return _DpGatheredBufferWrapper.is_dp_max_padding()
 

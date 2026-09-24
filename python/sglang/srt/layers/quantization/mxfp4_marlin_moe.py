@@ -5,12 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from torch.nn import Module
-
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
+from torch.nn import Module
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -57,6 +56,7 @@ class Mxfp4MarlinMoEMethod:
         # layer.  The flag is set by kt_ep_wrapper after it selects this
         # backend; ordinary SGLang Marlin keeps its existing in-place path.
         self._kt_layerwise_enabled = False
+        self._kt_activation_kwargs = None
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
@@ -123,9 +123,7 @@ class Mxfp4MarlinMoEMethod:
         def _scale_ones(*shape: int) -> torch.Tensor:
             if self._kt_layerwise_enabled:
                 return torch.ones(shape, dtype=torch.float32)
-            return torch.full(shape, 127, dtype=torch.uint8).view(
-                torch.float8_e8m0fnu
-            )
+            return torch.full(shape, 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
 
         w13_weight_scale = torch.nn.Parameter(
             _scale_ones(
@@ -164,14 +162,10 @@ class Mxfp4MarlinMoEMethod:
         if self._kt_layerwise_enabled:
             from sglang.srt.layers.quantization.v4_marlin_moe import (
                 prepare_v4_mxfp4_marlin,
+                require_v4_mxfp4_marlin_streaming_support,
             )
 
-            capability = torch.cuda.get_device_capability(layer.w13_weight.device)
-            if capability not in ((8, 9), (12, 0)):
-                raise RuntimeError(
-                    "KT MXFP4 layerwise Marlin requires SM89 or SM120, got "
-                    f"SM{capability[0]}{capability[1]}."
-                )
+            require_v4_mxfp4_marlin_streaming_support(layer.w13_weight.device)
             raw_names = (
                 "w13_weight",
                 "w13_weight_scale_inv",
@@ -241,11 +235,11 @@ class Mxfp4MarlinMoEMethod:
         # (hash/top-k carriers are represented by the same ``topk_ids`` /
         # ``topk_weights`` fields in this path).  Do not call the removed
         # ``format_is_hash`` helper from the old KT branch.
-        if not TopKOutputChecker.format_is_standard(topk_output):
-            if not hasattr(topk_output, "topk_ids") or not hasattr(
-                topk_output, "topk_weights"
-            ):
-                raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+        if not TopKOutputChecker.format_is_standard(topk_output) and (
+            not hasattr(topk_output, "topk_ids")
+            or not hasattr(topk_output, "topk_weights")
+        ):
+            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
         hidden_states = dispatch_output.hidden_states
 
         if getattr(layer, "_v4_marlin_path", False) and self._kt_layerwise_enabled:
@@ -278,15 +272,22 @@ class Mxfp4MarlinMoEMethod:
             if hidden_pad:
                 hidden_states_padded = F.pad(hidden_states, (0, hidden_pad))
 
+            activation_kwargs = getattr(self, "_kt_activation_kwargs", None)
+            if activation_kwargs is None:
+                activation_kwargs = {
+                    "swiglu_limit": getattr(
+                        getattr(layer, "moe_runner_config", None),
+                        "swiglu_limit",
+                        None,
+                    )
+                }
             output = apply_v4_marlin_moe(
                 hidden_states=hidden_states_padded,
                 prepared=layer._v4_marlin_weights,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 routed_scaling_factor=routed_scale,
-                swiglu_limit=getattr(
-                    getattr(layer, "moe_runner_config", None), "swiglu_limit", None
-                ),
+                **activation_kwargs,
             )
             if hidden_pad:
                 output = output[..., : hidden_states.shape[-1]]

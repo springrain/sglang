@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     resolve_kt_cpu_activation,
+    validate_kt_v4_mxfp4_activation,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization import mxfp4 as mxfp4_mod
@@ -224,6 +225,73 @@ def test_k3_situ_maps_to_explicit_kt_activation_contract():
     }
 
 
+def test_kt_v4_resident_wave_forwards_the_shared_activation_contract(
+    monkeypatch,
+):
+    import sglang.srt.layers.moe.topk as topk_mod
+    import sglang.srt.layers.quantization.v4_marlin_moe as v4_mod
+
+    captured = {}
+
+    def fake_apply(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros_like(kwargs["hidden_states"])
+
+    monkeypatch.setattr(v4_mod, "apply_v4_marlin_moe", fake_apply)
+    monkeypatch.setattr(
+        topk_mod.TopKOutputChecker,
+        "format_is_standard",
+        staticmethod(lambda _value: True),
+    )
+
+    method = Mxfp4MarlinMoEMethod.__new__(Mxfp4MarlinMoEMethod)
+    method._kt_layerwise_enabled = True
+    method._kt_activation_kwargs = {
+        "activation": "situ",
+        "situ_beta": 4.0,
+        "situ_linear_beta": 25.0,
+        "swiglu_alpha": 0.0,
+        "swiglu_limit": 0.0,
+    }
+    method.moe_runner_config = SimpleNamespace(routed_scaling_factor=None)
+    layer = SimpleNamespace(
+        _v4_marlin_path=True,
+        _v4_marlin_weights=object(),
+        w13_weight=torch.empty((2, 8, 2)),
+        should_fuse_routed_scaling_factor_in_topk=False,
+    )
+    topk_output = SimpleNamespace(
+        topk_ids=torch.tensor([[0]], dtype=torch.int32),
+        topk_weights=torch.ones((1, 1)),
+    )
+    dispatch_output = SimpleNamespace(
+        hidden_states=torch.ones((1, 4)),
+        topk_output=topk_output,
+    )
+
+    result = method.apply(layer, dispatch_output)
+
+    assert tuple(result.hidden_states.shape) == (1, 4)
+    assert captured["activation"] == "situ"
+    assert captured["situ_beta"] == 4.0
+    assert captured["situ_linear_beta"] == 25.0
+    assert captured["swiglu_alpha"] == 0.0
+    assert captured["swiglu_limit"] == 0.0
+
+
+def test_kt_v4_nonplain_activation_requires_split_gate_up_layout():
+    with pytest.raises(ValueError, match="gate_up_interleaved=False"):
+        validate_kt_v4_mxfp4_activation(
+            SimpleNamespace(gate_up_interleaved=True),
+            {"activation": "situ"},
+        )
+
+    validate_kt_v4_mxfp4_activation(
+        SimpleNamespace(gate_up_interleaved=False),
+        {"activation": "swiglu_oai"},
+    )
+
+
 @pytest.mark.parametrize(
     "method",
     [
@@ -334,6 +402,24 @@ def test_minimax_swiglu_oai_and_v4_clamp_keep_distinct_contracts():
             SimpleNamespace(activation="silu", gemm1_alpha=-1.0),
             "BF16",
             "finite and non-negative",
+        ),
+        (
+            SimpleNamespace(
+                activation="silu",
+                gemm1_alpha=1.702,
+                gemm1_beta=2.0,
+            ),
+            "MXFP4",
+            "gemm1_beta=1.0",
+        ),
+        (
+            SimpleNamespace(
+                activation="silu",
+                gemm1_alpha=None,
+                gemm1_clamp_limit=7.0,
+            ),
+            "MXFP4",
+            "post-SiLU clamp",
         ),
         (SimpleNamespace(activation="gelu"), "MXFP4", "do not support"),
         (

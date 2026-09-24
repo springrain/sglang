@@ -666,6 +666,9 @@ class ForwardFlags:
         # Sticky across forwards: every ForwardBatch construction writes it;
         # graph runners force False around capture.
         "is_extend_in_batch": False,
+        # Number of leading token rows belonging to prefill/extend work. KT
+        # uses this to exclude decode tails from MIXED-batch LFU evidence.
+        "prefill_num_tokens": 0,
         # Per-layer MLP collective control (set by decoder via scoped()
         # around the MLP / MoE / hybrid mixer call).
         # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
@@ -687,6 +690,7 @@ class ForwardFlags:
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
+            "prefill_num_tokens",
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
