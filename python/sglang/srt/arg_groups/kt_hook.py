@@ -187,11 +187,23 @@ def validate_kt_args(server_args: Any) -> None:
         )
 
     if cfg.kt_weight_path is not None:
+        if cfg.ep_size != 1:
+            raise ValueError(
+                "--kt-weight-path currently requires --ep-size 1; compact "
+                "resident expert rows are rank-local and do not yet implement "
+                "the EP>1 kernel ABI."
+            )
         if cfg.moe_a2a_backend != "none":
             raise ValueError(
                 "--kt-weight-path currently requires --moe-a2a-backend none; "
                 "KTEP needs the standard routed dispatch output and cannot "
                 "consume A2A dispatcher outputs."
+            )
+        if cfg.moe_runner_backend in ("triton_kernel", "hpc_ops"):
+            raise ValueError(
+                "--kt-weight-path is incompatible with --moe-runner-backend "
+                f"{cfg.moe_runner_backend}: that runner consumes global expert "
+                "routing metadata rather than KTEP's compact resident-row ids."
             )
         if cfg.kt_cpuinfer is None or cfg.kt_cpuinfer <= 0:
             raise ValueError(

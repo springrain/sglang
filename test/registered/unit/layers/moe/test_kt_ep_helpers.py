@@ -1,5 +1,7 @@
 """Unit coverage for the SGLang-side KT Q8/P1 routing helpers."""
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -35,6 +37,29 @@ def _parse_server_args(extra: list[str]) -> ServerArgs:
     server_args.resolve_once()
     server_args.check_server_args()
     return server_args
+
+
+@pytest.mark.parametrize(
+    ("method", "threshold", "dynamic", "expected"),
+    [
+        ("RAWINT4", 4096, False, True),
+        ("rawint4", 1, False, True),
+        ("RAWINT4", 0, False, False),
+        ("RAWINT4", None, False, False),
+        ("MXFP4", 4096, False, False),
+        ("MXFP4", None, True, True),
+    ],
+)
+def test_pack_all_native_experts_for_dynamic_or_rawint4_full_gpu_prefill(
+    method, threshold, dynamic, expected
+):
+    config = SimpleNamespace(
+        method=method,
+        gpu_prefill_token_threshold=threshold,
+        kt_enable_dynamic_expert_update=dynamic,
+    )
+
+    assert kt_ep._should_pack_all_experts_on_load(config) is expected
 
 
 def test_uniform_masks_keep_dense_layers_on_gpu():
@@ -120,6 +145,133 @@ def test_mask_and_remap_preserves_gpu_order_and_masks_cpu_experts():
     assert torch.equal(output, expected)
 
 
+def test_mask_and_remap_preserves_invalid_routing_sentinels():
+    mask = torch.tensor([True, False, True, False])
+    logical_to_gpu = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
+    topk_ids = torch.tensor([[-1, 4, 2]], dtype=torch.int64)
+
+    eager = getattr(kt_ep.mask_and_remap_expert_ids, "__wrapped__", None)
+    remap = eager or kt_ep.mask_and_remap_expert_ids
+    output = remap(topk_ids, mask, logical_to_gpu)
+
+    assert torch.equal(output, torch.tensor([[-1, -1, 1]], dtype=torch.int32))
+
+
+def test_materialize_kt_topk_output_resolves_bypassed_routing_once(monkeypatch):
+    import sglang.srt.layers.moe.topk as topk_mod
+
+    expected = topk_mod.StandardTopKOutput(
+        topk_weights=torch.tensor([[0.75, 0.25]]),
+        topk_ids=torch.tensor([[3, 1]]),
+        router_logits=torch.zeros(1, 4),
+    )
+    calls = []
+
+    def fake_select_experts(**kwargs):
+        calls.append(kwargs["layer_id"])
+        return expected
+
+    monkeypatch.setattr(topk_mod, "select_experts", fake_select_experts)
+    bypassed = topk_mod.BypassedTopKOutput(
+        hidden_states=torch.zeros(1, 2),
+        router_logits=torch.zeros(1, 4),
+        topk_config=topk_mod.TopKConfig(top_k=2),
+    )
+
+    result = kt_ep.materialize_kt_topk_output(bypassed, layer_idx=7)
+
+    assert result is expected
+    assert calls == [7]
+    assert kt_ep.materialize_kt_topk_output(expected, layer_idx=7) is expected
+
+
+def test_materialize_kt_topk_output_rejects_triton_kernel_carrier(monkeypatch):
+    import sglang.srt.layers.moe.topk as topk_mod
+
+    carrier = object()
+    monkeypatch.setattr(
+        topk_mod.TopKOutputChecker,
+        "format_is_bypassed",
+        staticmethod(lambda value: False),
+    )
+    monkeypatch.setattr(
+        topk_mod.TopKOutputChecker,
+        "format_is_triton_kernels",
+        staticmethod(lambda value: value is carrier),
+    )
+
+    with pytest.raises(ValueError, match="triton_kernel"):
+        kt_ep.materialize_kt_topk_output(carrier, layer_idx=7)
+
+
+def test_weight_loader_without_metadata_uses_kt_compact_mapping(monkeypatch):
+    import sglang.srt.layers.moe.fused_moe_triton.layer as fused_moe_layer
+
+    moe = fused_moe_layer.FusedMoE.__new__(fused_moe_layer.FusedMoE)
+    moe.quant_config = None
+    moe._expert_storage_rank = 0
+    moe._num_local_routed = 6
+    moe._has_fused_shared = False
+    moe.num_local_experts = 6
+
+    wrapper = kt_ep.KTEPWrapperMethod.__new__(kt_ep.KTEPWrapperMethod)
+    wrapper.num_gpu_experts = 2
+    wrapper.gpu_experts_mask = torch.tensor(
+        [False, True, False, False, True, False], dtype=torch.bool
+    )
+    wrapper.logical_to_gpu_index = torch.tensor(
+        [-1, 0, -1, -1, 1, -1], dtype=torch.int32
+    )
+    moe.quant_method = wrapper
+
+    writes = []
+
+    def record_write(**kwargs):
+        writes.append(kwargs["expert_id"])
+
+    moe._weight_loader_impl = record_write
+    monkeypatch.setattr(
+        fused_moe_layer, "get_global_expert_location_metadata", lambda: None
+    )
+    param = SimpleNamespace(_sglang_require_global_experts=False)
+    loaded_weight = torch.ones(1)
+
+    moe.weight_loader(param, loaded_weight, "weight", "w1", expert_id=4)
+    moe.weight_loader(param, loaded_weight, "weight", "w1", expert_id=1)
+    moe.weight_loader(param, loaded_weight, "weight", "w1", expert_id=2)
+
+    assert writes == [1, 0]
+
+
+def test_fused_mxfp4_loader_selects_only_resident_rows():
+    import sglang.srt.layers.moe.fused_moe_triton.layer as fused_moe_layer
+
+    class _StaticMxfp4Config:
+        @staticmethod
+        def get_name():
+            return "mxfp4"
+
+        @staticmethod
+        def is_static_cfg():
+            return True
+
+    moe = fused_moe_layer.FusedMoE.__new__(fused_moe_layer.FusedMoE)
+    moe.quant_config = _StaticMxfp4Config()
+    wrapper = kt_ep.KTEPWrapperMethod.__new__(kt_ep.KTEPWrapperMethod)
+    wrapper.gpu_index_to_logical = torch.tensor([1, 4], dtype=torch.int32)
+    moe.quant_method = wrapper
+
+    param = SimpleNamespace(data=torch.zeros((2, 2, 2), dtype=torch.float32))
+    loaded_weight = torch.stack(
+        [torch.full((2, 2), float(expert_id)) for expert_id in range(6)]
+    )
+
+    moe.weight_loader(param, loaded_weight, "weight", "w1", expert_id=None)
+
+    assert torch.equal(param.data[0], torch.full((2, 2), 1.0))
+    assert torch.equal(param.data[1], torch.full((2, 2), 4.0))
+
+
 def test_select_top_experts_ignores_invalid_ids_and_is_stable():
     topk_ids = torch.tensor([[2, 2, -1], [4, 2, 1], [4, 9, 1]])
     selected = kt_ep.select_top_experts_from_batch(
@@ -186,6 +338,30 @@ def test_kt_cli_matrix_is_accepted():
             "2",
             "--moe-a2a-backend",
             "deepep",
+        ],
+        [
+            "--kt-weight-path",
+            "/tmp/q8.gguf",
+            "--kt-cpuinfer",
+            "2",
+            "--ep-size",
+            "2",
+        ],
+        [
+            "--kt-weight-path",
+            "/tmp/q8.gguf",
+            "--kt-cpuinfer",
+            "2",
+            "--moe-runner-backend",
+            "triton_kernel",
+        ],
+        [
+            "--kt-weight-path",
+            "/tmp/q8.gguf",
+            "--kt-cpuinfer",
+            "2",
+            "--moe-runner-backend",
+            "hpc_ops",
         ],
     ],
 )

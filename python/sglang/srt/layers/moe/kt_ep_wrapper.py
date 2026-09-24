@@ -33,6 +33,7 @@ import ctypes
 import gc
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -117,6 +118,21 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+
+
+def _should_pack_all_experts_on_load(config: KTConfig) -> bool:
+    """Whether the native CPU image must retain GPU-resident experts too."""
+
+    if config.kt_enable_dynamic_expert_update:
+        return True
+    # RAWINT4's layerwise full-GPU prefill writer currently reconstructs every
+    # expert from the CPU backend. Keep resident experts in the owned CPU image
+    # whenever that fallback can run; ordinary static decode remains selective.
+    return (
+        (config.method or "").upper() == "RAWINT4"
+        and bool(config.gpu_prefill_token_threshold)
+        and config.gpu_prefill_token_threshold > 0
+    )
 
 
 @dataclass
@@ -316,7 +332,7 @@ class SharedStagingBuffer:
         )
         buffer_size_mb = self.buffer.numel() * self.buffer.element_size() / 1024**2
         logger.info(
-            f"[KT] Created shared staging buffer: {buffer_size_mb:.1f} MiB "
+            f"[KT] Created shared activation staging buffer: {buffer_size_mb:.1f} MiB "
             f"(shape={self.buffer.shape}, dtype={dtype})"
         )
 
@@ -3449,10 +3465,134 @@ def mask_and_remap_expert_ids(
     Returns:
         Remapped topk_ids tensor with GPU indices for GPU experts, -1 for CPU experts
     """
-    is_gpu_expert = gpu_experts_mask[topk_ids]
+    valid = (topk_ids >= 0) & (topk_ids < gpu_experts_mask.numel())
+    safe_ids = torch.where(valid, topk_ids, 0)
+    is_gpu_expert = valid & gpu_experts_mask[safe_ids]
     # For GPU experts: remap to GPU weight index; for CPU experts: set to -1
-    remapped_ids = torch.where(is_gpu_expert, logical_to_gpu_index[topk_ids], -1)
+    remapped_ids = torch.where(is_gpu_expert, logical_to_gpu_index[safe_ids], -1)
     return remapped_ids
+
+
+def materialize_kt_topk_output(topk_output, layer_idx: int):
+    """Return explicit logical top-k ids/weights for hybrid CPU/GPU routing.
+
+    Logits-based MoE backends can defer top-k selection to their fused GPU
+    kernel. KTransformers needs the selected logical ids earlier: the CPU
+    experts consume them directly and the GPU ids must be masked/remapped into
+    the compact resident-row space. Materialize that carrier exactly once at
+    the wrapper boundary; already-explicit formats pass through unchanged.
+    """
+
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    if TopKOutputChecker.format_is_bypassed(topk_output):
+        return topk_output.to_standard(layer_id=layer_idx)
+    if TopKOutputChecker.format_is_triton_kernels(topk_output):
+        raise ValueError(
+            "KTransformers hybrid experts require explicit standard top-k ids; "
+            "the triton_kernel MoE runner emits only ragged routing metadata. "
+            "Use --moe-runner-backend triton or another standard-topk backend."
+        )
+    if TopKOutputChecker.format_is_packed(topk_output):
+        raise ValueError(
+            "KTransformers hybrid experts require unpacked logical top-k ids; "
+            "the packed routed-MoE carrier cannot be masked for CPU experts."
+        )
+    return topk_output
+
+
+_KT_NATIVE_SITU_METHODS = frozenset(
+    {
+        "RAWINT4",
+        "FP8",
+        "BF16",
+        "FP8_PERCHANNEL",
+        "GPTQ_INT4",
+        "MXFP4",
+        "NVFP4",
+        "MXFP8",
+    }
+)
+_KT_NATIVE_SWIGLU_METHODS = _KT_NATIVE_SITU_METHODS | {"SYCL_GPTQ_INT4"}
+
+
+def resolve_kt_cpu_activation(moe_runner_config, kt_method: str) -> dict:
+    """Translate SGLang's MoE activation contract to kt-kernel arguments."""
+
+    activation = getattr(moe_runner_config, "activation", "silu") or "silu"
+    method = (kt_method or "").upper()
+    alpha = getattr(moe_runner_config, "gemm1_alpha", None)
+    clamp = getattr(moe_runner_config, "gemm1_clamp_limit", None)
+    swiglu_limit = getattr(moe_runner_config, "swiglu_limit", None)
+
+    if activation == "situ":
+        if method not in _KT_NATIVE_SITU_METHODS:
+            raise ValueError(
+                "KT CPU SiTU requires a native method whose gate/up outputs "
+                "use the shared CPU activation path; supported methods are "
+                f"{sorted(_KT_NATIVE_SITU_METHODS)}, got {kt_method!r}."
+            )
+        beta = 1.0 if alpha is None else float(alpha)
+        linear_beta = None if clamp is None else float(clamp)
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError(
+                f"KT CPU SiTU requires a finite positive beta, got {beta}."
+            )
+        if linear_beta is not None and (
+            not math.isfinite(linear_beta) or linear_beta < 0.0
+        ):
+            raise ValueError(
+                "KT CPU SiTU requires a finite non-negative linear_beta when provided, "
+                f"got {linear_beta}."
+            )
+        return {
+            "activation": "situ",
+            "situ_beta": beta,
+            "situ_linear_beta": linear_beta,
+            "swiglu_alpha": 0.0,
+            "swiglu_limit": 0.0,
+        }
+
+    if activation != "silu":
+        raise ValueError(
+            f"KT CPU experts do not support activation={activation!r}; "
+            "supported activations are 'silu' and 'situ'."
+        )
+
+    supports_shared_activation = (
+        method in _KT_NATIVE_SWIGLU_METHODS or method == "LLAMAFILE"
+    )
+    limit = float(clamp if clamp is not None else (swiglu_limit or 0.0))
+    swiglu_alpha = float(alpha) if alpha is not None else 0.0
+    if not math.isfinite(swiglu_alpha) or swiglu_alpha < 0.0:
+        raise ValueError(
+            f"KT CPU SwiGLU alpha must be finite and non-negative, got {swiglu_alpha}."
+        )
+    if not math.isfinite(limit) or limit < 0.0:
+        raise ValueError(
+            f"KT CPU SwiGLU clamp limit must be finite and non-negative, got {limit}."
+        )
+    if not supports_shared_activation:
+        if swiglu_alpha != 0.0 or limit != 0.0:
+            raise ValueError(
+                f"KT method {kt_method!r} bypasses the shared CPU activation "
+                "path and cannot preserve gemm1_alpha/gemm1_clamp_limit."
+            )
+        return {
+            "activation": "silu",
+            "situ_beta": None,
+            "situ_linear_beta": None,
+            "swiglu_alpha": 0.0,
+            "swiglu_limit": 0.0,
+        }
+
+    return {
+        "activation": "swiglu_oai" if swiglu_alpha > 0.0 else "silu",
+        "situ_beta": None,
+        "situ_linear_beta": None,
+        "swiglu_alpha": swiglu_alpha,
+        "swiglu_limit": limit,
+    }
 
 
 def select_top_experts_from_batch(
@@ -3849,6 +3989,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.kt_config = kt_config
         self.gpu_experts_mask = kt_config.gpu_experts_mask  # bool tensor [num_experts], on CPU
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
+        self._uses_compact_gpu_expert_rows = False
+        self._enable_compact_gpu_expert_rows(self.gpu_method)
         self.kt_expert_lora_path = kt_config.expert_lora_path
         self.kt_expert_lora_enabled = bool(self.kt_expert_lora_path)
         self.kt_expert_lora_weights: Optional[KTExpertLoraWeights] = None
@@ -3914,6 +4056,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
 
+    def _enable_compact_gpu_expert_rows(self, method) -> None:
+        if method is None or not getattr(
+            method, "supports_kt_compact_expert_rows", False
+        ):
+            return
+        # This GPU method owns only resident rows. apply() remaps logical
+        # expert ids into this compact row space before GPU execution.
+        self._uses_compact_gpu_expert_rows = True
+        method._kt_compact_expert_rows = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -3968,6 +4120,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             params_dtype=params_dtype,
             **extra_weight_attrs,
         )
+        # Scheme-based quant methods delegate their implementation through
+        # layer.scheme, which is not visible when this wrapper is constructed.
+        # Pick up and propagate the compact-row capability after weight
+        # creation so post-processing, quant-info construction, and the N=0
+        # runner bypass all follow the same contract.
+        self._enable_compact_gpu_expert_rows(getattr(layer, "scheme", None))
 
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device
@@ -3990,28 +4148,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
         if self.tp_rank == 0:
-            # SwiGLU activation params for CPU experts. Source of truth is
-            # MoeRunnerConfig, populated by the model file from HF config:
-            #   - minimax_m3.py forwards config.swiglu_alpha / swiglu_limit
-            #     as gemm1_alpha / gemm1_clamp_limit (swiglu_oai path)
-            #   - deepseek_v2.py forwards config.swiglu_limit into the
-            #     legacy swiglu_limit slot (DSV4 plain-silu clamp path)
-            # kt-kernel C++ accepts a single (alpha, limit) pair and
-            # disambiguates by alpha != 0 (swiglu_oai vs plain silu).
+            # Source of truth is MoeRunnerConfig, populated by the model file
+            # from HF config. Keep K3 SiTU explicit instead of overloading the
+            # legacy SwiGLU-OAI alpha/limit pair.
             _mrc = getattr(layer, "moe_runner_config", None)
-            _cfg_alpha = getattr(_mrc, "gemm1_alpha", None) if _mrc is not None else None
-            _cfg_clamp = getattr(_mrc, "gemm1_clamp_limit", None) if _mrc is not None else None
-            _cfg_swglim = getattr(_mrc, "swiglu_limit", None) if _mrc is not None else None
-            _kt_swiglu_alpha = float(_cfg_alpha) if _cfg_alpha is not None else 0.0
-            _kt_swiglu_limit = float(
-                _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
+            _kt_activation_kwargs = resolve_kt_cpu_activation(
+                _mrc, self.kt_config.method
             )
-            # kt-kernel guards swiglu_limit to MXFP4/MXFP8 only.
-            # Zero it out for other methods (AMXINT4, BF16, etc.)
-            # so V4-Flash + non-MXFP runs don't crash at init.
-            if (self.kt_config.method or "").upper() not in ("MXFP4", "MXFP8"):
-                _kt_swiglu_limit = 0.0
-                _kt_swiglu_alpha = 0.0
             common_wrapper_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -4026,10 +4169,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
             )
             if self.kt_expert_lora_enabled:
-                if _kt_swiglu_limit != 0.0:
+                if (
+                    _kt_activation_kwargs["activation"] != "silu"
+                    or _kt_activation_kwargs["swiglu_limit"] != 0.0
+                ):
                     raise ValueError(
                         "--kt-expert-lora-path uses KT SFT wrappers, which do not "
-                        "support the V4-2604B swiglu_limit path."
+                        "support SiTU, SwiGLU-OAI, or the V4-2604B clamp path."
                     )
                 self.kt_expert_lora_weights = _load_kt_expert_lora_weights(
                     adapter_path=self.kt_expert_lora_path,
@@ -4050,12 +4196,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             else:
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
-                    swiglu_limit=_kt_swiglu_limit,
-                    swiglu_alpha=_kt_swiglu_alpha,
+                    **_kt_activation_kwargs,
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
-                    pack_all_experts_on_load=(
-                        self.kt_config.kt_enable_dynamic_expert_update
+                    pack_all_experts_on_load=_should_pack_all_experts_on_load(
+                        self.kt_config
                     ),
                 )
 
@@ -4128,7 +4273,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
 
         # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        if (
+            self.num_gpu_experts > 0
+            and hasattr(self.gpu_method, "process_weights_after_loading")
+        ):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
@@ -4221,6 +4369,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 4. routed_scaling_factor is applied uniformly in deepseek_v2.py forward_normal
         # So we disable it in GPU method to avoid double scaling on GPU part.
         gpu_runner_config = replace(moe_runner_config, routed_scaling_factor=None)
+        if self._uses_compact_gpu_expert_rows:
+            if self.num_gpu_experts == 0:
+                # apply() bypasses the GPU MoE entirely in this configuration.
+                # Avoid constructing a backend runner with zero expert rows.
+                self.runner = None
+                return
         if self.override_num_local_experts:
             gpu_runner_config = replace(
                 gpu_runner_config, num_local_experts=self.num_gpu_experts
@@ -4284,15 +4438,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation in ("silu", "situ"), (
+            "KT CPU experts support only SiLU and SiTU activations."
         )
 
         if self.tp_rank != 0 or self.wrapper is None:
             return
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        topk_output = materialize_kt_topk_output(
+            dispatch_output.topk_output, self.kt_config.layer_idx
+        )
         topk_weights, topk_ids, _ = topk_output
 
         # Submit forward task to CPU (non-blocking)
@@ -4328,14 +4484,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             dispatch_output: Dispatched tokens and routing information
             staged_hidden_states: Pre-copied hidden states in staging buffer
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation in ("silu", "situ"), (
+            "KT CPU experts support only SiLU and SiTU activations."
+        )
 
         if self.tp_rank != 0 or self.wrapper is None:
             return
 
-        topk_output = dispatch_output.topk_output
+        topk_output = materialize_kt_topk_output(
+            dispatch_output.topk_output, self.kt_config.layer_idx
+        )
         topk_weights, topk_ids, _ = topk_output
 
         # Submit forward task using staged buffer
@@ -4585,6 +4743,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 ctx._restore_raw_attrs()
 
             return result
+
+        # Hybrid execution needs explicit logical ids for the CPU kernel and
+        # for compact GPU-row remapping. Keep the original deferred carrier on
+        # the full-GPU fallback above, whose logits-based backend can consume it
+        # directly.
+        topk_output = materialize_kt_topk_output(topk_output, self.kt_config.layer_idx)
+        if topk_output is not dispatch_output.topk_output:
+            dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy

@@ -1063,9 +1063,6 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         f"unsupported topk format: {topk_output.format}"
     )
     if is_standard:
-        assert runner_config.activation == "situ", (
-            "standard topk output only wired for the situ path"
-        )
         top_k = topk_output.topk_ids.shape[1]
         router_logits = None
     else:
@@ -1183,6 +1180,53 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             norm_topk_prob=topk_output.topk_config.renormalize,
             local_expert_offset=quant_info.local_expert_offset,
             local_num_experts=quant_info.local_num_experts,
+            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+            output=symm_output,
+            enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        )
+        return StandardCombineInput(hidden_states=symm_output)
+
+    if is_standard:
+        # KTEP materializes deferred routing before splitting CPU/GPU experts,
+        # then masks and remaps the GPU ids into compact resident-row indices.
+        # Re-running top-k from router logits would lose that remap, so consume
+        # the explicit ids/weights with FlashInfer's routed API. Its FP4 ABI
+        # carries the same bias and clamped-SwiGLU parameters as the logits API
+        # used below (GPT-OSS), while activation_type preserves the ordinary
+        # gated activation semantics.
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+
+        routing = _get_routing_for_flashinfer_routed(topk_output)
+        trtllm_fp4_block_scale_routed_moe(
+            topk_ids=routing,
+            routing_bias=None,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale,
+            gemm1_bias=quant_info.w13_weight_bias,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
+            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale,
+            gemm2_bias=quant_info.w2_weight_bias,
+            output1_scale_scalar=None,
+            output1_scale_gate_scalar=None,
+            output2_scale_scalar=None,
+            num_experts=quant_info.global_num_experts,
+            top_k=_routing_top_k(routing),
+            n_group=None,
+            topk_group=None,
+            intermediate_size=quant_info.intermediate_size_per_partition,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=1,  # Unused, but must be 1 to pass validation.
+            do_finalize=True,
+            activation_type=get_activation_type(
+                runner_config.activation, is_gated=runner_config.is_gated
+            ),
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),

@@ -106,6 +106,7 @@ from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
+    collect_kt_cpu_only_routed_expert_layers,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -122,6 +123,7 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
+    should_materialize_routed_expert_tensor,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
@@ -394,6 +396,11 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        kt_cpu_only_routed_expert_layers: frozenset[int] = dataclasses.field(
+            default_factory=frozenset
+        )
+        """Instantiated KT layers whose routed experts are loaded only by CPU."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -405,6 +412,9 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                kt_cpu_only_routed_expert_layers=collect_kt_cpu_only_routed_expert_layers(
+                    model, model_config
+                ),
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -630,6 +640,39 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
+            tensor_filter = None
+            if source.kt_cpu_only_routed_expert_layers:
+                skip_layer_ids = source.kt_cpu_only_routed_expert_layers
+                layer_preview = sorted(skip_layer_ids)
+                logger.info(
+                    "[KT] Main checkpoint loader will skip routed-expert tensors "
+                    "for %d CPU-only layer(s): %s%s",
+                    len(layer_preview),
+                    layer_preview[:12],
+                    " ..." if len(layer_preview) > 12 else "",
+                )
+
+                def _include_checkpoint_tensor(name: str) -> bool:
+                    return should_materialize_routed_expert_tensor(
+                        name, skip_layer_ids
+                    )
+
+                tensor_filter = _include_checkpoint_tensor
+            tensor_filter_kwargs = (
+                {} if tensor_filter is None else {"tensor_filter": tensor_filter}
+            )
+
+            if (
+                tensor_filter is not None
+                and self.load_config.load_format == LoadFormat.FASTSAFETENSORS
+            ):
+                raise ValueError(
+                    "Kimi-K3 KT CPU-only expert loading is incompatible with "
+                    "load_format='fastsafetensors': that backend copies complete "
+                    "checkpoint files to GPU before per-key filtering. Use the "
+                    "standard safetensors loader instead."
+                )
+
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             configured_prefetch = get_model().weight_loader_prefetch_checkpoints
             start_iterator_prefetch = (
@@ -677,6 +720,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                     enable_gds=enable_gds,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    **tensor_filter_kwargs,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -688,6 +732,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    **tensor_filter_kwargs,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -696,6 +741,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    **tensor_filter_kwargs,
                 )
 
         else:

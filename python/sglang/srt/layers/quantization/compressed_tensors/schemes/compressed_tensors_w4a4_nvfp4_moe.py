@@ -31,6 +31,10 @@ if TYPE_CHECKING:
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
+    # KTransformers keeps only GPU-resident experts in this method and remaps
+    # logical expert ids into the compact weight-row space before execution.
+    supports_kt_compact_expert_rows = True
+
     def __init__(self):
         if not get_platform().is_blackwell:
             raise ValueError(
@@ -174,6 +178,13 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         )
         delattr(layer, "w2_weight_packed")
 
+        num_physical_experts = layer.w13_weight.size(0)
+        if num_physical_experts == 0:
+            # KTEP bypasses the GPU runner when no experts are resident. Keep
+            # the canonical runtime parameter names above, but avoid reductions
+            # and backend transforms that require at least one expert row.
+            return
+
         if self.use_flashinfer_trtllm:
             w, s = reorder_w1w3_to_w3w1(
                 layer.w13_weight.data, layer.w13_weight_scale.data, dim=-2
@@ -203,7 +214,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             w13_input_global_scale = (
                 layer.w13_input_global_scale.min()
                 .to(torch.float32)
-                .expand(layer.num_local_experts)
+                .expand(num_physical_experts)
             )
         else:
             w13_input_global_scale = layer.w13_input_global_scale.min(dim=1).values.to(
@@ -223,7 +234,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             w2_input_global_scale = (
                 layer.w2_input_global_scale.min()
                 .to(torch.float32)
-                .expand(layer.num_local_experts)
+                .expand(num_physical_experts)
             )
         else:
             w2_input_global_scale = layer.w2_input_global_scale
@@ -283,9 +294,15 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         if self.use_flashinfer_trtllm:
             import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401 – triggers @register_fused_func
 
-            self.runner = MoeRunner(
-                MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
+            # KTEP has already materialized and remapped top-k ids into the
+            # compact resident-row space. Force the routed kernel so it cannot
+            # recompute logical expert ids from the original router logits.
+            runner_backend = (
+                MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+                if getattr(self, "_kt_compact_expert_rows", False)
+                else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
+            self.runner = MoeRunner(runner_backend, moe_runner_config)
         else:
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401 – triggers @register_fused_func
 
@@ -308,6 +325,13 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
             assert layer.routing_method_type is not None
 
+            if getattr(self, "_kt_compact_expert_rows", False):
+                local_expert_offset = 0
+                local_num_experts = layer.w13_weight.size(0)
+            else:
+                local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+                local_num_experts = layer.num_local_experts
+
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -323,8 +347,8 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 # feeds a scalar).
                 w13_input_scale_quant=layer.w13_input_scale_quant[:1],
                 global_num_experts=layer.num_experts,
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                local_num_experts=layer.num_local_experts,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=local_num_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=layer.routing_method_type,
                 use_per_token_activation=False,
@@ -340,6 +364,16 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
 
+            if getattr(self, "_kt_compact_expert_rows", False):
+                # Compact ids address this method's resident rows directly;
+                # they are no longer partitioned in the layer's logical EP
+                # range.
+                moe_ep_size = 1
+                moe_ep_rank = 0
+            else:
+                moe_ep_size = layer.moe_ep_size
+                moe_ep_rank = layer.moe_ep_rank
+
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
@@ -353,8 +387,8 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                     layer.w2_weight_scale,
                     layer.g2_alphas,
                 ],
-                moe_ep_size=layer.moe_ep_size,
-                moe_ep_rank=layer.moe_ep_rank,
+                moe_ep_size=moe_ep_size,
+                moe_ep_rank=moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,

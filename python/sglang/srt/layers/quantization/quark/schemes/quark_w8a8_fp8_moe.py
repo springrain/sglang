@@ -35,6 +35,9 @@ if _use_aiter:
 
 
 class QuarkW8A8FP8MoE(QuarkMoEScheme):
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    supports_kt_compact_expert_rows = True
+
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.is_static_input_scheme: bool = False
         self.input_qscheme = None
@@ -153,6 +156,12 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        num_physical_experts = layer.w13_weight.size(0)
+        if num_physical_experts == 0:
+            # KTEP skips the GPU runner for an empty resident set. Avoid empty
+            # reductions and backend transforms if this hook is called directly.
+            return
+
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.is_static_input_scheme:
@@ -209,7 +218,7 @@ class QuarkW8A8FP8MoE(QuarkMoEScheme):
             assert layer.w13_weight_scale is not None
             shard_size = layer.intermediate_size_per_partition
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.num_local_experts):
+            for expert_id in range(num_physical_experts):
                 start = 0
                 for shard_id in range(2):
                     dq_weight = per_tensor_dequantize(

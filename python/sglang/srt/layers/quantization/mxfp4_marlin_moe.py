@@ -47,6 +47,7 @@ class Mxfp4MarlinMoEMethod:
     """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
 
     fuse_routed_scaling_factor_in_topk = True
+    supports_kt_compact_expert_rows = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method

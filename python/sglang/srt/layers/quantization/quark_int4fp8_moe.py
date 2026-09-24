@@ -133,6 +133,9 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    supports_kt_compact_expert_rows = True
+
     def __init__(self, quant_config):
         self.quant_config = quant_config
 
@@ -153,6 +156,29 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
             shard_id: str,
             expert_id: int,
         ):
+            logical_expert_id = expert_id
+            storage_expert_id = expert_id
+            if getattr(self, "_kt_compact_expert_rows", False):
+                kt_method = getattr(layer, "quant_method", None)
+                gpu_mask = getattr(kt_method, "gpu_experts_mask", None)
+                logical_to_compact = getattr(kt_method, "logical_to_gpu_index", None)
+                if gpu_mask is None or logical_to_compact is None:
+                    raise RuntimeError(
+                        "Quark INT4/FP8 compact loading requires the KTEP "
+                        "logical-to-compact expert mapping."
+                    )
+                if expert_id < 0 or expert_id >= len(gpu_mask):
+                    return
+                if not bool(gpu_mask[expert_id].item()):
+                    return
+                storage_expert_id = int(logical_to_compact[expert_id].item())
+                if storage_expert_id < 0 or storage_expert_id >= param.shape[0]:
+                    raise RuntimeError(
+                        "Invalid KTEP compact expert row while loading Quark "
+                        f"INT4/FP8: logical={expert_id}, physical={storage_expert_id}, "
+                        f"rows={param.shape[0]}."
+                    )
+
             if shard_id in ["w1", "w3"]:
                 shard_size = self.w13_shard_size
             else:
@@ -196,43 +222,47 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
                     shard_slice = slice(shard_size, 2 * shard_size)
                     idx = 1
 
-                assert param[expert_id][shard_slice].dtype == int4_w.dtype
+                assert param[storage_expert_id][shard_slice].dtype == int4_w.dtype
 
                 assert (
-                    layer.w13_int4_scale[expert_id][shard_slice].shape
+                    layer.w13_int4_scale[storage_expert_id][shard_slice].shape
                     == int4_scale.shape
                 )
                 assert (
-                    layer.w13_int4_scale[expert_id][shard_slice].dtype
+                    layer.w13_int4_scale[storage_expert_id][shard_slice].dtype
                     == int4_scale.dtype
                 )
 
-                layer.w13_int4_scale[expert_id][shard_slice].copy_(int4_scale)
+                layer.w13_int4_scale[storage_expert_id][shard_slice].copy_(int4_scale)
 
-                assert layer.w13_fp8_scale[expert_id][idx].shape == fp8_scale.shape
-                assert layer.w13_fp8_scale[expert_id][idx].dtype == fp8_scale.dtype
+                assert (
+                    layer.w13_fp8_scale[storage_expert_id][idx].shape == fp8_scale.shape
+                )
+                assert (
+                    layer.w13_fp8_scale[storage_expert_id][idx].dtype == fp8_scale.dtype
+                )
 
-                layer.w13_fp8_scale[expert_id][idx].copy_(fp8_scale)
+                layer.w13_fp8_scale[storage_expert_id][idx].copy_(fp8_scale)
             else:
-                assert param[expert_id].dtype == int4_w.dtype
-                assert param[expert_id].shape == int4_w.shape
+                assert param[storage_expert_id].dtype == int4_w.dtype
+                assert param[storage_expert_id].shape == int4_w.shape
 
-                assert layer.w2_int4_scale[expert_id].shape == int4_scale.shape
-                assert layer.w2_int4_scale[expert_id].dtype == int4_scale.dtype
+                assert layer.w2_int4_scale[storage_expert_id].shape == int4_scale.shape
+                assert layer.w2_int4_scale[storage_expert_id].dtype == int4_scale.dtype
 
-                layer.w2_int4_scale[expert_id].copy_(int4_scale)
+                layer.w2_int4_scale[storage_expert_id].copy_(int4_scale)
 
-                assert layer.w2_fp8_scale[expert_id].shape == fp8_scale.shape
-                assert layer.w2_fp8_scale[expert_id].dtype == fp8_scale.dtype
+                assert layer.w2_fp8_scale[storage_expert_id].shape == fp8_scale.shape
+                assert layer.w2_fp8_scale[storage_expert_id].dtype == fp8_scale.dtype
 
-                layer.w2_fp8_scale[expert_id].copy_(fp8_scale)
+                layer.w2_fp8_scale[storage_expert_id].copy_(fp8_scale)
 
             original_weight_loader(
                 param,
                 int4_w,
                 shard_id=shard_id,
                 weight_name=weight_name,
-                expert_id=expert_id,
+                expert_id=logical_expert_id,
             )
 
             # Reset `use_presharded_weights` as the same layer may load several different weights.
@@ -349,6 +379,12 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         tqdm_reset_no_print(self.online_quant_progress_bar, total=total)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        num_physical_experts = layer.w13_weight.size(0)
+        if num_physical_experts == 0:
+            # KTEP bypasses GPU execution for an empty resident set. In
+            # particular, avoid invoking the AITER shuffle with empty weights.
+            return
+
         if _is_hip and not ON_GFX950:
             # CDNA3 does not support OCP FP8E4M3FN, but uses FP8E4M3FNUZ.
             # CDNA4 supports OCP FP8E4M3FN.
@@ -379,7 +415,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         assert layer.w13_fp8_scale is not None
         shard_size = layer.intermediate_size_per_partition
         max_w13_scales = layer.w13_fp8_scale.max(dim=1).values
-        for expert_id in range(layer.num_experts):
+        for expert_id in range(num_physical_experts):
             start = 0
             max_w13_scale_fp8 = max_w13_scales[expert_id]
             for shard_id in range(2):
@@ -396,7 +432,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
 
         # special hack to asm_moe, which takes (weight_int4_scale * weight_scale) as post GEMM scaling
         # optimal design - shall apply per-column weight_int4_scale before GEMM, and weight_scale post
-        for expert_id in range(layer.num_experts):
+        for expert_id in range(num_physical_experts):
             layer.w13_int4_scale[expert_id] *= max_w13_scales[expert_id]
             layer.w2_int4_scale[expert_id] *= layer.w2_fp8_scale[expert_id]
 

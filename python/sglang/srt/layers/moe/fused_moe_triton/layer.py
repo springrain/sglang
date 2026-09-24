@@ -998,6 +998,11 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
         ):
+            if isinstance(self.quant_method, KTEPWrapperMethod):
+                resident_rows = self.quant_method.gpu_index_to_logical.to(
+                    device=loaded_weight.device, dtype=torch.long
+                )
+                loaded_weight = loaded_weight.index_select(0, resident_rows)
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
@@ -1009,12 +1014,21 @@ class FusedMoE(torch.nn.Module):
 
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
-            if not getattr(param, "_sglang_require_global_experts", False):
-                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-                if expert_id == -1:
-                    return
-
-            self._weight_loader_impl(
+            if expert_id is None:
+                # Preserve whole-tensor loaders that do not address one expert
+                # at a time. Static MXFP4 is handled by the fast path above.
+                self._weight_loader_impl(
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                return
+            # Reuse the physical loader so KTransformers applies its resident
+            # expert mask and logical-to-compact-row mapping exactly once even
+            # when EPLB metadata has not been initialized.
+            self._weight_loader_physical(
                 param=param,
                 loaded_weight=loaded_weight,
                 weight_name=weight_name,

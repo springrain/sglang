@@ -628,6 +628,10 @@ def _empty_xpu_moe_expert_weight(
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     """MoE method without quantization."""
 
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    # The logical-to-compact row remap is handled by KTEPWrapperMethod.
+    supports_kt_compact_expert_rows = True
+
     def __init__(
         self,
         use_triton_kernels: bool = False,
@@ -644,6 +648,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # Set by process_weights_after_loading when w13 rows are permuted to
         # interleave gate/up for the fused swiglu up-GEMM epilogue.
         self.w13_swiglu_interleaved = False
+
+    def _runtime_expert_geometry(self, layer: torch.nn.Module) -> tuple[int, int, int]:
+        """Return global count, local offset, and physical local row count."""
+
+        if getattr(self, "_kt_compact_expert_rows", False):
+            return layer.num_experts, 0, int(layer.w13_weight.shape[0])
+        return (
+            layer.num_experts,
+            layer.moe_ep_rank * layer.num_local_experts,
+            layer.num_local_experts,
+        )
 
     def create_weights(
         self,
@@ -761,7 +776,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         # Reorder rows of W1 for fused gated activation
-        if self.use_flashinfer_trtllm_moe:
+        num_physical_experts = int(layer.w13_weight.shape[0])
+        if self.use_flashinfer_trtllm_moe and num_physical_experts > 0:
             # The cached indices are GPU tensors. Colocated weight offloading
             # can release their backing memory between reloads, so rebuild them
             # once per post-processing cycle.
@@ -780,7 +796,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             old_shape_w2 = layer.w2_weight.data[0].shape
             new_shape_w13 = None
             new_shape_w2 = None
-            for i in range(layer.num_local_experts):
+            for i in range(num_physical_experts):
                 permute_indices = _maybe_get_cached_w3_w1_permute_indices(
                     self._cache_permute_indices,
                     layer.w13_weight.data[i].view(torch.uint8),
@@ -825,10 +841,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 )
 
             layer.w13_weight.data = layer.w13_weight.data.reshape(
-                layer.num_local_experts, *new_shape_w13
+                num_physical_experts, *new_shape_w13
             )
             layer.w2_weight.data = layer.w2_weight.data.reshape(
-                layer.num_local_experts, *new_shape_w2
+                num_physical_experts, *new_shape_w2
             )
         if _is_npu:
             # The kernels set the dispatcher output dtype themselves -- they are
@@ -910,16 +926,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return
 
         expected_shape = None
+        num_physical_experts = int(layer.w13_weight.shape[0])
         if weight_name.endswith(".experts.w13_weight"):
             w13_rows = (
                 2 * layer.intermediate_size_per_partition
                 if layer.moe_runner_config.is_gated
                 else layer.intermediate_size_per_partition
             )
-            expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
+            expected_shape = (num_physical_experts, w13_rows, layer.hidden_size)
         elif weight_name.endswith(".experts.w2_weight"):
             expected_shape = (
-                layer.num_local_experts,
+                num_physical_experts,
                 layer.hidden_size,
                 layer.intermediate_size_per_partition,
             )
@@ -945,10 +962,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
-                if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                if (
+                    moe_runner_backend.is_flashinfer_trtllm_routed()
+                    or (
+                        getattr(self, "_kt_compact_expert_rows", False)
+                        and moe_runner_backend.is_flashinfer_trtllm()
+                    )
+                )
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
         elif self.use_flashinfer_cutlass:
@@ -966,6 +990,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.ASCEND
         else:
             backend = MoeRunnerBackend.TRITON
+        if getattr(self, "_kt_compact_expert_rows", False) and backend.is_triton_kernels():
+            raise ValueError(
+                "KTransformers compact BF16 expert rows are incompatible with "
+                "triton_kernel ragged routing; use --moe-runner-backend triton."
+            )
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
@@ -1080,11 +1109,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 FlashInferTrtllmBf16MoeQuantInfo,
             )
 
+            global_num_experts, local_expert_offset, _ = self._runtime_expert_geometry(
+                layer
+            )
             quant_info = FlashInferTrtllmBf16MoeQuantInfo(
                 gemm1_weights=layer.w13_weight,
                 gemm2_weights=layer.w2_weight,
-                global_num_experts=layer.num_experts,
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                global_num_experts=global_num_experts,
+                local_expert_offset=local_expert_offset,
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

@@ -90,6 +90,85 @@ _ROUTED_EXPERT_KEY_RE = re.compile(
     r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
 )
 
+# Conservative Kimi-K3 checkpoint-name matcher used by KT's
+# pre-materialization filter. Match only known main-language prefixes; a loose
+# ``.layers.<id>`` search would also match MTP, vision, encoder, or a second
+# backbone that happens to reuse the same numeric layer id.
+_ROUTED_EXPERT_LAYER_RE = re.compile(
+    r"^(?:model\.layers|language_model\.layers|language_model\.model\.layers|"
+    r"model\.language_model\.layers|layers)\.(\d+)\."
+)
+_ROUTED_EXPERT_INSTANCE_RE = re.compile(r"\.experts\.\d+\.")
+_KT_PREMATERIALIZE_SAFE_ARCHS = frozenset({"KimiK3ForConditionalGeneration"})
+
+
+def routed_expert_layer_index(name: str) -> Optional[int]:
+    """Return the layer index for a per-expert checkpoint tensor.
+
+    This accepts raw HF layouts such as ``block_sparse_moe.experts.7.w1`` as
+    well as ``mlp.experts.7.gate_proj`` and ``ffn.experts.7.w1``. It returns
+    ``None`` for shared experts, router tensors, dense layers, and fused
+    all-expert tensors whose ownership cannot be proven from the name alone.
+    """
+
+    layer_match = _ROUTED_EXPERT_LAYER_RE.search(name)
+    if layer_match is None:
+        return None
+    if _ROUTED_EXPERT_INSTANCE_RE.search(name, layer_match.end() - 1) is None:
+        return None
+    return int(layer_match.group(1))
+
+
+def should_materialize_routed_expert_tensor(
+    name: str, skip_layer_ids: frozenset[int]
+) -> bool:
+    """Whether a checkpoint tensor should be materialized by the loader.
+
+    Only routed-expert tensors belonging to an explicitly supplied layer are
+    filtered. An empty set therefore preserves the ordinary SGLang behavior.
+    """
+
+    if not skip_layer_ids:
+        return True
+    layer_idx = routed_expert_layer_index(name)
+    return layer_idx is None or layer_idx not in skip_layer_ids
+
+
+def collect_kt_cpu_only_routed_expert_layers(
+    model, model_config=None
+) -> frozenset[int]:
+    """Collect instantiated KT layers with zero resident GPU experts.
+
+    Inspecting the constructed model makes this follow the actual per-layer KT
+    placement mask. GPU-pinned leading layers have no KT wrapper, while layers
+    with one or more resident experts are intentionally excluded. The
+    optimization is intentionally enabled only for model loaders whose missing
+    CPU-owned expert keys have been validated; other models keep the ordinary
+    iterator contract until they opt into an explicit KT ownership contract.
+    """
+
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = set(getattr(hf_config, "architectures", None) or ())
+    if not architectures.intersection(_KT_PREMATERIALIZE_SAFE_ARCHS):
+        return frozenset()
+
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return frozenset()
+
+    layer_ids = set()
+    for module in modules():
+        quant_method = getattr(module, "quant_method", None)
+        if getattr(quant_method, "_quant_wrapper_id", None) != "kt_ep":
+            continue
+        if getattr(quant_method, "num_gpu_experts", None) != 0:
+            continue
+        kt_config = getattr(quant_method, "kt_config", None)
+        layer_idx = getattr(kt_config, "layer_idx", None)
+        if isinstance(layer_idx, int) and not isinstance(layer_idx, bool):
+            layer_ids.add(layer_idx)
+    return frozenset(layer_ids)
+
 
 def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
     """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
@@ -1186,6 +1265,7 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    tensor_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1208,10 +1288,14 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
+                    if tensor_filter is not None and not tensor_filter(name):
+                        continue
                     yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if tensor_filter is not None and not tensor_filter(name):
+                        continue
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
@@ -1221,6 +1305,7 @@ def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
     enable_gds: bool = True,
     drop_cache_after_load: bool = False,
+    tensor_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1266,6 +1351,8 @@ def fastsafetensors_weights_iterator(
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
+                    if tensor_filter is not None and not tensor_filter(k):
+                        continue
                     t = fb.get_tensor(k)
                     yield k, t
             finally:
@@ -1282,6 +1369,7 @@ def multi_thread_safetensors_weights_iterator(
     max_workers: int,
     disable_mmap: bool = False,
     drop_cache_after_load: bool = False,
+    tensor_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1292,9 +1380,19 @@ def multi_thread_safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+                if tensor_filter is not None:
+                    result = {
+                        key: tensor
+                        for key, tensor in result.items()
+                        if tensor_filter(key)
+                    }
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    key: f.get_tensor(key)
+                    for key in f.keys()
+                    if tensor_filter is None or tensor_filter(key)
+                }
 
         return st_file, result
 
@@ -1328,6 +1426,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    tensor_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1347,9 +1446,19 @@ def buffered_multi_thread_safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+                if tensor_filter is not None:
+                    result = {
+                        key: tensor
+                        for key, tensor in result.items()
+                        if tensor_filter(key)
+                    }
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    key: f.get_tensor(key)
+                    for key in f.keys()
+                    if tensor_filter is None or tensor_filter(key)
+                }
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

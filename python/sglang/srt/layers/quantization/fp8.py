@@ -1159,6 +1159,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    # The logical-to-compact row remap is handled by KTEPWrapperMethod.
+    supports_kt_compact_expert_rows = True
+
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
@@ -1183,6 +1187,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 or get_platform().is_sm90
                 or get_platform().is_sm120
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
+
+    def _runtime_expert_geometry(self, layer: Module) -> tuple[int, int, int]:
+        """Return global count, local offset, and physical local row count."""
+
+        if getattr(self, "_kt_compact_expert_rows", False):
+            return layer.num_experts, 0, int(layer.w13_weight.shape[0])
+        return (
+            layer.num_experts,
+            layer.moe_ep_rank * layer.num_local_experts,
+            layer.num_local_experts,
+        )
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled(
@@ -2171,15 +2186,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Re-initialize w13_scale because we directly quantize
             # merged w13 weights and generate a single scaling factor.
+            num_physical_experts = int(layer.w13_weight.shape[0])
             layer.w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
-                    layer.num_local_experts,
+                    num_physical_experts,
                     dtype=torch.float32,
                     device=w13_weight.device,
                 ),
                 requires_grad=False,
             )
-            for expert in range(layer.num_local_experts):
+            for expert in range(num_physical_experts):
                 w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
                     scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
                 )
@@ -2257,7 +2273,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
             # A single shard already carries one scale per expert; nothing to fuse.
             if w13_num_shards > 1:
-                for expert_id in range(layer.num_local_experts):
+                for expert_id in range(layer.w13_weight.shape[0]):
                     start = 0
                     for shard_id in range(w13_num_shards):
                         dq_weight = per_tensor_dequantize(
@@ -2309,7 +2325,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
         """Materialize optional TRT-LLM SwiGLU parameters once per expert."""
-        num_experts = int(layer.num_local_experts)
+        num_experts = int(layer.w13_weight.shape[0])
         device = layer.w13_weight.device
         clamp_limit = (
             self.moe_runner_config.gemm1_clamp_limit
@@ -2427,7 +2443,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w13_num_shards = 2 if layer.moe_runner_config.is_gated else 1
         shard_size = layer.intermediate_size_per_partition
         max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-        for expert_id in range(layer.num_local_experts):
+        num_physical_experts = int(layer.w13_weight.shape[0])
+        for expert_id in range(num_physical_experts):
             start = 0
             max_w13_scale_fp8 = max_w13_scales[expert_id]
             for shard_id in range(w13_num_shards):
@@ -2444,7 +2461,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # special hack to asm_moe, which takes (weight_scale1 * weight_scale) as post GEMM scaling
         # optimal design - shall apply per-column weight_scale1 before GEMM, and weight_scale post
-        for expert_id in range(layer.num_local_experts):
+        for expert_id in range(num_physical_experts):
             layer.w13_weight_scale1[expert_id] *= max_w13_scales[expert_id]
             layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
 
@@ -2498,6 +2515,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return
 
         moe_runner_backend = get_moe_runner_backend()
+
+        if getattr(self, "_kt_compact_expert_rows", False):
+            if moe_runner_backend.is_hpc_ops() or moe_runner_backend.is_triton_kernels():
+                raise ValueError(
+                    "KTransformers compact FP8 expert rows require a runner that "
+                    "consumes remapped resident-row ids; hpc_ops and triton_kernel "
+                    "use incompatible global/ragged expert metadata."
+                )
+            if moe_runner_backend.is_flashinfer_trtllm():
+                # KTEPWrapper materializes explicit top-k ids before masking and
+                # remapping them, so compact rows must use the routed carrier.
+                # Both TRT-LLM variants consume the same aligned weight layout.
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+            if moe_runner_backend.is_flashinfer_megamoe():
+                raise ValueError(
+                    "KTransformers compact FP8 expert rows are incompatible with "
+                    "flashinfer_megamoe because MegaMOE builds a global expert "
+                    "fleet while KTransformers stores only the resident rows. Use "
+                    "--moe-runner-backend triton or deep_gemm."
+                )
 
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
@@ -2817,9 +2854,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # router logits directly (no separate apply_with_router_logits needed).
             # FlashInfer TRT-LLM routed backend consumes SGLang-computed
             # top-k ids/weights (packed into int32) instead of router logits.
-            global_num_experts = int(getattr(layer, "num_experts"))
-            num_local_experts = int(getattr(layer, "num_local_experts"))
-            moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
+            global_num_experts, local_expert_offset, num_local_experts = (
+                self._runtime_expert_geometry(layer)
+            )
 
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 get_activation_type,
@@ -2834,7 +2871,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 global_num_experts=global_num_experts,
-                local_expert_offset=moe_ep_rank * num_local_experts,
+                local_expert_offset=local_expert_offset,
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
                 routing_method_type=int(

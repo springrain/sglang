@@ -1081,6 +1081,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         quant_config: The ModelOpt quantization config.
     """
 
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    # KTEPWrapperMethod remaps logical expert ids into the compact row space.
+    supports_kt_compact_expert_rows = True
+
     def __init__(self, quant_config: ModelOptFp8Config):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
@@ -1095,6 +1099,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.num_experts = num_experts
+        if not 0 <= self.num_experts <= layer.num_local_experts:
+            raise ValueError(
+                "ModelOpt FP8 expert row count must be between zero and the "
+                f"layer's local expert count, got {self.num_experts} and "
+                f"{layer.num_local_experts}."
+            )
 
         # Use FP8 dtype if checkpoint is serialized, otherwise use the default dtype
         weight_dtype = (
@@ -1176,6 +1188,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
 
+        # A CPU-only KTransformers layer has no GPU expert image to requantize
+        # or align. The wrapper also skips this hook, but keeping the method
+        # independently safe avoids empty reductions if it is called directly.
+        if layer.w13_weight.shape[0] == 0:
+            return
+
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
@@ -1234,8 +1252,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_input_scale.max(), requires_grad=False
             )
 
-        # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        # Align FP8 weights to FlashInfer's logits-routed per-tensor layout only
+        # for the ordinary full expert image. KTransformers materializes and
+        # remaps top-k ids before the resident GPU call; the per-tensor TRT-LLM
+        # API has no explicit-topk entry point, so compact rows intentionally
+        # retain the canonical layout consumed by the Triton fallback runner.
+        if get_moe_runner_backend().is_flashinfer_trtllm() and not getattr(
+            self, "_kt_compact_expert_rows", False
+        ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp8_moe_weights_for_flashinfer_trtllm,
             )
@@ -1322,6 +1346,17 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         else:
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
+    def _runtime_expert_geometry(self, layer: torch.nn.Module) -> tuple[int, int, int]:
+        """Return global count, local offset, and physical local row count."""
+
+        if getattr(self, "_kt_compact_expert_rows", False):
+            return layer.num_experts, 0, self.num_experts
+        return (
+            layer.num_experts,
+            layer.moe_ep_rank * layer.num_local_experts,
+            layer.num_local_experts,
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1330,6 +1365,15 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        if getattr(
+            self, "_kt_compact_expert_rows", False
+        ) and TopKOutputChecker.format_is_bypassed(topk_output):
+            raise RuntimeError(
+                "Compact KTransformers ModelOpt FP8 experts require explicit "
+                "top-k ids. KTEPWrapperMethod must materialize the bypassed "
+                "routing output before invoking the GPU method."
+            )
 
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
 
@@ -1354,12 +1398,16 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 layer, "routing_method_type", RoutingMethodType.Llama4
             )
 
+            global_num_experts, local_expert_offset, local_num_experts = (
+                self._runtime_expert_geometry(layer)
+            )
+
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
-                global_num_experts=layer.num_experts,
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                local_num_experts=layer.num_local_experts,
+                global_num_experts=global_num_experts,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=local_num_experts,
                 intermediate_size=layer.w2_weight.shape[2],
                 routing_method_type=routing_method_type,
                 block_quant=False,
@@ -2302,6 +2350,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         quant_config: NVFP4 Quant Config
     """
 
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    # KTEPWrapperMethod remaps logical expert ids into the compact row space.
+    supports_kt_compact_expert_rows = True
+
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
@@ -2375,6 +2427,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _runtime_expert_geometry(self, layer: torch.nn.Module) -> tuple[int, int, int]:
+        """Return global count, local offset, and physical local row count."""
+
+        if getattr(self, "_kt_compact_expert_rows", False):
+            return layer.num_experts, 0, self.num_experts
+        return (
+            layer.num_experts,
+            layer.moe_ep_rank * layer.num_local_experts,
+            layer.num_local_experts,
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2385,6 +2448,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         # TODO(ch-wan): check if this is needed
+        self.num_experts = num_experts
+        if not 0 <= self.num_experts <= layer.num_local_experts:
+            raise ValueError(
+                "ModelOpt NVFP4 expert row count must be between zero and the "
+                f"layer's local expert count, got {self.num_experts} and "
+                f"{layer.num_local_experts}."
+            )
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
@@ -2399,7 +2469,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w13_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                self.num_experts,
                 num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
@@ -2414,7 +2484,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 2
         w2_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                self.num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
@@ -2428,7 +2498,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                self.num_experts,
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -2443,7 +2513,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
         if (
-            self.enable_flashinfer_trtllm_moe
+            self.num_experts == 0
+            or self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
         ):
             layer.w13_blockscale_swizzled = None
@@ -2454,7 +2525,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                self.num_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -2466,7 +2537,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
         if (
-            self.enable_flashinfer_trtllm_moe
+            self.num_experts == 0
+            or self.enable_flashinfer_trtllm_moe
             or get_moe_runner_backend().is_flashinfer_megamoe()
         ):
             layer.w2_blockscale_swizzled = None
@@ -2482,9 +2554,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         w13_weight_scale_shape = (
-            (layer.num_local_experts, 2)
+            (self.num_experts, 2)
             if layer.moe_runner_config.is_gated
-            else (layer.num_local_experts,)
+            else (self.num_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
@@ -2493,7 +2565,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(self.num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -2523,24 +2595,37 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online installs per-token activation scales after loading;
         # per-tensor paths default to 1.0 here.
         input_scale_fill = 1.0 if not is_nvfp4_online else None
+        input_scale_num_experts = (
+            self.num_experts
+            if getattr(self, "_kt_compact_expert_rows", False)
+            else layer.num_experts
+        )
         w13_input_scale = _make_per_tensor_scale_parameter(
-            (layer.num_experts, num_shards),
+            (input_scale_num_experts, num_shards),
             weight_loader=weight_loader,
             fill_value=input_scale_fill,
         )
-        w13_input_scale._sglang_require_global_experts = True
+        w13_input_scale._sglang_require_global_experts = not getattr(
+            self, "_kt_compact_expert_rows", False
+        )
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = _make_per_tensor_scale_parameter(
-            (layer.num_experts,),
+            (input_scale_num_experts,),
             weight_loader=weight_loader,
             fill_value=input_scale_fill,
         )
-        w2_input_scale._sglang_require_global_experts = True
+        w2_input_scale._sglang_require_global_experts = not getattr(
+            self, "_kt_compact_expert_rows", False
+        )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
+        num_physical_experts = layer.w13_weight.shape[0]
+        if num_physical_experts == 0:
+            return
+
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
@@ -2600,7 +2685,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = _input_scale_to_local_experts(
                 layer.w2_input_scale,
-                layer.num_local_experts,
+                num_physical_experts,
                 layer.num_experts,
                 layer.moe_ep_rank,
             )
@@ -2614,6 +2699,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale
 
             def _slice_scale(w):
+                if w.shape == (num_physical_experts,):
+                    return w.contiguous()
                 assert w.shape == (layer.num_experts,)
                 assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
                 return w[
@@ -3021,6 +3108,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer, "routing_method_type", RoutingMethodType.Default
             )
 
+            global_num_experts, local_expert_offset, local_num_experts = (
+                self._runtime_expert_geometry(layer)
+            )
+
             gemm1_clamp = getattr(layer, "gemm1_clamp_limit", None)
             gemm1_alpha = getattr(layer, "gemm1_alpha", None)
             gemm1_beta = getattr(layer, "gemm1_beta", None)
@@ -3033,9 +3124,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 g1_alphas=layer.g1_alphas.data,
                 g2_alphas=layer.g2_alphas.data,
                 w13_input_scale_quant=layer.w13_input_scale_quant,
-                global_num_experts=layer.num_experts,
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                local_num_experts=layer.num_local_experts,
+                global_num_experts=global_num_experts,
+                local_expert_offset=local_expert_offset,
+                local_num_experts=local_num_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
                 use_per_token_activation=self.quant_config.use_per_token_activation,

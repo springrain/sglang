@@ -104,6 +104,10 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
 
     layer.weight_schemas = {}
     layer.input_schemas = {}
+    # KTransformers can keep only the resident GPU expert rows.  The weight
+    # tensor is the source of truth for the physical Humming image; the layer's
+    # logical/local expert count intentionally remains unchanged for routing.
+    num_weight_experts = int(layer.w13_weight.shape[0])
 
     for sublayer_name in shape_config:
         # Step 1: convert weight to humming standard format
@@ -123,7 +127,7 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             tensors=tensors,
             shape_n_stacks=shape_n_stacks,
             shape_k_stacks=shape_k_stacks,
-            num_experts=layer.num_local_experts,
+            num_experts=num_weight_experts,
             param_dtype=layer.params_dtype,
         )
 
@@ -153,7 +157,7 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             input_schema=sub_input_schema,
             weight_schema=weight_schema_new,
             has_bias=layer.with_bias,
-            num_experts=layer.num_local_experts,
+            num_experts=num_weight_experts,
             torch_dtype=layer.params_dtype,
             sublayer_name=sublayer_name,
         )

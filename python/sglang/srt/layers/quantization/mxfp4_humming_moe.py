@@ -26,6 +26,8 @@ class Mxfp4HummingMoEMethod:
     experts in the format the Humming kernel expects.
     """
 
+    supports_kt_compact_expert_rows = True
+
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix

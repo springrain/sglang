@@ -49,10 +49,17 @@ logger = logging.getLogger(__name__)
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    supports_kt_compact_expert_rows = True
+
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        moe_runner_backend = get_moe_runner_backend()
+        self.use_flashinfer_trtllm = (
+            moe_runner_backend.is_flashinfer_trtllm()
+            or moe_runner_backend.is_flashinfer_trtllm_routed()
+        )
 
         per_tensor = (
             self.weight_quant.strategy == QuantizationStrategy.TENSOR
@@ -238,6 +245,12 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
+        num_physical_experts = layer.w13_weight.size(0)
+        if num_physical_experts == 0:
+            # The KTEP wrapper bypasses GPU execution for this layer. Avoid
+            # empty max reductions and backend transforms during direct use.
+            return
+
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:
@@ -294,7 +307,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             assert layer.w13_weight_scale is not None
             shard_size = layer.intermediate_size_per_partition
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
-            for expert_id in range(layer.num_local_experts):
+            for expert_id in range(num_physical_experts):
                 start = 0
                 for shard_id in range(2):
                     dq_weight = per_tensor_dequantize(
@@ -355,6 +368,15 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
+            getattr(self, "_kt_compact_expert_rows", False)
+            and moe_runner_backend.is_flashinfer_trtllm()
+        ):
+            # KTEP supplies compact, already-remapped top-k ids. The logits-
+            # based TRT-LLM path would route in the original logical id space,
+            # so select the equivalent routed kernel explicitly.
+            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+
+        if (
             moe_runner_backend.is_aiter()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
@@ -403,12 +425,18 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     moe_runner_config.activation,
                     is_gated=moe_runner_config.is_gated,
                 )
+                if getattr(self, "_kt_compact_expert_rows", False):
+                    local_expert_offset = 0
+                    local_num_experts = layer.w13_weight.size(0)
+                else:
+                    local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+                    local_num_experts = layer.num_local_experts
                 quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
                     global_num_experts=layer.num_experts,
-                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                    local_num_experts=layer.num_local_experts,
+                    local_expert_offset=local_expert_offset,
+                    local_num_experts=local_num_experts,
                     intermediate_size=layer.w2_weight.shape[2],
                     routing_method_type=layer.routing_method_type,
                     block_quant=self.block_quant,

@@ -367,6 +367,10 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    # KTransformers stores only the GPU-resident expert rows in this method.
+    # The logical-to-compact row remap is handled by KTEPWrapperMethod.
+    supports_kt_compact_expert_rows = True
+
     def __init__(
         self,
         prefix: str,
@@ -423,6 +427,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    def _runtime_expert_geometry(self, layer: torch.nn.Module) -> tuple[int, int, int]:
+        """Return global count, local offset, and local count for the GPU runner.
+
+        Normal SGLang MoE runners consume global expert ids and EP-local weight
+        rows. KTransformers masks CPU experts and remaps resident GPU experts
+        into a compact ``[0, num_gpu_experts)`` id space before invoking this
+        method, so its runner must use that compact geometry as well.
+        """
+
+        if getattr(self, "_kt_compact_expert_rows", False):
+            # Keep the model's global expert count so top-k/workspace sizing
+            # remains valid (for example K3 top_k=16 with one resident expert).
+            # Remapped resident ids occupy the virtual local range [0, N).
+            return layer.num_experts, 0, self.num_experts
+        return (
+            layer.num_experts,
+            layer.moe_ep_rank * layer.num_local_experts,
+            layer.num_local_experts,
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -434,6 +458,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         self.num_experts = num_experts
+        if not 0 <= self.num_experts <= layer.num_local_experts:
+            raise ValueError(
+                "MXFP4 expert row count must be between zero and the layer's "
+                f"local expert count, got {self.num_experts} and "
+                f"{layer.num_local_experts}."
+            )
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
@@ -538,7 +568,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
-                layer.num_local_experts,
+                self.num_experts,
                 2 * intermediate_size_per_partition_after_pad,
                 hidden_size // 2,
                 dtype=weight_dtype,
@@ -551,7 +581,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_weight_scale = torch.nn.Parameter(
             torch.full(
                 (
-                    layer.num_local_experts,
+                    self.num_experts,
                     2 * intermediate_size_per_partition_after_pad,
                     hidden_size // mxfp4_block,
                 ),
@@ -568,7 +598,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if create_bias:
             w13_weight_bias = torch.nn.Parameter(
                 torch.zeros(
-                    layer.num_local_experts,
+                    self.num_experts,
                     2 * intermediate_size_per_partition_after_pad,
                     dtype=torch.bfloat16,
                 ),
@@ -580,7 +610,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.zeros(
-                layer.num_local_experts,
+                self.num_experts,
                 hidden_size,
                 intermediate_size_per_partition_after_pad // 2,
                 dtype=weight_dtype,
@@ -593,7 +623,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_weight_scale = torch.nn.Parameter(
             torch.full(
                 (
-                    layer.num_local_experts,
+                    self.num_experts,
                     hidden_size,
                     intermediate_size_per_partition_after_pad // mxfp4_block,
                 ),
@@ -608,13 +638,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if create_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
+                torch.zeros(self.num_experts, hidden_size, dtype=torch.bfloat16),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        # KTransformers may place every routed expert on CPU. There is then no
+        # GPU image to shuffle/repack, and several backends assume row 0 exists.
+        if self.num_experts == 0:
+            layer._mxfp4_backend = "kt_cpu_only"
+            return
+
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -702,9 +738,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._process_weights_for_sm120_cutlass(layer)
             return
         if self.use_flashinfer:
-            # Per-expert buffers are local (create_weights uses num_local_experts);
-            # the global self.num_experts here breaks EP>1. Mirrors the SM90 path.
-            E = layer.num_local_experts
+            # Match the physical row count allocated by create_weights. Under
+            # KTransformers this is the resident GPU-expert count.
+            E = self.num_experts
             _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
             _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
             layer.gemm1_alpha = Parameter(
@@ -1133,10 +1169,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )  # hidden (unpadded, *2 because packed 4-bit)
         N_pad = self._padded_intermediate
         K_pad = self._padded_hidden
-        # Use the local expert count (matches the existing buffer allocation in
-        # create_weights) so the SM90 cutlass path remains correct under
-        # Expert Parallelism. `self.num_experts` is the *global* count.
-        E = layer.num_local_experts
+        # Match the physical row count allocated by create_weights. For normal
+        # EP this equals layer.num_local_experts; KTransformers may use less.
+        E = self.num_experts
         device = layer.w13_weight.device
         bias_dtype = layer.w13_weight_bias.dtype
 
@@ -1326,7 +1361,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         K_un = layer.w13_weight.shape[2] * 2
         N_pad = self._padded_intermediate
         K_pad = self._padded_hidden
-        E = layer.num_local_experts
+        E = self.num_experts
         device = layer.w13_weight.device
 
         def _stack_up_gate_w13(unpadded, last_pad, last_un):
@@ -1546,6 +1581,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routing_bias = correction_bias.to(torch.bfloat16)
                 layer._situ_routing_bias_bf16 = routing_bias
 
+        global_num_experts, local_expert_offset, local_num_experts = (
+            self._runtime_expert_geometry(layer)
+        )
         quant_info = FlashInferTrtllmGenMxfp4MoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -1556,9 +1594,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             gemm1_alpha=layer.gemm1_alpha,
             gemm1_beta=layer.gemm1_beta,
             gemm1_clamp_limit=layer.gemm1_clamp_limit,
-            global_num_experts=layer.num_experts,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=layer.num_local_experts,
+            global_num_experts=global_num_experts,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
@@ -1787,6 +1825,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
+    supports_kt_compact_expert_rows = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,

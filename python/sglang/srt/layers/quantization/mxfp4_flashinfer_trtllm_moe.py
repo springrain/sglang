@@ -49,6 +49,7 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 class Mxfp4FlashinferTrtllmMoEMethod:
     fuse_routed_scaling_factor_in_topk = True
+    supports_kt_compact_expert_rows = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -60,6 +61,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
 
+    def _physical_expert_count(self, layer: Module) -> int:
+        weight = getattr(layer, "w13_weight", None)
+        if weight is not None:
+            return int(weight.shape[0])
+        return int(getattr(self, "num_experts", layer.num_local_experts))
+
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
         # Applies flashinfer trtllm directly instead of going through a
@@ -68,9 +75,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self.runner = None
 
         swiglu_limit = moe_runner_config.swiglu_limit
+        num_local_experts = self._physical_expert_count(layer)
         self._gemm1_clamp_limit_tensor = (
             torch.full(
-                (layer.num_local_experts,),
+                (num_local_experts,),
                 swiglu_limit,
                 dtype=torch.float32,
                 device=layer.w13_weight.device,
@@ -90,6 +98,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        self.num_experts = num_experts
         fp4_block_k = 32
 
         w13_weight = Parameter(
@@ -248,6 +257,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
     def _register_static_scale_ones(self, layer: Module) -> None:
         device = layer.w13_weight.device
+        num_local_experts = self._physical_expert_count(layer)
         for name in (
             "output1_scale_scalar",
             "output1_scale_gate_scalar",
@@ -255,9 +265,19 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         ):
             layer.register_buffer(
                 name,
-                torch.ones(layer.num_local_experts, device=device, dtype=torch.float32),
+                torch.ones(num_local_experts, device=device, dtype=torch.float32),
                 persistent=False,
             )
+
+    def _runtime_expert_geometry(self, layer: Module) -> tuple[int, int, int]:
+        num_local_experts = self._physical_expert_count(layer)
+        if getattr(self, "_kt_compact_expert_rows", False):
+            return layer.num_experts, 0, num_local_experts
+        return (
+            layer.num_experts,
+            layer.moe_ep_rank * layer.num_local_experts,
+            layer.num_local_experts,
+        )
 
     def apply(
         self,
@@ -278,7 +298,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         intermediate_size = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
         hidden_size = w13.shape[2] * 2 if w13.dtype == torch.uint8 else w13.shape[2]
 
-        num_local_experts = layer.num_local_experts
+        global_num_experts, local_expert_offset, num_local_experts = (
+            self._runtime_expert_geometry(layer)
+        )
         if w13_scale.dim() == 2:
             w13_scale = w13_scale.reshape(num_local_experts, 2 * intermediate_size, -1)
         if w2_scale.dim() == 2:
@@ -358,12 +380,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_scalar=layer.output1_scale_scalar,
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
-            num_experts=layer.num_experts,
+            num_experts=global_num_experts,
             top_k=topk_ids.shape[1],
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            local_expert_offset=local_expert_offset,
             local_num_experts=num_local_experts,
             routed_scaling_factor=1.0,
             routing_method_type=int(RoutingMethodType.TopK),
