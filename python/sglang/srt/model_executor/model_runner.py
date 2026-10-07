@@ -18,6 +18,8 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
@@ -378,6 +380,9 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        self._kt_decode_events = []
+        self._kt_layer_trace_handles = []
+        self._kt_layer_events = []
         self._pending_elastic_scale_update = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -692,6 +697,7 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        self._kt_install_layer_trace_hooks()
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1603,6 +1609,414 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         return kwargs
 
+    def _kt_install_layer_trace_hooks(self) -> None:
+        """Install debug-only hooks around every transformer layer."""
+        if not logger.isEnabledFor(logging.DEBUG) or self._kt_layer_trace_handles:
+            return
+        pattern = re.compile(r"(?:^|\.)layers\.(\d+)$")
+        layers = []
+        for name, module in self.model.named_modules():
+            match = pattern.search(name)
+            if match is not None:
+                layers.append((int(match.group(1)), name, module))
+        device_type = getattr(self.device, "type", str(self.device).split(":", 1)[0])
+        trace_cuda = device_type == "cuda" and torch.cuda.is_available()
+
+        for layer_idx, name, module in sorted(layers, key=lambda item: (item[0], item[1])):
+            active = []
+
+            def pre_hook(_module, _args, _kwargs, *, _idx=layer_idx, _name=name, _active=active):
+                capture = False
+                start_event = None
+                stream_id = "cpu"
+                if trace_cuda:
+                    try:
+                        stream = torch.cuda.current_stream()
+                        stream_id = getattr(stream, "cuda_stream", "unknown")
+                        capture = torch.cuda.is_current_stream_capturing()
+                        if not capture:
+                            start_event = torch.cuda.Event(enable_timing=True)
+                            start_event.record(stream)
+                    except Exception:
+                        start_event = None
+                started_ns = time.perf_counter_ns()
+                profile_previous = None
+                profile_callback = None
+                # A first-use stall may occur after layer 0 (the current trace
+                # stalls in layer 2). Profile both blocks for diagnostics.
+                if _idx in (0, 2) and not capture:
+                    profile_previous = sys.getprofile()
+                    profile_stack = {}
+                    profile_logging = False
+
+                    def profile_callback(frame, event, _arg):
+                        nonlocal profile_logging
+                        if profile_logging:
+                            return
+                        frame_id = id(frame)
+                        if event == "call":
+                            profile_stack[frame_id] = (
+                                time.perf_counter_ns(),
+                                frame.f_code,
+                            )
+                        elif event == "return":
+                            state = profile_stack.pop(frame_id, None)
+                            if state is None:
+                                return
+                            elapsed_ns = time.perf_counter_ns() - state[0]
+                            if elapsed_ns < 100_000_000:
+                                return
+                            profile_logging = True
+                            try:
+                                code = state[1]
+                                logger.debug(
+                                    "[kt-python] mono_ms=%.3f phase=slow_call "
+                                    "pass=%s tp_rank=%s layer=%d func=%s file=%s:%s "
+                                    "elapsed_ms=%.3f",
+                                    time.perf_counter_ns() / 1e6,
+                                    self.forward_pass_id,
+                                    getattr(self.ps, "tp_rank", -1),
+                                    _idx,
+                                    code.co_name,
+                                    code.co_filename,
+                                    code.co_firstlineno,
+                                    elapsed_ns / 1e6,
+                                )
+                            finally:
+                                profile_logging = False
+
+                    sys.setprofile(profile_callback)
+                _active.append(
+                    (
+                        started_ns,
+                        start_event,
+                        stream_id,
+                        capture,
+                        profile_previous,
+                        profile_callback,
+                    )
+                )
+                logger.debug(
+                    "[kt-layer] mono_ms=%.3f phase=start pass=%s tp_rank=%s "
+                    "layer=%d name=%s stream=%s capture=%s",
+                    started_ns / 1e6,
+                    self.forward_pass_id,
+                    getattr(self.ps, "tp_rank", -1),
+                    _idx,
+                    _name,
+                    stream_id,
+                    capture,
+                )
+
+            def post_hook(
+                _module,
+                _args,
+                _kwargs,
+                _output,
+                *,
+                _idx=layer_idx,
+                _name=name,
+                _active=active,
+            ):
+                state = _active.pop() if _active else None
+                if state is None:
+                    return
+                (
+                    started_ns,
+                    start_event,
+                    stream_id,
+                    capture,
+                    profile_previous,
+                    profile_callback,
+                ) = state
+                if profile_callback is not None:
+                    sys.setprofile(profile_previous)
+                end_event = None
+                if start_event is not None:
+                    try:
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        end_event.record(torch.cuda.current_stream())
+                    except Exception:
+                        end_event = None
+                if end_event is not None:
+                    self._kt_layer_events.append(
+                        (
+                            _idx,
+                            _name,
+                            self.forward_pass_id,
+                            started_ns,
+                            start_event,
+                            end_event,
+                            stream_id,
+                        )
+                    )
+                logger.debug(
+                    "[kt-layer] mono_ms=%.3f phase=end pass=%s tp_rank=%s "
+                    "layer=%d name=%s wall_ms=%.3f cuda_pending=%s stream=%s capture=%s",
+                    time.perf_counter_ns() / 1e6,
+                    self.forward_pass_id,
+                    getattr(self.ps, "tp_rank", -1),
+                    _idx,
+                    _name,
+                    (time.perf_counter_ns() - started_ns) / 1e6,
+                    end_event is not None,
+                    stream_id,
+                    capture,
+                )
+
+            self._kt_layer_trace_handles.extend(
+                [
+                    module.register_forward_pre_hook(pre_hook, with_kwargs=True),
+                    module.register_forward_hook(post_hook, with_kwargs=True),
+                ]
+            )
+        logger.debug(
+            "[kt-layer] installed count=%d layers=%s model_type=%s tp_rank=%s",
+            len(layers),
+            [item[0] for item in layers],
+            type(self.model).__module__ + "." + type(self.model).__name__,
+            getattr(self.ps, "tp_rank", -1),
+        )
+
+        # Layer-wide hooks identify the slow transformer block, but a block can
+        # contain attention, KV-cache preparation, and MLP work. Decompose every
+        # layer's immediate children so a later request can be attributed to the
+        # exact block and child that stalled.
+        for child_layer_idx, child_layer_name, child_layer in layers:
+            for child_name, child in child_layer.named_children():
+                full_name = f"{child_layer_name}.{child_name}"
+                active = []
+
+                def child_pre_hook(
+                    _module,
+                    _args,
+                    _kwargs,
+                    *,
+                    _layer_idx=child_layer_idx,
+                    _name=full_name,
+                    _active=active,
+                ):
+                    capture = False
+                    start_event = None
+                    stream_id = "cpu"
+                    if trace_cuda:
+                        try:
+                            stream = torch.cuda.current_stream()
+                            stream_id = getattr(stream, "cuda_stream", "unknown")
+                            capture = torch.cuda.is_current_stream_capturing()
+                            if not capture:
+                                start_event = torch.cuda.Event(enable_timing=True)
+                                start_event.record(stream)
+                        except Exception:
+                            start_event = None
+                    started_ns = time.perf_counter_ns()
+                    _active.append((started_ns, start_event, stream_id, capture))
+                    logger.debug(
+                        "[kt-layer-child] mono_ms=%.3f phase=start pass=%s "
+                        "tp_rank=%s layer=%d module=%s stream=%s capture=%s",
+                        started_ns / 1e6,
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                        _layer_idx,
+                        _name,
+                        stream_id,
+                        capture,
+                    )
+
+                def child_post_hook(
+                    _module,
+                    _args,
+                    _kwargs,
+                    _output,
+                    *,
+                    _layer_idx=child_layer_idx,
+                    _name=full_name,
+                    _active=active,
+                ):
+                    state = _active.pop() if _active else None
+                    if state is None:
+                        return
+                    started_ns, start_event, stream_id, capture = state
+                    end_event = None
+                    if start_event is not None:
+                        try:
+                            end_event = torch.cuda.Event(enable_timing=True)
+                            end_event.record(torch.cuda.current_stream())
+                        except Exception:
+                            end_event = None
+                    if end_event is not None:
+                        self._kt_layer_events.append(
+                            (
+                                _layer_idx,
+                                _name,
+                                self.forward_pass_id,
+                                started_ns,
+                                start_event,
+                                end_event,
+                                stream_id,
+                            )
+                        )
+                    logger.debug(
+                        "[kt-layer-child] mono_ms=%.3f phase=end pass=%s "
+                        "tp_rank=%s layer=%d module=%s wall_ms=%.3f "
+                        "cuda_pending=%s stream=%s capture=%s",
+                        time.perf_counter_ns() / 1e6,
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                        _layer_idx,
+                        _name,
+                        (time.perf_counter_ns() - started_ns) / 1e6,
+                        end_event is not None,
+                        stream_id,
+                        capture,
+                    )
+
+                self._kt_layer_trace_handles.extend(
+                    [
+                        child.register_forward_pre_hook(
+                            child_pre_hook, with_kwargs=True
+                        ),
+                        child.register_forward_hook(child_post_hook, with_kwargs=True),
+                    ]
+                )
+            logger.debug(
+                "[kt-layer-child] installed layer=%d layer_type=%s "
+                "child_modules=%s tp_rank=%s",
+                child_layer_idx,
+                type(child_layer).__module__ + "." + type(child_layer).__name__,
+                [
+                    (name, type(module).__module__ + "." + type(module).__name__)
+                    for name, module in child_layer.named_children()
+                ],
+                getattr(self.ps, "tp_rank", -1),
+            )
+
+    def _kt_poll_layer_events(self) -> None:
+        if not self._kt_layer_events or not logger.isEnabledFor(logging.DEBUG):
+            return
+        pending = []
+        now_ns = time.perf_counter_ns()
+        for (
+            layer_idx,
+            name,
+            pass_id,
+            started_ns,
+            start_event,
+            end_event,
+            stream_id,
+        ) in self._kt_layer_events:
+            try:
+                if not end_event.query():
+                    pending.append(
+                        (
+                            layer_idx,
+                            name,
+                            pass_id,
+                            started_ns,
+                            start_event,
+                            end_event,
+                            stream_id,
+                        )
+                    )
+                    continue
+                cuda_ms = start_event.elapsed_time(end_event)
+            except Exception:
+                pending.append(
+                    (
+                        layer_idx,
+                        name,
+                        pass_id,
+                        started_ns,
+                        start_event,
+                        end_event,
+                        stream_id,
+                    )
+                )
+                continue
+            logger.debug(
+                "[kt-layer] mono_ms=%.3f phase=cuda_complete pass=%s tp_rank=%s "
+                "layer=%d name=%s cuda_ms=%.3f host_wall_ms=%.3f stream=%s",
+                now_ns / 1e6,
+                pass_id,
+                getattr(self.ps, "tp_rank", -1),
+                layer_idx,
+                name,
+                cuda_ms,
+                (now_ns - started_ns) / 1e6,
+                stream_id,
+            )
+        self._kt_layer_events = pending
+
+    def _kt_decode_event_start(self, forward_batch: ForwardBatch):
+        if self.device == "cpu" or not torch.cuda.is_available():
+            return None
+        try:
+            stream = torch.cuda.current_stream()
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+            return {
+                "pass": self.forward_pass_id,
+                "host_start_ns": time.perf_counter_ns(),
+                "start_event": start_event,
+                "end_event": None,
+                "stream": getattr(stream, "cuda_stream", "unknown"),
+                "tokens": forward_batch._forward_num_tokens(),
+            }
+        except Exception:
+            return None
+
+    def _kt_decode_event_finish(self, state) -> None:
+        try:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(torch.cuda.current_stream())
+            state["end_event"] = end_event
+            state["host_submit_ns"] = time.perf_counter_ns()
+            self._kt_decode_events.append(state)
+            logger.debug(
+                "[kt-decode] mono_ms=%.3f phase=graph_submitted pass=%d tp_rank=%s "
+                "tokens=%s stream=%s host_submit_ms=%.3f",
+                state["host_submit_ns"] / 1e6,
+                state["pass"],
+                getattr(self.ps, "tp_rank", -1),
+                state["tokens"],
+                state["stream"],
+                (state["host_submit_ns"] - state["host_start_ns"]) / 1e6,
+            )
+        except Exception:
+            return
+
+    def _kt_poll_decode_events(self) -> None:
+        if not self._kt_decode_events or not logger.isEnabledFor(logging.DEBUG):
+            return
+        pending = []
+        now_ns = time.perf_counter_ns()
+        for state in self._kt_decode_events:
+            end_event = state.get("end_event")
+            if end_event is None:
+                continue
+            try:
+                if not end_event.query():
+                    pending.append(state)
+                    continue
+                cuda_ms = state["start_event"].elapsed_time(end_event)
+            except Exception:
+                pending.append(state)
+                continue
+            logger.debug(
+                "[kt-decode] mono_ms=%.3f phase=graph_complete pass=%d tp_rank=%s "
+                "tokens=%s stream=%s cuda_ms=%.3f host_to_complete_ms=%.3f "
+                "submit_to_complete_ms=%.3f",
+                now_ns / 1e6,
+                state["pass"],
+                getattr(self.ps, "tp_rank", -1),
+                state["tokens"],
+                state["stream"],
+                cuda_ms,
+                (now_ns - state["host_start_ns"]) / 1e6,
+                (now_ns - state["host_submit_ns"]) / 1e6,
+            )
+        self._kt_decode_events = pending
+
     def forward_split_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -1633,10 +2047,43 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        forward_trace_start = time.perf_counter_ns()
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        self._kt_poll_decode_events()
+        self._kt_poll_layer_events()
+        try:
+            forward_batch._kt_debug_pass_id = self.forward_pass_id
+        except Exception:
+            pass
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                forward_mode = str(forward_batch.forward_mode)
+            except Exception:
+                forward_mode = "unknown"
+            try:
+                current_stream = getattr(torch.cuda.current_stream(), "cuda_stream", "unknown")
+            except Exception:
+                current_stream = "unknown"
+            out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            logger.debug(
+                "[kt-forward] mono_ms=%.3f phase=forward_enter pass=%d "
+                "tp_rank=%s mode=%s batch=%s tokens=%s extend=%s cuda_graph=%s "
+                "stream=%s out_cache_loc=%s pending_decode_events=%d",
+                time.perf_counter_ns() / 1e6,
+                self.forward_pass_id,
+                getattr(self.ps, "tp_rank", -1),
+                forward_mode,
+                getattr(forward_batch, "batch_size", -1),
+                forward_batch._forward_num_tokens(),
+                bool(getattr(forward_batch, "is_extend_in_batch", False)),
+                bool(forward_batch.forward_mode.is_cuda_graph()),
+                current_stream,
+                tuple(out_cache_loc.shape) if torch.is_tensor(out_cache_loc) else None,
+                len(self._kt_decode_events),
+            )
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1678,6 +2125,16 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-forward] mono_ms=%.3f phase=forward_raw_end pass=%d tp_rank=%s "
+                    "elapsed_ms=%.3f can_run_graph=%s",
+                    time.perf_counter_ns() / 1e6,
+                    self.forward_pass_id,
+                    getattr(self.ps, "tp_rank", -1),
+                    (time.perf_counter_ns() - forward_trace_start) / 1e6,
+                    output.can_run_graph,
+                )
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
@@ -1720,6 +2177,17 @@ class ModelRunner:
 
         if get_exec().moe.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-forward] mono_ms=%.3f phase=forward_exit pass=%d tp_rank=%s "
+                "elapsed_ms=%.3f can_run_graph=%s",
+                time.perf_counter_ns() / 1e6,
+                self.forward_pass_id,
+                getattr(self.ps, "tp_rank", -1),
+                (time.perf_counter_ns() - forward_trace_start) / 1e6,
+                output.can_run_graph,
+            )
 
         return output
 
@@ -1778,6 +2246,17 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        raw_trace_start = time.perf_counter_ns()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-forward] mono_ms=%.3f phase=raw_enter pass=%d tp_rank=%s "
+                "mode=%s tokens=%s",
+                time.perf_counter_ns() / 1e6,
+                self.forward_pass_id,
+                getattr(self.ps, "tp_rank", -1),
+                str(forward_batch.forward_mode),
+                forward_batch._forward_num_tokens(),
+            )
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
@@ -1804,11 +2283,36 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                if logger.isEnabledFor(logging.DEBUG):
+                    decode_event_state = self._kt_decode_event_start(forward_batch)
+                    logger.debug(
+                        "[kt-forward] phase=decode_graph_start pass=%d tp_rank=%s "
+                        "elapsed_ms=%.3f stream=%s",
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                        (time.perf_counter_ns() - raw_trace_start) / 1e6,
+                        getattr(torch.cuda.current_stream(), "cuda_stream", "unknown")
+                        if self.device != "cpu"
+                        else "cpu",
+                    )
+                else:
+                    decode_event_state = None
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                if decode_event_state is not None:
+                    self._kt_decode_event_finish(decode_event_state)
+                output = ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-forward] phase=decode_graph_end pass=%d tp_rank=%s "
+                        "elapsed_ms=%.3f",
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                        (time.perf_counter_ns() - raw_trace_start) / 1e6,
+                    )
+                return output
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -1816,7 +2320,24 @@ class ModelRunner:
             # forward all run the live batch and need this first — it sets
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-forward] mono_ms=%.3f phase=prepare_batch_start pass=%d "
+                    "tp_rank=%s",
+                    time.perf_counter_ns() / 1e6,
+                    self.forward_pass_id,
+                    getattr(self.ps, "tp_rank", -1),
+                )
             self._prepare_eager_forward_batch(forward_batch)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-forward] mono_ms=%.3f phase=prepare_batch_end pass=%d "
+                    "tp_rank=%s elapsed_ms=%.3f",
+                    time.perf_counter_ns() / 1e6,
+                    self.forward_pass_id,
+                    getattr(self.ps, "tp_rank", -1),
+                    (time.perf_counter_ns() - raw_trace_start) / 1e6,
+                )
 
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
@@ -1828,6 +2349,16 @@ class ModelRunner:
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
+                branch = "split_prefill"
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-forward] mono_ms=%.3f phase=branch_start pass=%d "
+                        "tp_rank=%s branch=%s",
+                        time.perf_counter_ns() / 1e6,
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                        branch,
+                    )
                 ret = self.forward_split_prefill(
                     forward_batch,
                     reinit_attn_backend=reinit_attn_backend,
@@ -1843,6 +2374,16 @@ class ModelRunner:
                 )
             ):
                 # Prefill cuda graph (piecewise).
+                branch = "prefill_graph"
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-forward] mono_ms=%.3f phase=branch_start pass=%d "
+                        "tp_rank=%s branch=%s",
+                        time.perf_counter_ns() / 1e6,
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                        branch,
+                    )
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
                 category = (
                     "target_verify"
@@ -1859,6 +2400,16 @@ class ModelRunner:
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
+                branch = "eager"
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-forward] mono_ms=%.3f phase=branch_start pass=%d "
+                        "tp_rank=%s branch=%s",
+                        time.perf_counter_ns() / 1e6,
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                        branch,
+                    )
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
@@ -1867,9 +2418,38 @@ class ModelRunner:
                 forward_batch.global_num_tokens_cpu is not None
                 and self.pp_group.is_last_rank
             ):
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-forward] mono_ms=%.3f phase=post_mlp_sync_start "
+                        "pass=%d tp_rank=%s",
+                        time.perf_counter_ns() / 1e6,
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                    )
                 forward_batch.post_forward_mlp_sync_batch(ret)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-forward] mono_ms=%.3f phase=post_mlp_sync_end "
+                        "pass=%d tp_rank=%s",
+                        time.perf_counter_ns() / 1e6,
+                        self.forward_pass_id,
+                        getattr(self.ps, "tp_rank", -1),
+                    )
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            output = ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-forward] mono_ms=%.3f phase=raw_exit pass=%d tp_rank=%s "
+                    "branch=%s "
+                    "elapsed_ms=%.3f can_run_graph=%s",
+                    time.perf_counter_ns() / 1e6,
+                    self.forward_pass_id,
+                    getattr(self.ps, "tp_rank", -1),
+                    branch,
+                    (time.perf_counter_ns() - raw_trace_start) / 1e6,
+                    can_run_graph,
+                )
+            return output
 
     def _preprocess_logits(
         self,

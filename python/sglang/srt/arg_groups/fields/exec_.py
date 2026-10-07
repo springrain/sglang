@@ -830,13 +830,25 @@ class ExecMoe(msgspec.Struct):
         Optional[int],
         "[ktransformers parameter] First N layers (by global layer index, 0-based) run routed experts entirely on GPU, bypassing the KT CPU path.",
     ] = None
+    kt_expert_gpu_slots: A[
+        Optional[int],
+        "[ktransformers parameter] Global persistent hot-expert cache capacity, counted in Logical Experts; startup placement is layer-major and runtime rows can migrate across MoE layers based on activation heat.",
+    ] = None
+    kt_layer_h2d_slots: A[
+        Optional[int],
+        "[ktransformers parameter] Per-layer GEC H2D admission budget, counted in Logical Experts; requires --kt-expert-gpu-slots.",
+    ] = None
+    kt_layer_h2d_batch_size: A[
+        Optional[int],
+        "[ktransformers parameter] Maximum Logical Experts per GEC H2D batch; a batch is min(available, batch_size) and never waits to be filled.",
+    ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
     ] = None
     kt_gpu_prefill_token_threshold: A[
         Optional[int],
-        "[ktransformers parameter] Token threshold for layerwise GPU prefill of CPU experts.",
+        "[ktransformers parameter] Independent token threshold for the legacy layerwise full-GPU prefill path.",
     ] = None
     record_kt_gpu_expert_distribution: A[
         bool,
@@ -844,7 +856,7 @@ class ExecMoe(msgspec.Struct):
     ] = False
     kt_enable_dynamic_expert_update: A[
         bool,
-        "[ktransformers parameter] Dynamically update GPU expert placement from runtime statistics.",
+        "[ktransformers parameter] Enable the legacy threshold-gated dynamic GPU expert update path; GEC slots are an independent mode.",
     ] = False
     kt_expert_placement_strategy: A[
         str,

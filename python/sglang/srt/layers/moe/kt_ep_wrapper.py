@@ -25,6 +25,10 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
         Force GPU-experts apply() to a zero return; routed expert output
         comes purely from the CPU side. "Plan-C" fallback for diagnosing
         whether a regression sits in the GPU MoE path or the merge math.
+
+    ``--log-level debug``
+        Emit a per-call KTEP/GEC phase trace with a shared call id, layer,
+        rank, token count, residency and phase durations.
 """
 
 import bisect
@@ -40,7 +44,8 @@ import uuid
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -55,6 +60,7 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_schedule,
 )
 from sglang.srt.utils import get_compiler_backend, is_cuda
@@ -81,6 +87,10 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _kt_debug_trace_enabled() -> bool:
+    return logger.isEnabledFor(logging.DEBUG)
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
@@ -118,12 +128,24 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+    # GEC residency planning (doc/KT-CPU-PICE-GPU.md section 5). All three are
+    # counted in Logical Experts; see sglang.srt.layers.moe.kt_gec.
+    kt_expert_gpu_slots: Optional[int] = None
+    kt_layer_h2d_slots: Optional[int] = None
+    kt_layer_h2d_batch_size: Optional[int] = None
+    # Shared model-scope coordinator.  It is populated by
+    # create_kt_config_from_server_args so every MoE layer uses one global
+    # Logical-Expert cache rather than constructing a cache per layer.
+    kt_gec_coordinator: Optional[object] = None
+    kt_num_gpu_layers: int = 0
+    kt_tp_size: int = 1
+    max_running_requests: int = 0
 
 
 def _should_pack_all_experts_on_load(config: KTConfig) -> bool:
     """Whether the native CPU image must retain GPU-resident experts too."""
 
-    if config.kt_enable_dynamic_expert_update:
+    if config.kt_enable_dynamic_expert_update or config.kt_expert_gpu_slots:
         return True
     # RAWINT4's layerwise full-GPU prefill writer currently reconstructs every
     # expert from the CPU backend. Keep resident experts in the owned CPU image
@@ -301,6 +323,18 @@ def _load_kt_expert_lora_weights(
 
 
 _SHARED_FULL_CONTEXT = None
+_SHARED_GEC_CPU_CONTEXT = None
+_DEFERRED_TEMP_CONTEXTS = []
+
+
+def _poll_deferred_temp_contexts() -> None:
+    remaining = []
+    for context, event in _DEFERRED_TEMP_CONTEXTS:
+        if event is None or event.query():
+            context.close_temporary()
+        else:
+            remaining.append((context, event))
+    _DEFERRED_TEMP_CONTEXTS[:] = remaining
 _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
@@ -370,6 +404,7 @@ class SharedFullContext:
         global_num_experts: int,
         moe_runner_config: "MoeRunnerConfig",
         defer_cpu_buffers: bool = False,
+        cpu_buffer_depth: int = 2,
     ):
         _kt_config = getattr(getattr(layer, "quant_method", None), "kt_config", None)
         self._kt_mxfp4_requested = bool(
@@ -390,6 +425,7 @@ class SharedFullContext:
         # has successfully allocated both GPU layer slots.  This keeps an OOM
         # on one rank from stranding peers inside an SHM collective.
         self._cpu_buffers_initialized = False
+        self.cpu_buffer_depth = max(2, int(cpu_buffer_depth))
         if not defer_cpu_buffers:
             self.initialize_cpu_buffers()
 
@@ -482,6 +518,16 @@ class SharedFullContext:
                        "is_fp8_channel_quant", "is_bf16_quant"):
             if hasattr(self, _attr):
                 setattr(self, f"_{_attr}", getattr(self, _attr))
+        self._is_int4_quant = not any(
+            getattr(self, name, False)
+            for name in (
+                "_is_mxfp4_quant",
+                "_is_mxfp8_quant",
+                "_is_fp8_quant",
+                "_is_fp8_channel_quant",
+                "_is_bf16_quant",
+            )
+        )
 
         # Move all parameters to target device
         for param in self.gpu_layer.parameters():
@@ -820,6 +866,19 @@ class SharedFullContext:
                 pass
         self.shm_handles = {}
 
+    def close_temporary(self) -> None:
+        """Release host staging resources owned by a compact temporary context."""
+        self._cleanup_cpu_buffers_after_failure()
+
+    def defer_close_temporary(self, stream=None) -> None:
+        """Release host staging after queued H2D/GEMM work completes."""
+        if not torch.cuda.is_available():
+            self.close_temporary()
+            return
+        event = torch.cuda.Event(enable_timing=False)
+        event.record(stream or torch.cuda.current_stream())
+        _DEFERRED_TEMP_CONTEXTS.append((self, event))
+
     def _commit_cpu_buffer_phase(
         self, local_error: Optional[Exception], phase: str
     ) -> None:
@@ -837,8 +896,8 @@ class SharedFullContext:
     def _create_cpu_buffers(self):
         """Create CPU buffers in POSIX shared memory and register as pinned memory.
 
-        Uses double buffering (2 experts) to reduce memory usage while maintaining
-        pipeline efficiency: write(e+1) || copy(e) only needs 2 buffers.
+        Uses a bounded ring of host buffers. GEC sets the depth to its H2D
+        window so one CPU writer drain and one TP barrier can cover a window.
         """
         self.cpu_buffers = {}
         self.shm_handles: Dict[str, shared_memory.SharedMemory] = {}
@@ -878,7 +937,7 @@ class SharedFullContext:
         try:
             for name in self.weight_names:
                 gpu_tensor = getattr(self.gpu_layer, name)
-                # Only allocate 2 experts worth of buffer (double buffering)
+                buffer_depth = self.cpu_buffer_depth
                 expert_shape = gpu_tensor.shape[1:]  # Shape per expert
                 if (
                     getattr(self, "_is_mxfp4_quant", False)
@@ -889,23 +948,23 @@ class SharedFullContext:
                     buf_dtype = gpu_tensor.dtype
                 element_size = torch.empty((), dtype=buf_dtype).element_size()
                 expert_nbytes = gpu_tensor.numel() // num_experts * element_size
-                double_buf_nbytes = expert_nbytes * 2
+                buffer_nbytes = expert_nbytes * buffer_depth
 
                 shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
                 shm = shared_memory.SharedMemory(
-                    name=shm_name, create=True, size=double_buf_nbytes
+                    name=shm_name, create=True, size=buffer_nbytes
                 )
                 self.shm_handles[name] = shm
 
-                # Shape: [2, ...expert_shape...]
+                # Shape: [buffer_depth, ...expert_shape...]
                 cpu_buffer = torch.frombuffer(shm.buf, dtype=buf_dtype).reshape(
-                    (2,) + expert_shape
+                    (buffer_depth,) + expert_shape
                 )
 
                 # Register as pinned memory for fast DMA
                 if torch.cuda.is_available():
                     register_result = torch.cuda.cudart().cudaHostRegister(
-                        cpu_buffer.data_ptr(), double_buf_nbytes, 0
+                        cpu_buffer.data_ptr(), buffer_nbytes, 0
                     )
                     if int(register_result) != 0:
                         raise RuntimeError(
@@ -1433,8 +1492,6 @@ class SharedFullContext:
         # Phase 3: re-swizzle the now-256-expert flat tensors into the
         # triton_kernels form `gpu_method.apply` will consume. Ensure all
         # in-flight CPU→GPU copies from Phase 2 are visible first.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
 
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
@@ -1774,6 +1831,527 @@ class SharedFullContext:
                 setattr(self.gpu_layer, _sn,
                         torch.nn.Parameter(
                             torch.empty(_shape, dtype=_dtype, device=_device)))
+
+    def _copy_selected_cpu_int4_weights(
+        self,
+        wrapper,
+        expert_ids: List[int],
+        destination_layer: torch.nn.Module,
+        destination_rows: torch.Tensor,
+    ) -> bool:
+        """Write selected INT4 experts directly into resident Marlin rows.
+
+        The CPU buffers contain the pre-Marlin packed rows.  Each selected row
+        is copied into its destination row and repacked in place, so this path
+        does not require a full-model GPU shadow.
+        """
+        if not expert_ids:
+            return True
+        if not getattr(self, "_is_int4_quant", False):
+            return False
+        if not getattr(self, "_cpu_buffers_initialized", False):
+            self.initialize_cpu_buffers()
+        names = list(self.WEIGHT_NAMES_INT4)
+        if not all(name in self.cpu_buffers for name in names):
+            raise RuntimeError("INT4 selected-row copy is missing CPU weight buffers")
+        if len(expert_ids) != int(destination_rows.numel()):
+            raise ValueError("expert_ids and destination_rows must have equal length")
+
+        targets = [getattr(destination_layer, name, None) for name in names]
+        if any(target is None for target in targets):
+            raise RuntimeError("INT4 selected-row copy requires Marlin destination tensors")
+
+        num_bits, packed_factor, group_size, actorder = self._resolve_int4_quant_params()
+        w13_p, w13_s = destination_layer.w13_weight_packed, destination_layer.w13_weight_scale
+        w2_p, w2_s = destination_layer.w2_weight_packed, destination_layer.w2_weight_scale
+        raw_w13_shape = self.cpu_buffers["w13_weight_packed"].shape[1:]
+        raw_w2_shape = self.cpu_buffers["w2_weight_packed"].shape[1:]
+        raw_w2_scale_shape = self.cpu_buffers["w2_weight_scale"].shape[1:]
+        w13_k, w13_n = raw_w13_shape[0] * packed_factor, raw_w13_shape[1]
+        w2_k, w2_n = raw_w2_shape[0] * packed_factor, raw_w2_shape[1]
+        w2_sk = raw_w2_scale_shape[0] * (
+            group_size if group_size != -1 else packed_factor
+        )
+        perm = torch.empty(0, dtype=torch.int32, device=w13_p.device)
+
+        destination_row_ids = destination_rows.detach().cpu().tolist()
+        buffer_depth = self.cpu_buffer_depth
+        raw_scratch = {
+            name: torch.empty(
+                (buffer_depth, *self.cpu_buffers[name].shape[1:]),
+                dtype=self.cpu_buffers[name].dtype,
+                device=w13_p.device,
+            )
+            for name in names
+        }
+        tmp_w13 = torch.empty(
+            self.cpu_buffers["w13_weight_packed"].shape[1:][::-1],
+            dtype=w13_p.dtype,
+            device=w13_p.device,
+        ).transpose(0, 1).contiguous()
+        tmp_w2 = torch.empty(
+            self.cpu_buffers["w2_weight_packed"].shape[1:][::-1],
+            dtype=w2_p.dtype,
+            device=w2_p.device,
+        ).transpose(0, 1).contiguous()
+        slot_events = getattr(self, "_int4_cpu_weight_slot_events", None)
+        if slot_events is None or len(slot_events) != buffer_depth:
+            slot_events = [None] * buffer_depth
+            self._int4_cpu_weight_slot_events = slot_events
+        tp_world_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        def expert_nbytes(name: str) -> int:
+            tensor = self.cpu_buffers[name]
+            return tensor.numel() // buffer_depth * tensor.element_size()
+
+        for batch_start in range(0, len(expert_ids), buffer_depth):
+            batch_end = min(batch_start + buffer_depth, len(expert_ids))
+            batch_ids = expert_ids[batch_start:batch_end]
+            batch_rows = destination_row_ids[batch_start:batch_end]
+            batch_slots = range(batch_end - batch_start)
+            for slot in batch_slots:
+                previous = slot_events[slot]
+                if previous is not None and not previous.query():
+                    previous.synchronize()
+
+            if tp_rank == 0:
+                for local_index, expert_id in enumerate(batch_ids):
+                    slot = local_index
+                    pointers = {
+                        name: [
+                            ptr + slot * expert_nbytes(name)
+                            for ptr in self.all_rank_buffer_ptrs[name]
+                        ]
+                        for name in names
+                    }
+                    wrapper.submit_write_weight_scale_to_buffer(
+                        tp_world_size,
+                        int(expert_id),
+                        pointers["w13_weight_packed"],
+                        pointers["w13_weight_scale"],
+                        pointers["w2_weight_packed"],
+                        pointers["w2_weight_scale"],
+                    )
+                wrapper.sync_write_weight_scale_to_buffer()
+
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            for local_index, destination_row in enumerate(batch_rows):
+                slot = local_index
+                for name in names:
+                    raw_scratch[name][slot].copy_(
+                        self.cpu_buffers[name][slot], non_blocking=True
+                    )
+
+                # Marlin expects the row-local transpose/repack and scale
+                # permutation after the raw CPU payload reaches the scratch row.
+                row = int(destination_row)
+                raw_w13 = raw_scratch["w13_weight_packed"][slot]
+                raw_w2 = raw_scratch["w2_weight_packed"][slot]
+                tmp_w13.copy_(raw_w13.reshape(raw_w13.shape[1], raw_w13.shape[0]).T)
+                tmp_w2.copy_(raw_w2.reshape(raw_w2.shape[1], raw_w2.shape[0]).T)
+                repacked_w13 = gptq_marlin_repack(
+                    tmp_w13, perm, w13_k, w13_n, num_bits
+                )
+                repacked_w2 = gptq_marlin_repack(
+                    tmp_w2, perm, w2_k, w2_n, num_bits
+                )
+                if tuple(repacked_w13.shape) != tuple(w13_p[row].shape):
+                    raise RuntimeError(
+                        f"INT4 Marlin w13 repack shape mismatch: "
+                        f"repacked={tuple(repacked_w13.shape)} target={tuple(w13_p[row].shape)}"
+                    )
+                if tuple(repacked_w2.shape) != tuple(w2_p[row].shape):
+                    raise RuntimeError(
+                        f"INT4 Marlin w2 repack shape mismatch: "
+                        f"repacked={tuple(repacked_w2.shape)} target={tuple(w2_p[row].shape)}"
+                    )
+                w13_p[row].copy_(repacked_w13)
+                w2_p[row].copy_(repacked_w2)
+                w13_s[row].copy_(
+                    marlin_permute_scales(
+                        raw_scratch["w13_weight_scale"][slot],
+                        w13_n,
+                        raw_scratch["w13_weight_scale"].shape[2],
+                        group_size,
+                    ).view(w13_s[row].shape)
+                )
+                w2_s[row].copy_(
+                    marlin_permute_scales(
+                        raw_scratch["w2_weight_scale"][slot],
+                        w2_sk,
+                        raw_scratch["w2_weight_scale"].shape[2],
+                        group_size,
+                    ).view(w2_s[row].shape)
+                )
+
+            if torch.cuda.is_available():
+                copy_stream = torch.cuda.current_stream(destination_layer.w13_weight_packed.device)
+                for slot in batch_slots:
+                    event = torch.cuda.Event(enable_timing=False)
+                    event.record(copy_stream)
+                    slot_events[slot] = event
+        return True
+
+    def copy_selected_cpu_weights(
+        self,
+        wrapper,
+        expert_ids: List[int],
+        destination_layer: torch.nn.Module,
+        destination_rows: torch.Tensor,
+    ) -> bool:
+        """Copy selected CPU experts directly into resident GPU rows.
+
+        BF16 and FP8 layouts are already in execution format, so they can use
+        the pinned host buffers directly. INT4/Marlin and MXFP4 copy canonical
+        rows into the destination's persistent image and repack only newly
+        admitted rows; unsupported layouts must fail instead of silently
+        falling back to a full-shadow source.
+        """
+        if getattr(self, "_is_int4_quant", False):
+            return self._copy_selected_cpu_int4_weights(
+                wrapper, expert_ids, destination_layer, destination_rows
+            )
+
+        supported = (
+            getattr(self, "_is_bf16_quant", False)
+            or getattr(self, "_is_fp8_quant", False)
+            or getattr(self, "_is_fp8_channel_quant", False)
+            or getattr(self, "_is_mxfp8_quant", False)
+            or getattr(self, "_is_mxfp4_quant", False)
+        )
+        if not supported or not expert_ids:
+            return False
+        if len(expert_ids) != int(destination_rows.numel()):
+            raise ValueError("expert_ids and destination_rows must have equal length")
+        if not getattr(self, "_cpu_buffers_initialized", False):
+            self.initialize_cpu_buffers()
+
+        names = list(self.weight_names)
+        if not all(name in self.cpu_buffers for name in names):
+            return False
+        mxfp4 = getattr(self, "_is_mxfp4_quant", False)
+        if mxfp4:
+            if not all(
+                hasattr(destination_layer, name)
+                for name in _Mxfp4PrefillSlot.RAW_NAMES
+            ) or getattr(destination_layer, "_v4_marlin_weights", None) is None:
+                return False
+        for name in names:
+            target = getattr(destination_layer, name, None)
+            source = self.cpu_buffers[name][0]
+            if target is None or target.shape[1:] != source.shape:
+                return False
+            if target.dtype != source.dtype and not mxfp4:
+                return False
+        tp_world_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        destination_row_ids = destination_rows.detach().cpu().tolist()
+
+        def expert_nbytes(name: str) -> int:
+            tensor = self.cpu_buffers[name]
+            return tensor.numel() // self.cpu_buffer_depth * tensor.element_size()
+
+        buffer_depth = self.cpu_buffer_depth
+        slot_events = getattr(self, "_cpu_weight_slot_events", None)
+        if slot_events is None or len(slot_events) != buffer_depth:
+            slot_events = [None] * buffer_depth
+            self._cpu_weight_slot_events = slot_events
+
+        if tp_rank == 0 and wrapper is None:
+            return False
+        for batch_start in range(0, len(expert_ids), buffer_depth):
+            batch_end = min(batch_start + buffer_depth, len(expert_ids))
+            batch_ids = expert_ids[batch_start:batch_end]
+            batch_rows = destination_row_ids[batch_start:batch_end]
+            batch_slots = range(batch_end - batch_start)
+            for slot in batch_slots:
+                previous = slot_events[slot]
+                if previous is not None and not previous.query():
+                    previous.synchronize()
+
+            if tp_rank == 0:
+                for local_index, expert_id in enumerate(batch_ids):
+                    slot = local_index
+                    pointers = {
+                        name: [
+                            ptr + slot * expert_nbytes(name)
+                            for ptr in self.all_rank_buffer_ptrs[name]
+                        ]
+                        for name in names
+                    }
+                    wrapper.submit_write_weight_scale_to_buffer(
+                        tp_world_size,
+                        int(expert_id),
+                        pointers.get("w13_weight", pointers.get("w13_weight_packed", [])),
+                        pointers.get("w13_weight_scale_inv", pointers.get("w13_weight_scale"))
+                        or [0] * tp_world_size,
+                        pointers.get("w2_weight", pointers.get("w2_weight_packed", [])),
+                        pointers.get("w2_weight_scale_inv", pointers.get("w2_weight_scale"))
+                        or [0] * tp_world_size,
+                    )
+                wrapper.sync_write_weight_scale_to_buffer()
+
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            for local_index, destination_row in enumerate(batch_rows):
+                slot = local_index
+                for name in names:
+                    target = getattr(destination_layer, name, None)
+                    source = self.cpu_buffers[name][slot]
+                    target[int(destination_row)].copy_(source, non_blocking=True)
+            if torch.cuda.is_available():
+                copy_stream = torch.cuda.current_stream(destination_layer.w13_weight.device)
+                for slot in batch_slots:
+                    event = torch.cuda.Event(enable_timing=False)
+                    event.record(copy_stream)
+                    slot_events[slot] = event
+        if mxfp4:
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                allocate_v4_mxfp4_marlin,
+                prepare_v4_mxfp4_marlin,
+                V4MarlinPreparedWeights,
+            )
+
+            device = destination_layer.w13_weight.device
+            rows = torch.tensor(destination_row_ids, dtype=torch.long, device=device)
+            resident = destination_layer._v4_marlin_weights
+            scratch = getattr(destination_layer, "_kt_mxfp4_repack_scratch", None)
+            scratch_capacity = max(self.cpu_buffer_depth, len(destination_row_ids))
+            if scratch is None or scratch["capacity"] < scratch_capacity:
+                raw_scratch = {
+                    name: torch.empty(
+                        (scratch_capacity, *getattr(destination_layer, name).shape[1:]),
+                        dtype=getattr(destination_layer, name).dtype,
+                        device=device,
+                    )
+                    for name in _Mxfp4PrefillSlot.RAW_NAMES
+                }
+                prepared = allocate_v4_mxfp4_marlin(
+                    num_experts=scratch_capacity,
+                    hidden_size=destination_layer.w13_weight.shape[2] * 2,
+                    intermediate_size=destination_layer.w2_weight.shape[2] * 2,
+                    device=device,
+                )
+                scratch = {
+                    "capacity": scratch_capacity,
+                    "raw": raw_scratch,
+                    "prepared": prepared,
+                }
+                destination_layer._kt_mxfp4_repack_scratch = scratch
+            raw_scratch = scratch["raw"]
+            prepared_storage = scratch["prepared"]
+            batch_prepared = V4MarlinPreparedWeights(
+                w13=prepared_storage.w13[: len(rows)],
+                w13_scale=prepared_storage.w13_scale[: len(rows)],
+                w2=prepared_storage.w2[: len(rows)],
+                w2_scale=prepared_storage.w2_scale[: len(rows)],
+                hidden_size=prepared_storage.hidden_size,
+                intermediate_size=prepared_storage.intermediate_size,
+                num_experts=len(rows),
+            )
+            for name in _Mxfp4PrefillSlot.RAW_NAMES:
+                torch.index_select(
+                    getattr(destination_layer, name),
+                    0,
+                    rows,
+                    out=raw_scratch[name][: len(rows)],
+                )
+            prepare_v4_mxfp4_marlin(
+                raw_scratch["w13_weight"][: len(rows)],
+                raw_scratch["w13_weight_scale_inv"][: len(rows)],
+                raw_scratch["w2_weight"][: len(rows)],
+                raw_scratch["w2_weight_scale_inv"][: len(rows)],
+                out=batch_prepared,
+            )
+            for name in ("w13", "w13_scale", "w2", "w2_scale"):
+                getattr(resident, name).index_copy_(
+                    0, rows, getattr(batch_prepared, name)
+                )
+        return True
+
+    def _write_selected_raw_weights(
+        self,
+        wrapper,
+        expert_ids: List[int],
+        destination_rows: Optional[List[int]] = None,
+    ) -> None:
+        """Write selected logical experts into the temporary raw GPU image."""
+        if not expert_ids:
+            return
+        if not getattr(self, "_cpu_buffers_initialized", False):
+            self.initialize_cpu_buffers()
+        names = list(self.weight_names)
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        def expert_nbytes(name: str) -> int:
+            return self.cpu_buffers[name].numel() // 2 * self.cpu_buffers[name].element_size()
+
+        rows = destination_rows or list(range(len(expert_ids)))
+        if len(rows) != len(expert_ids):
+            raise ValueError("temporary rows must match selected experts")
+        for index, expert_id in enumerate(expert_ids):
+            slot = index % 2
+            if tp_rank == 0:
+                if wrapper is None:
+                    raise RuntimeError("temporary GEC GEMM requires a CPU weight wrapper")
+                pointers = {
+                    name: [
+                        ptr + slot * expert_nbytes(name)
+                        for ptr in self.all_rank_buffer_ptrs[name]
+                    ]
+                    for name in names
+                }
+                wrapper.submit_write_weight_scale_to_buffer(
+                    tp_world_size,
+                    int(expert_id),
+                    pointers.get("w13_weight", pointers.get("w13_weight_packed", [])),
+                    pointers.get("w13_weight_scale_inv", pointers.get("w13_weight_scale"))
+                    or [0] * tp_world_size,
+                    pointers.get("w2_weight", pointers.get("w2_weight_packed", [])),
+                    pointers.get("w2_weight_scale_inv", pointers.get("w2_weight_scale"))
+                    or [0] * tp_world_size,
+                )
+                wrapper.sync_write_weight_scale_to_buffer()
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+            for name in names:
+                target = getattr(self.gpu_layer, name)
+                source = self.cpu_buffers[name][slot]
+                target[int(rows[index])].copy_(source, non_blocking=True)
+
+    def load_selected_temporary_weights(
+        self, wrapper, expert_ids: Iterable[int]
+    ) -> List[int]:
+        """Materialize selected CPU experts in a compact temporary GPU image.
+
+        The context owns only ``len(expert_ids)`` rows.  Logical source ids are
+        mapped to compact rows by ``apply_selected_temporary_gemm``; no
+        Persistent Cache row or full-model shadow row is touched.
+        """
+        selected = sorted({int(item) for item in expert_ids})
+        if not selected:
+            return selected
+        self._restore_raw_attrs()
+        # Quantization post-processing often walks the complete expert tensor.
+        # Zero rows that are masked out of dispatch so a selected-only shadow
+        # remains deterministic even when the backend rebuilds all rows.
+        for name in self.weight_names:
+            tensor = getattr(self.gpu_layer, name, None)
+            if tensor is not None:
+                tensor.data.zero_()
+        self._logical_expert_ids = selected
+        self._router_num_experts = max(selected) + 1
+        self._write_selected_raw_weights(
+            wrapper, selected, list(range(len(selected)))
+        )
+        if getattr(self, "_is_int4_quant", False):
+            self._repack_selected_int4_rows(list(range(len(selected))))
+        elif getattr(self, "_is_mxfp4_quant", False):
+            self._selected_mxfp4_raw_source = {
+                name: getattr(self.gpu_layer, name).detach().clone()
+                for name in _Mxfp4PrefillSlot.RAW_NAMES
+            }
+            self.gpu_method.process_weights_after_loading(self.gpu_layer)
+        return selected
+
+    def _repack_selected_int4_rows(self, expert_ids: List[int]) -> None:
+        """Run the Marlin transform for selected INT4 rows only."""
+        num_bits, packed_factor, group_size, actorder = self._resolve_int4_quant_params()
+        layer = self.gpu_layer
+        if actorder != "group":
+            for name in (
+                "w13_weight_g_idx",
+                "w2_weight_g_idx",
+                "w13_g_idx_sort_indices",
+                "w2_g_idx_sort_indices",
+            ):
+                setattr(
+                    layer,
+                    name,
+                    torch.nn.Parameter(
+                        torch.empty((layer.num_experts, 0), dtype=torch.int32, device=layer.w13_weight_packed.device),
+                        requires_grad=False,
+                    ),
+                )
+        w13_p, w13_s = layer.w13_weight_packed, layer.w13_weight_scale
+        w2_p, w2_s = layer.w2_weight_packed, layer.w2_weight_scale
+        w13_k, w13_n = w13_p.shape[1] * packed_factor, w13_p.shape[2]
+        w2_k, w2_n = w2_p.shape[1] * packed_factor, w2_p.shape[2]
+        w2_sk = w2_s.shape[1] * (group_size if group_size != -1 else packed_factor)
+        perm = torch.empty(0, dtype=torch.int32, device=w13_p.device)
+        tmp_w13 = torch.empty(w13_p.shape[1], w13_p.shape[2], dtype=w13_p.dtype, device=w13_p.device)
+        tmp_w2 = torch.empty(w2_p.shape[1], w2_p.shape[2], dtype=w2_p.dtype, device=w2_p.device)
+        for expert_id in expert_ids:
+            for tensor, tmp in ((w13_p, tmp_w13), (w2_p, tmp_w2)):
+                tmp.copy_(tensor[expert_id].reshape(tensor.shape[2], tensor.shape[1]).T)
+                tensor[expert_id].copy_(tmp)
+            w13_p[expert_id].copy_(
+                gptq_marlin_repack(w13_p[expert_id], perm, w13_k, w13_n, num_bits).view(
+                    w13_p[expert_id].shape
+                )
+            )
+            w2_p[expert_id].copy_(
+                gptq_marlin_repack(w2_p[expert_id], perm, w2_k, w2_n, num_bits).view(
+                    w2_p[expert_id].shape
+                )
+            )
+            w13_s[expert_id].copy_(
+                marlin_permute_scales(w13_s[expert_id], w13_n, w13_s.shape[2], group_size).view(
+                    w13_s[expert_id].shape
+                )
+            )
+            w2_s[expert_id].copy_(
+                marlin_permute_scales(w2_s[expert_id], w2_sk, w2_s.shape[2], group_size).view(
+                    w2_s[expert_id].shape
+                )
+            )
+        w13_p.set_(w13_p.view(layer.num_experts, w13_k // 16, w13_n * (num_bits // 2)))
+        w2_p.set_(w2_p.view(layer.num_experts, w2_k // 16, w2_n * (num_bits // 2)))
+
+    def apply_selected_temporary_gemm(
+        self, dispatch_output, expert_ids: Iterable[int]
+    ):
+        """Run the existing quant GEMM with only selected logical experts."""
+        selected = sorted({int(item) for item in expert_ids})
+        topk_ids = dispatch_output.topk_output.topk_ids
+        router_num_experts = int(
+            getattr(self, "_router_num_experts", self.global_num_experts)
+        )
+        mask = torch.zeros(
+            router_num_experts, dtype=torch.bool, device=topk_ids.device
+        )
+        logical_to_compact = torch.full(
+            (router_num_experts,), -1, dtype=torch.int32, device=topk_ids.device
+        )
+        if selected:
+            logical_ids = torch.tensor(
+                selected, dtype=torch.int64, device=topk_ids.device
+            )
+            mask[logical_ids] = True
+            logical_to_compact[logical_ids] = torch.arange(
+                len(selected), dtype=torch.int32, device=topk_ids.device
+            )
+        masked_ids = mask_and_remap_expert_ids(
+            topk_ids, mask, logical_to_compact
+        )
+        masked_topk = dispatch_output.topk_output._replace(topk_ids=masked_ids)
+        masked_dispatch = dispatch_output._replace(topk_output=masked_topk)
+        return self.gpu_method.apply(self.gpu_layer, masked_dispatch)
+
+    def restore_temporary_weights(self) -> None:
+        """Return the temporary image to raw storage before the next load."""
+        self._restore_raw_attrs()
+        if hasattr(self, "_selected_mxfp4_raw_source"):
+            del self._selected_mxfp4_raw_source
+        for name in ("_logical_expert_ids", "_router_num_experts"):
+            if hasattr(self, name):
+                delattr(self, name)
+
     def load(self, layer_idx, wrapper, original_layer=None, gpu_experts_mask=None,
              logical_to_gpu_index=None):
         """Load weights from disk to GPU via shared memory.
@@ -1789,9 +2367,6 @@ class SharedFullContext:
             setattr(self.gpu_layer, name, param)
         for name, buf in self.original_buffers.items():
             self.gpu_layer.register_buffer(name, buf)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
 
         tp_rank = get_tensor_model_parallel_rank()
         t0 = time.perf_counter()
@@ -1828,9 +2403,6 @@ class SharedFullContext:
         else:
             # INT4 Marlin format: write(e+1) || copy(e) || postprocess(e-1)
             self._prepare_weight_int4(wrapper)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
 
         total_time = (time.perf_counter() - t0) * 1000.0
 
@@ -2483,10 +3055,9 @@ class _Mxfp4LayerwisePrefillManager:
         # Dynamic MXFP4 placement must consume the raw image for the slot just
         # executed.  Run it before successor prefetch can overwrite the shared
         # shadow context's raw tensors.
-        if method.kt_config.kt_enable_dynamic_expert_update:
+        if method._gec_enabled or method.kt_config.kt_enable_dynamic_expert_update:
             dynamic_error = None
             try:
-                torch.cuda.synchronize(self.device)
                 method._update_gpu_experts_from_batch(
                     layer=layer,
                     ctx=self.context,
@@ -2529,7 +3100,10 @@ def _mxfp4_pipeline_signature(method, layer: torch.nn.Module) -> tuple:
 
 def _mxfp4_pipeline_requested(method) -> bool:
     requested = (
-        method.gpu_prefill_token_threshold > 0
+        (
+            method.gpu_prefill_token_threshold > 0
+            or getattr(method, "_gec_enabled", False)
+        )
         and (method.kt_config.method or "").upper() == "MXFP4"
     )
     if not requested:
@@ -2968,6 +3542,28 @@ def generate_front_loading_masks(
     return masks
 
 
+def generate_global_slot_masks(
+    num_layers: int,
+    num_experts: int,
+    global_slots: int,
+    first_k_dense_replace: int,
+    moe_layer_freq: int,
+) -> torch.Tensor:
+    """Allocate a global GEC budget in layer-major order.
+
+    ``global_slots`` counts Logical Experts across all eligible MoE layers.
+    A layer consumes up to ``num_experts`` entries before the next layer is
+    considered, so a 32 x 256 model with 512 slots gets two full layers.
+    """
+    return generate_front_loading_masks(
+        num_layers=num_layers,
+        num_experts=num_experts,
+        num_gpu_experts=global_slots,
+        first_k_dense_replace=first_k_dense_replace,
+        moe_layer_freq=moe_layer_freq,
+    )
+
+
 def generate_uniform_masks(
     num_layers: int,
     num_experts: int,
@@ -3207,7 +3803,24 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         )
 
     # Determine num_gpu_experts (total across all layers)
-    if server_args.kt_gpu_experts_ratio is not None:
+    if server_args.kt_expert_gpu_slots is not None:
+        # GEC global persistent cache capacity, counted in Logical Experts
+        # (doc/KT-CPU-PICE-GPU.md section 5.2). It is already a total across
+        # all MoE layers, so it needs no per-layer multiplication.
+        num_gpu_experts = server_args.kt_expert_gpu_slots
+        if (
+            server_args.kt_gpu_experts_ratio is not None
+            or server_args.kt_num_gpu_experts is not None
+        ):
+            logger.warning(
+                f"--kt-expert-gpu-slots={server_args.kt_expert_gpu_slots} overrides "
+                f"--kt-num-gpu-experts/--kt-gpu-experts-ratio for GPU expert sizing."
+            )
+        logger.info(
+            f"Using kt_expert_gpu_slots={server_args.kt_expert_gpu_slots}, "
+            f"total GPU experts: {num_gpu_experts} (GEC global capacity)"
+        )
+    elif server_args.kt_gpu_experts_ratio is not None:
         # Use ratio to calculate total GPU experts
         num_gpu_experts = int(total_experts * server_args.kt_gpu_experts_ratio)
         if server_args.kt_num_gpu_experts is not None:
@@ -3238,10 +3851,31 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     # Get GPU expert placement strategy
     strategy = server_args.kt_expert_placement_strategy
 
-    # Generate masks based on strategy
+    # GEC owns a global Logical-Expert budget. Its physical startup rows are
+    # therefore allocated layer-major: fill the first eligible MoE layer up
+    # to ``num_experts``, then continue with the next layer. This preserves
+    # the global slot meaning and avoids silently changing it into a per-layer
+    # average when a model has many experts per layer.
     tp_rank = get_tensor_model_parallel_rank()
 
-    if strategy == "frequency":
+    if server_args.kt_expert_gpu_slots is not None:
+        if tp_rank == 0:
+            logger.info(
+                "Using sequential layer-major placement for kt_expert_gpu_slots=%d",
+                num_gpu_experts,
+            )
+            masks = generate_global_slot_masks(
+                num_layers,
+                num_experts,
+                num_gpu_experts,
+                first_k_dense_replace,
+                moe_layer_freq,
+            )
+        else:
+            masks = torch.zeros(
+                num_layers, num_experts, dtype=torch.bool, device="cpu"
+            )
+    elif strategy == "frequency":
         # Load activation frequency from init_expert_location if it's a .pt file
         init_loc = server_args.init_expert_location
         has_activation_freq = init_loc and init_loc.endswith(".pt")
@@ -3427,6 +4061,32 @@ def create_kt_config_from_server_args(
 
     # Get mask for this specific layer
     gpu_experts_mask = masks[layer_idx]
+    tp_size = int(get_tensor_model_parallel_world_size() or 1)
+
+    gec_coordinator = None
+    if get_exec().moe.kt_expert_gpu_slots:
+        from sglang.srt.layers.moe.kt_gec import (
+            _load_gec_module,
+            get_or_create_gec_coordinator,
+        )
+
+        gec_module = _load_gec_module()
+        if gec_module is not None:
+            # The same ServerArgs object is used while all model layers are
+            # constructed, giving them one process/model scoped cache.
+            gec_coordinator = get_or_create_gec_coordinator(
+                server_args,
+                SimpleNamespace(
+                    kt_expert_gpu_slots=get_exec().moe.kt_expert_gpu_slots,
+                    kt_num_gpu_layers=num_gpu_layers,
+                    kt_tp_size=tp_size,
+                    max_running_requests=getattr(
+                        get_schedule(), "max_running_requests", 0
+                    ),
+                    kt_layer_h2d_batch_size=get_exec().moe.kt_layer_h2d_batch_size,
+                ),
+                gec_module,
+            )
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -3442,6 +4102,15 @@ def create_kt_config_from_server_args(
         gpu_prefill_token_threshold=get_exec().moe.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=get_exec().moe.kt_enable_dynamic_expert_update,
         expert_lora_path=get_exec().moe.kt_expert_lora_path,
+        kt_expert_gpu_slots=get_exec().moe.kt_expert_gpu_slots,
+        kt_layer_h2d_slots=get_exec().moe.kt_layer_h2d_slots,
+        kt_layer_h2d_batch_size=get_exec().moe.kt_layer_h2d_batch_size,
+        kt_gec_coordinator=gec_coordinator,
+        kt_num_gpu_layers=num_gpu_layers,
+        kt_tp_size=tp_size,
+        max_running_requests=int(
+            getattr(get_schedule(), "max_running_requests", 0) or 0
+        ),
     )
 
 
@@ -3471,6 +4140,34 @@ def mask_and_remap_expert_ids(
     # For GPU experts: remap to GPU weight index; for CPU experts: set to -1
     remapped_ids = torch.where(is_gpu_expert, logical_to_gpu_index[safe_ids], -1)
     return remapped_ids
+
+
+def mask_gpu_expert_ids_for_cpu(
+    topk_ids: torch.Tensor,
+    gpu_experts_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Leave only CPU-fallback experts in the IDs submitted to KT CPU MoE.
+
+    GEC updates the resident mask before the CPU task is submitted.  Keeping
+    GPU-resident routes as ``-1`` here makes the CPU fallback contract explicit
+    and avoids relying only on the C++ wrapper's late mask check.
+    """
+    valid = (topk_ids >= 0) & (topk_ids < gpu_experts_mask.numel())
+    safe_ids = torch.where(valid, topk_ids, 0)
+    is_gpu_expert = valid & gpu_experts_mask[safe_ids]
+    return topk_ids.masked_fill(is_gpu_expert, -1)
+
+
+def mask_topk_ids_for_expert_group(
+    topk_ids: torch.Tensor,
+    expert_group_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Keep only one resident Expert group for a streamed GPU GEMM."""
+    valid = (topk_ids >= 0) & (topk_ids < expert_group_mask.numel())
+    safe_ids = torch.where(valid, topk_ids, 0)
+    return topk_ids.masked_fill(
+        ~(valid & expert_group_mask[safe_ids]), -1
+    )
 
 
 def materialize_kt_topk_output(topk_output, layer_idx: int):
@@ -3642,10 +4339,29 @@ def select_top_experts_from_batch(
     return selected_experts
 
 
+def _gather_scatter_expert_rows(
+    weight_pairs: List[Tuple[torch.Tensor, torch.Tensor]],
+    src_ids: torch.Tensor,
+    dst_rows: torch.Tensor,
+) -> None:
+    """Gather ``src_ids`` expert rows from each source and scatter them into
+    ``dst_rows`` of the destination.
+
+    Vectorized copy: one ``index_select`` + one ``index_copy_`` per tensor,
+    replacing the legacy per-expert Python loop whose
+    ``selected_experts[i].item()`` forced a blocking D2H sync per expert (the
+    launch/sync storm behind the TP0 "Command Buffer Full" stalls). The
+    tensor-native operation preserves all supported weight and scale dtypes.
+    """
+    for src_weight, dst_weight in weight_pairs:
+        dst_weight.index_copy_(0, dst_rows, src_weight.index_select(0, src_ids))
+
+
 def copy_experts_weights_int4(
     src_layer: torch.nn.Module,
     dst_layer: torch.nn.Module,
     selected_experts: torch.Tensor,
+    dst_rows: torch.Tensor,
 ) -> None:
     """Copy INT4 Marlin expert weights from source to destination layer.
 
@@ -3662,27 +4378,21 @@ def copy_experts_weights_int4(
     """
     weight_names = ["w13_weight_packed", "w13_weight_scale", "w2_weight_packed", "w2_weight_scale"]
 
-    # Build mapping: selected logical ID -> dst GPU index
-    logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
-    }
-
-    for weight_name in weight_names:
-        src_weight = getattr(src_layer, weight_name)  # [global_num_experts, ...]
-        dst_weight = getattr(dst_layer, weight_name)  # [num_gpu_experts, ...]
-
-        # Copy each selected expert
-        for logical_id, dst_idx in logical_to_dst_index.items():
-            # In src_layer, expert at logical_id is at index logical_id
-            # In dst_layer, we write to gpu_index dst_idx
-            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+    _gather_scatter_expert_rows(
+        [
+            (getattr(src_layer, name), getattr(dst_layer, name))
+            for name in weight_names
+        ],
+        src_ids=selected_experts,
+        dst_rows=dst_rows,
+    )
 
 
 def copy_experts_weights_fp8(
     src_layer: torch.nn.Module,
     dst_layer: torch.nn.Module,
     selected_experts: torch.Tensor,
+    dst_rows: torch.Tensor,
 ) -> None:
     """Copy FP8 block quant expert weights from source to destination layer.
 
@@ -3699,25 +4409,21 @@ def copy_experts_weights_fp8(
     """
     weight_names = ["w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv"]
 
-    # Build mapping: selected logical ID -> dst GPU index
-    logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
-    }
-
-    for weight_name in weight_names:
-        src_weight = getattr(src_layer, weight_name)  # [global_num_experts, ...]
-        dst_weight = getattr(dst_layer, weight_name)  # [num_gpu_experts, ...]
-
-        # Copy each selected expert
-        for logical_id, dst_idx in logical_to_dst_index.items():
-            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+    _gather_scatter_expert_rows(
+        [
+            (getattr(src_layer, name), getattr(dst_layer, name))
+            for name in weight_names
+        ],
+        src_ids=selected_experts,
+        dst_rows=dst_rows,
+    )
 
 
 def copy_experts_weights_fp8_channel(
     src_layer: torch.nn.Module,
     dst_layer: torch.nn.Module,
     selected_experts: torch.Tensor,
+    dst_rows: torch.Tensor,
 ) -> None:
     """Copy FP8 per-channel quant expert weights from source to destination layer.
 
@@ -3734,25 +4440,21 @@ def copy_experts_weights_fp8_channel(
     """
     weight_names = ["w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"]
 
-    # Build mapping: selected logical ID -> dst GPU index
-    logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
-    }
-
-    for weight_name in weight_names:
-        src_weight = getattr(src_layer, weight_name)  # [global_num_experts, ...]
-        dst_weight = getattr(dst_layer, weight_name)  # [num_gpu_experts, ...]
-
-        # Copy each selected expert
-        for logical_id, dst_idx in logical_to_dst_index.items():
-            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+    _gather_scatter_expert_rows(
+        [
+            (getattr(src_layer, name), getattr(dst_layer, name))
+            for name in weight_names
+        ],
+        src_ids=selected_experts,
+        dst_rows=dst_rows,
+    )
 
 
 def copy_experts_weights_bf16(
     src_layer: torch.nn.Module,
     dst_layer: torch.nn.Module,
     selected_experts: torch.Tensor,
+    dst_rows: torch.Tensor,
 ) -> None:
     """Copy BF16/unquantized expert weights from source to destination layer.
 
@@ -3767,19 +4469,14 @@ def copy_experts_weights_bf16(
     """
     weight_names = ["w13_weight", "w2_weight"]
 
-    # Build mapping: selected logical ID -> dst GPU index
-    logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
-    }
-
-    for weight_name in weight_names:
-        src_weight = getattr(src_layer, weight_name)  # [global_num_experts, ...]
-        dst_weight = getattr(dst_layer, weight_name)  # [num_gpu_experts, ...]
-
-        # Copy each selected expert
-        for logical_id, dst_idx in logical_to_dst_index.items():
-            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+    _gather_scatter_expert_rows(
+        [
+            (getattr(src_layer, name), getattr(dst_layer, name))
+            for name in weight_names
+        ],
+        src_ids=selected_experts,
+        dst_rows=dst_rows,
+    )
 
 
 def copy_experts_weights_mxfp4(
@@ -3787,6 +4484,7 @@ def copy_experts_weights_mxfp4(
     dst_layer: torch.nn.Module,
     selected_experts: torch.Tensor,
     raw_source: Optional[Dict[str, torch.Tensor]] = None,
+    dst_rows: Optional[torch.Tensor] = None,
 ) -> None:
     """Copy canonical packed MXFP4 experts and rebuild the resident Marlin image.
 
@@ -3812,10 +4510,7 @@ def copy_experts_weights_mxfp4(
             "and _scale_inv tensors."
         )
 
-    logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
-    }
+    weight_pairs = []
     for name in raw_names:
         src_weight = source[name]
         dst_weight = getattr(dst_layer, name).data
@@ -3824,8 +4519,20 @@ def copy_experts_weights_mxfp4(
                 f"MXFP4 dynamic update shape mismatch for {name}: "
                 f"source={tuple(src_weight.shape)} destination={tuple(dst_weight.shape)}"
             )
-        for logical_id, dst_idx in logical_to_dst_index.items():
-            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+        weight_pairs.append((src_weight, dst_weight))
+    _gather_scatter_expert_rows(
+        weight_pairs,
+        src_ids=selected_experts,
+        dst_rows=(
+            dst_rows
+            if dst_rows is not None
+            else torch.arange(
+                len(selected_experts),
+                dtype=torch.int64,
+                device=selected_experts.device,
+            )
+        ),
+    )
 
     from sglang.srt.layers.quantization.v4_marlin_moe import (
         prepare_v4_mxfp4_marlin,
@@ -3852,38 +4559,47 @@ def copy_experts_weights_mxfp4(
 def update_gpu_expert_mappings(
     selected_experts: torch.Tensor,
     num_experts: int,
-    device: torch.device,
 ):
     """Update GPU expert mapping tables based on newly selected experts.
 
     Args:
-        selected_experts: Tensor of logical expert IDs now on GPU (shape: [num_gpu_experts])
+        selected_experts: Row-ordered tensor of logical expert IDs now on GPU
+            (shape: [num_gpu_experts]); entry i is the resident of GPU row i.
         num_experts: Total number of experts in layer
-        device: Target CUDA device for mapping tensors
 
     Returns:
-        Tuple of (gpu_experts_mask, logical_to_gpu_index, gpu_index_to_logical):
+        Tuple of (gpu_experts_mask, logical_to_gpu_index, gpu_index_to_logical),
+        all CPU tensors (the caller H2D-copies them into the persistent CUDA
+        buffers in place for CUDA-graph compatibility):
             - gpu_experts_mask: CPU bool tensor [num_experts], True = on GPU
-            - logical_to_gpu_index: CUDA int32 tensor [num_experts], maps logical -> GPU index
+            - logical_to_gpu_index: CPU int32 tensor [num_experts], maps logical -> GPU index
             - gpu_index_to_logical: CPU int32 tensor [num_gpu_experts], reverse mapping
+
+    Fully vectorized on CPU: the legacy per-expert ``index_put_`` loop on a
+    CUDA tensor launched one kernel per resident expert per round.
     """
-    num_gpu_experts = len(selected_experts)
+    selected_cpu = (
+        selected_experts.cpu() if selected_experts.device.type != "cpu"
+        else selected_experts
+    ).to(torch.int64)
+    num_gpu_experts = len(selected_cpu)
 
     # Create new mask (CPU tensor)
     gpu_experts_mask_cpu = torch.zeros(num_experts, dtype=torch.bool, device='cpu')
-    gpu_experts_mask_cpu[selected_experts.cpu()] = True
+    gpu_experts_mask_cpu[selected_cpu] = True
 
-    # Create logical_to_gpu_index (CUDA tensor)
-    logical_to_gpu_index = torch.full(
-        (num_experts,), -1, dtype=torch.int32, device=device
+    # Create logical_to_gpu_index (CPU tensor)
+    logical_to_gpu_index_cpu = torch.full(
+        (num_experts,), -1, dtype=torch.int32
     )
-    for gpu_idx, logical_id in enumerate(selected_experts):
-        logical_to_gpu_index[logical_id] = gpu_idx
+    logical_to_gpu_index_cpu[selected_cpu] = torch.arange(
+        num_gpu_experts, dtype=torch.int32
+    )
 
     # Create gpu_index_to_logical (CPU tensor for weight loading)
-    gpu_index_to_logical_cpu = selected_experts.cpu().to(torch.int32)
+    gpu_index_to_logical_cpu = selected_cpu.to(torch.int32)
 
-    return gpu_experts_mask_cpu, logical_to_gpu_index, gpu_index_to_logical_cpu
+    return gpu_experts_mask_cpu, logical_to_gpu_index_cpu, gpu_index_to_logical_cpu
 
 
 def update_kt_wrapper_masks(
@@ -3951,21 +4667,35 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "kt_kernel is not installed. To use KTransformers EP wrapper, please install kt_kernel."
             )
 
-        if (
-            (kt_config.method or "").upper() == "MXFP4"
-            and kt_config.kt_enable_dynamic_expert_update
-        ):
+        _gec_requested = (
+            kt_config.kt_expert_gpu_slots is not None
+            and kt_config.kt_expert_gpu_slots > 0
+        )
+        _dynamic_update_requested = (
+            kt_config.kt_enable_dynamic_expert_update or _gec_requested
+        )
+        if (kt_config.method or "").upper() == "MXFP4" and _dynamic_update_requested:
             if not torch.cuda.is_available():
                 raise ValueError(
                     "MXFP4 dynamic expert update requires a CUDA GPU; "
                     "pure CPU/NEON execution cannot update GPU expert placement."
                 )
-            if int(kt_config.gpu_experts_mask.sum().item()) <= 0:
+            if (
+                int(kt_config.gpu_experts_mask.sum().item()) <= 0
+                and getattr(kt_config, "kt_gec_coordinator", None) is None
+            ):
                 raise ValueError(
                     "MXFP4 dynamic expert update requires at least one GPU expert; "
-                    "set --kt-num-gpu-experts to a positive value."
+                    "set --kt-num-gpu-experts or --kt-expert-gpu-slots to a "
+                    "positive value."
                 )
-            if not kt_config.gpu_prefill_token_threshold or kt_config.gpu_prefill_token_threshold <= 0:
+            if (
+                kt_config.kt_enable_dynamic_expert_update
+                and (
+                    not kt_config.gpu_prefill_token_threshold
+                    or kt_config.gpu_prefill_token_threshold <= 0
+                )
+            ):
                 raise ValueError(
                     "MXFP4 dynamic expert update requires a positive "
                     "--kt-gpu-prefill-token-threshold."
@@ -3997,6 +4727,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
+        from sglang.srt.layers.moe.kt_gec import build_gec_planner
+
+        # With a model-scoped coordinator every TP rank makes the same
+        # deterministic decision, allowing row migration before broadcast.
+        self._gec_enabled = (
+            kt_config.kt_expert_gpu_slots is not None
+            and kt_config.kt_expert_gpu_slots > 0
+            and (
+                self.num_gpu_experts > 0
+                or getattr(kt_config, "kt_gec_coordinator", None) is not None
+            )
+        )
+        self._gec_planner = build_gec_planner(
+            kt_config=kt_config,
+            num_experts=len(kt_config.gpu_experts_mask),
+            num_gpu_experts=self.num_gpu_experts,
+            tp_rank=self.tp_rank,
+        )
         if self.kt_expert_lora_enabled:
             if self.num_gpu_experts != 0:
                 raise ValueError(
@@ -4038,6 +4786,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             len(gpu_expert_indices), dtype=torch.int32
         )
         self.gpu_index_to_logical = gpu_expert_indices.to(torch.int32)
+        # GEC stable row ownership: row -> logical expert id currently held by
+        # that GPU row. Runtime updates keep rows stable and copy only newly
+        # admitted experts into freed rows, instead of re-copying the whole
+        # resident set per round. None on the legacy frequency path.
+        self._resident_row_owner = (
+            gpu_expert_indices.to(torch.int64)
+            if self._gec_enabled
+            else None
+        )
 
         # CUDA tensors for inference (will be set in create_weights)
         self.gpu_experts_mask_cuda = None
@@ -4045,7 +4802,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
         self._full_init_args = None
-        self.wrapper: Optional[KTMoEWrapper] = None
+        self.wrapper: Optional['KTMoEWrapper'] = None
 
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
         # main stream for GPU computation (initialized in create_weights)
@@ -4055,6 +4812,35 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Shared staging buffer reference (initialized in create_weights, shared across all layers)
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
+        self._cpu_forward_submitted = False
+        # The copy stream is created lazily once a CUDA device is known.  It
+        # is deliberately per layer, so its completion events never impose a
+        # process-wide synchronization on unrelated MoE layers.
+        self._gec_cuda_pipeline = None
+        self._gec_h2d_before_compute = False
+        self._kt_trace_step = 0
+
+    def _kt_trace(self, call_id: int, started_ns: int, phase: str, **fields) -> None:
+        if (
+            call_id <= 0
+            or started_ns <= 0
+            or not _kt_debug_trace_enabled()
+            or not logger.isEnabledFor(logging.DEBUG)
+        ):
+            return
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1e6
+        details = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.debug(
+            "[kt-trace] mono_ms=%.3f layer=%s rank=%d call=%d phase=%s "
+            "elapsed_ms=%.3f %s",
+            time.perf_counter_ns() / 1e6,
+            getattr(self.kt_config, "layer_idx", -1),
+            self.tp_rank,
+            call_id,
+            phase,
+            elapsed_ms,
+            details,
+        )
 
     def _enable_compact_gpu_expert_rows(self, method) -> None:
         if method is None or not getattr(
@@ -4065,6 +4851,111 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # expert ids into this compact row space before GPU execution.
         self._uses_compact_gpu_expert_rows = True
         method._kt_compact_expert_rows = True
+
+    def _resize_gpu_expert_rows(
+        self, layer: torch.nn.Module, new_capacity: int, keep_owner: List[int]
+    ) -> None:
+        """Resize this layer's compact GPU storage during global rebalancing.
+
+        Existing rows are copied by Logical Expert id before the runner is
+        rebuilt. Newly allocated rows are filled by the caller's current
+        layerwise H2D update. This keeps the physical pool equal to the global
+        slot budget instead of allocating a full expert image per layer.
+        """
+        new_capacity = max(0, min(int(new_capacity), self.global_num_experts))
+        old_capacity = self.num_gpu_experts
+        old_owner = (
+            self._resident_row_owner.tolist()
+            if self._resident_row_owner is not None
+            else self.gpu_index_to_logical.tolist()
+        )
+        if new_capacity == old_capacity:
+            self._resident_row_owner = torch.tensor(
+                keep_owner, dtype=torch.int64, device="cpu"
+            )
+            return
+
+        old_weights = {}
+        for name in (
+            "w13_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_packed",
+            "w2_weight_scale",
+            "w13_weight",
+            "w13_weight_scale_inv",
+            "w2_weight",
+            "w2_weight_scale_inv",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        ):
+            tensor = getattr(layer, name, None)
+            if tensor is not None and getattr(tensor, "ndim", 0) > 0:
+                old_weights[name] = tensor.detach()
+
+        if self._full_init_args is None:
+            raise RuntimeError("GEC row resize requested before create_weights")
+        hidden_size, intermediate_size, params_dtype = self._full_init_args
+        self.gpu_method.num_gpu_experts = new_capacity
+        self.gpu_method.create_weights(
+            layer=layer,
+            num_experts=new_capacity,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size,
+            params_dtype=params_dtype,
+            **getattr(self, "_kt_extra_weight_attrs", {}),
+        )
+
+        old_index = {expert_id: row for row, expert_id in enumerate(old_owner)}
+        if keep_owner:
+            source_rows = [old_index[item] for item in keep_owner if item in old_index]
+            destination_rows = [
+                index for index, item in enumerate(keep_owner) if item in old_index
+            ]
+            if source_rows:
+                src = torch.tensor(source_rows, dtype=torch.int64, device=next(layer.parameters()).device)
+                dst = torch.tensor(destination_rows, dtype=torch.int64, device=src.device)
+                resize_stream = None
+                if self._gec_cuda_pipeline is not None:
+                    resize_stream = self._gec_cuda_pipeline.stream
+                if resize_stream is not None:
+                    with torch.cuda.stream(resize_stream):
+                        for name, source in old_weights.items():
+                            destination = getattr(layer, name, None)
+                            if destination is None or destination.shape[1:] != source.shape[1:]:
+                                continue
+                            destination.data.index_copy_(
+                                0, dst, source.index_select(0, src)
+                            )
+                        resize_event = torch.cuda.Event(enable_timing=False)
+                        resize_event.record(resize_stream)
+                    torch.cuda.current_stream(layer.w13_weight.device).wait_event(
+                        resize_event
+                    )
+                else:
+                    for name, source in old_weights.items():
+                        destination = getattr(layer, name, None)
+                        if destination is None or destination.shape[1:] != source.shape[1:]:
+                            continue
+                        destination.data.index_copy_(0, dst, source.index_select(0, src))
+
+        self.num_gpu_experts = new_capacity
+        self.gpu_method.num_gpu_experts = new_capacity
+        if getattr(self, "moe_runner_config", None) is not None:
+            self.create_moe_runner(layer, self.moe_runner_config)
+        owner_cpu = torch.tensor(keep_owner, dtype=torch.int64, device="cpu")
+        self._resident_row_owner = owner_cpu
+        mask_cpu, logical_cpu, reverse_cpu = update_gpu_expert_mappings(
+            selected_experts=owner_cpu,
+            num_experts=self.global_num_experts,
+        )
+        self.gpu_experts_mask = mask_cpu
+        self.logical_to_gpu_index = logical_cpu
+        self.gpu_index_to_logical = reverse_cpu
+        if self.gpu_experts_mask_cuda is not None:
+            self.gpu_experts_mask_cuda.copy_(mask_cpu)
+            self.logical_to_gpu_index_cuda.copy_(logical_cpu)
+        if self.tp_rank == 0:
+            update_kt_wrapper_masks(self.wrapper, mask_cpu)
 
     def create_weights(
         self,
@@ -4086,6 +4977,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs: Additional weight attributes
         """
         self.global_num_experts = num_experts
+        self._kt_layer_ref = layer
+        self._kt_extra_weight_attrs = dict(extra_weight_attrs)
         self._full_init_args = (
             hidden_size,
             intermediate_size_per_partition,
@@ -4112,6 +5005,24 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 1. Create weights for GPU experts using the wrapped method
         # GPU weights are indexed by gpu_index (0 to num_gpu_experts-1), not logical expert ID
         # The mapping logical_to_gpu_index is used to remap IDs during weight loading and inference
+        coordinator = getattr(self.kt_config, "kt_gec_coordinator", None)
+        if coordinator is not None:
+            assigned_capacity = coordinator.layer_capacity(self.kt_config.layer_idx)
+            if assigned_capacity is not None:
+                self.num_gpu_experts = assigned_capacity
+                self.gpu_method.num_gpu_experts = assigned_capacity
+                current_owner = self._resident_row_owner
+                if current_owner is not None and len(current_owner) != assigned_capacity:
+                    current_owner = current_owner[:assigned_capacity]
+                    self._resident_row_owner = current_owner
+                    (
+                        self.gpu_experts_mask,
+                        self.logical_to_gpu_index,
+                        self.gpu_index_to_logical,
+                    ) = update_gpu_expert_mappings(
+                        selected_experts=current_owner,
+                        num_experts=self.global_num_experts,
+                    )
         self.gpu_method.create_weights(
             layer=layer,
             num_experts=self.num_gpu_experts,
@@ -4129,6 +5040,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device
+        if self._gec_enabled and torch.cuda.is_available():
+            from sglang.srt.layers.moe.kt_gec import GecCudaPipeline
+
+            self._gec_cuda_pipeline = GecCudaPipeline(
+                torch.device(target_device),
+                depth=max(1, getattr(self._gec_planner, "buffer_pool_depth", 1)),
+            )
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
 
@@ -4206,6 +5124,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Registration happens during model construction, not on the first
         # request, so layer N can identify and prepare N+1 immediately.
+        if self._gec_planner is not None:
+            coordinator = getattr(self.kt_config, "kt_gec_coordinator", None)
+            if coordinator is not None:
+                coordinator.register_physical_layer(
+                    self.kt_config.layer_idx,
+                    self._gec_planner,
+                    lambda capacity, owner, layer=layer: self._resize_gpu_expert_rows(
+                        layer, capacity, owner
+                    ),
+                )
         _register_mxfp4_prefill_layer(self, layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -4216,7 +5144,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         if (
             (self.kt_config.method or "").upper() == "MXFP4"
-            and self.kt_config.kt_enable_dynamic_expert_update
+            and (
+                self.kt_config.kt_enable_dynamic_expert_update
+                or self._gec_enabled
+            )
             and not _mxfp4_pipeline_backend_supported(self, layer)
         ):
             raise ValueError(
@@ -4281,8 +5212,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
-            torch.cuda.synchronize()
-
             # Get expert location metadata for CPU expert mapping
             from sglang.srt.eplb.expert_location_dispatch import (
                 get_global_expert_location_metadata,
@@ -4349,6 +5278,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     lora.rank,
                     lora.alpha,
                 )
+
+        if self._gec_planner is not None:
+            self._gec_planner.initialize_residents(
+                self.gpu_index_to_logical.tolist()
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -4476,7 +5410,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
         staged_hidden_states: torch.Tensor,
-    ) -> None:
+    ) -> bool:
         """Submit CPU expert computation using staged hidden states.
 
         Args:
@@ -4489,15 +5423,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
 
         if self.tp_rank != 0 or self.wrapper is None:
-            return
+            return False
 
         topk_output = materialize_kt_topk_output(
             dispatch_output.topk_output, self.kt_config.layer_idx
         )
         topk_weights, topk_ids, _ = topk_output
 
-        # Submit forward task using staged buffer
-        self._submit_cpu_forward(staged_hidden_states, topk_ids, topk_weights)
+        # Submit only CPU-fallback routes. GEC has already updated the resident
+        # mask before this method is called, so newly admitted H2D experts are
+        # never submitted to the CPU GEMM as duplicate work.
+        cpu_topk_ids = mask_gpu_expert_ids_for_cpu(
+            topk_ids, self.gpu_experts_mask_cuda
+        )
+        self._submit_cpu_forward(staged_hidden_states, cpu_topk_ids, topk_weights)
+        return True
 
     def _sync_with_staged_input(
         self, staged_hidden_states: torch.Tensor
@@ -4523,7 +5463,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """Execute hybrid CPU+GPU MoE forward pass with parallelism.
 
         This is the main computation method that coordinates:
-        1. Submit CPU expert computation (non-blocking)
+        1. Update GEC residency and submit only CPU-fallback experts
         2. Execute GPU expert computation in parallel
         3. Synchronize CPU results and merge with GPU results
 
@@ -4534,6 +5474,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             Combined computation results from CPU and GPU experts
         """
+        trace_id = 0
+        trace_started_ns = 0
+        if _kt_debug_trace_enabled():
+            self._kt_trace_step += 1
+            trace_id = self._kt_trace_step
+            trace_started_ns = time.perf_counter_ns()
+            self._kt_trace(
+                trace_id,
+                trace_started_ns,
+                "call_enter",
+                dispatch_type=type(dispatch_output).__name__,
+            )
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
@@ -4542,18 +5494,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Record GPU expert mask for distribution tracking (rank 0 only)
         # Use gpu_experts_mask_cuda which is already on GPU for CUDA graph compatibility
         if self.tp_rank == 0:
+            self._kt_trace(trace_id, trace_started_ns, "distribution_record_start")
             recorder = get_global_expert_distribution_recorder()
             recorder.on_gpu_expert_mask(
                 self.kt_config.layer_idx, self.gpu_experts_mask_cuda
             )
+            self._kt_trace(trace_id, trace_started_ns, "distribution_record_end")
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        if _kt_debug_trace_enabled():
+            self._kt_trace(
+                trace_id,
+                trace_started_ns,
+                "apply_enter",
+                num_tokens=num_tokens,
+                topk_shape=tuple(topk_output.topk_ids.shape),
+                extend=bool(get_forward().is_extend_in_batch),
+                capture=torch.cuda.is_current_stream_capturing()
+                if x.device.type == "cuda"
+                else False,
+                gpu_rows=self.num_gpu_experts,
+                gec=self._gec_enabled,
+            )
         _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
             and self.tp_rank == 0
-            and getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
+            and (
+                os.environ.get("SGLANG_KT_HYBRID_TIMING_ALL") == "1"
+                or getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
+            )
         )
         _kt_t_apply_start = time.perf_counter() if _kt_timing else None
         _kt_t_after_submit = None
@@ -4562,6 +5533,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _kt_t_after_sync = None
         _kt_t_after_merge = None
         _kt_t_cpu_wait_ms = 0.0
+        _kt_cpu_route_count = 0
 
         # Check for full GPU fallback. The full-GPU path's _build_full_context →
         # _prepare_weight_{mxfp4,fp8,fp8_channel,bf16,int4} helpers read flat
@@ -4616,10 +5588,41 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 and _v4_raw_contract
                 and _v4_aligned
             )
-        _full_gpu_gate = (
+        _legacy_full_gpu_gate = (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
+        )
+        # GEC is independent of the legacy full-GPU prefill flag. Use the
+        # existing full-layer path to observe extend batches and update hot
+        # residency; decode-sized batches consume the resulting resident set.
+        _gec_full_gpu_gate = (
+            self._gec_enabled
+            and bool(get_forward().is_extend_in_batch)
+            and not any(
+                tag in (self.kt_config.method or "").upper()
+                for tag in ("BF16", "FP8", "MXFP8")
+            )
+        )
+        # MXFP4 GEC uses the resident compact layer below.  The old full-GPU
+        # branch materialized every routed expert into a temporary shadow and
+        # returned before GEC admission, which bypassed the persistent cache.
+        _gec_persistent_mxfp4 = (
+            self._gec_enabled
+            and _mxfp4_pipeline_runtime_supported(self, layer)
+        )
+        _full_gpu_gate = (
+            (_legacy_full_gpu_gate or _gec_full_gpu_gate)
             and _full_gpu_fallback_supported
+            and not _gec_persistent_mxfp4
+        )
+        self._kt_trace(
+            trace_id,
+            trace_started_ns,
+            "path_select",
+            legacy_full_gpu=_legacy_full_gpu_gate,
+            gec_full_gpu=_gec_full_gpu_gate,
+            gec_persistent_mxfp4=_gec_persistent_mxfp4,
+            full_gpu_gate=_full_gpu_gate,
         )
         _mxfp4_requested = _mxfp4_pipeline_requested(self)
         _mxfp4_signature = getattr(self, "_mxfp4_pipeline_signature", None)
@@ -4663,18 +5666,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _mxfp4_requested and _mxfp4_disabled_after_oom
         ):
             if _mxfp4_pipeline_runtime_supported(self, layer):
+                if self._gec_enabled:
+                    compact_result = self._run_gec_compact_temporary_gemm(
+                        layer, dispatch_output
+                    )
+                    if compact_result is not None:
+                        return compact_result
                 if _mxfp4_manager is None:
                     raise RuntimeError(
                         "MXFP4 layerwise prefill is supported but was not "
                         "initialized during lazy slot allocation"
                     )
-                return _mxfp4_manager.apply(self, layer, dispatch_output)
+                self._kt_trace(trace_id, trace_started_ns, "full_gpu_mxfp4_start")
+                result = _mxfp4_manager.apply(self, layer, dispatch_output)
+                self._kt_trace(trace_id, trace_started_ns, "full_gpu_mxfp4_end")
+                return result
 
             if _mxfp4_manager is not None:
                 raise RuntimeError(
                     "MXFP4 Marlin layerwise prefill was initialized, but the "
                     "runtime layer has no compatible raw MXFP4 weights"
                 )
+
+            # GEC packed-format temporary execution: materialize only the
+            # experts referenced by this router batch and mask all others.
+            # The full-shadow path below remains available for legacy callers.
+            if self._gec_enabled:
+                compact_result = self._run_gec_compact_temporary_gemm(
+                    layer, dispatch_output
+                )
+                if compact_result is not None:
+                    return compact_result
 
             # Non-MXFP4 and unsupported MXFP4 backends retain the existing
             # serialized full-GPU fallback.
@@ -4694,10 +5716,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 ctx.gpu_method.process_weights_after_loading(ctx.gpu_layer)
 
             t_compute = time.perf_counter()
+            self._kt_trace(trace_id, trace_started_ns, "full_gpu_apply_start")
             result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             compute_time = (time.perf_counter() - t_compute) * 1000.0
+            self._kt_trace(
+                trace_id,
+                trace_started_ns,
+                "full_gpu_apply_end",
+                duration_ms=f"{compute_time:.3f}",
+            )
 
             # Dynamic expert update: analyze batch and update GPU experts.
             # MUST run BEFORE _restore_raw_attrs() because on Ampere FP8 the
@@ -4709,7 +5736,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # not fall through to the INT4 helper.
             _quant_skip_dyn_update = getattr(ctx, "_is_mxfp8_quant", False)
             if (
-                self.kt_config.kt_enable_dynamic_expert_update
+                (
+                    self.kt_config.kt_enable_dynamic_expert_update
+                    or self._gec_enabled
+                )
                 and not _quant_skip_dyn_update
             ):
                 t_update = time.perf_counter()
@@ -4718,8 +5748,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     ctx=ctx,
                     dispatch_output=dispatch_output,
                 )
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
                 update_time = (time.perf_counter() - t_update) * 1000.0
 
                 if self.tp_rank == 0:
@@ -4729,6 +5757,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         compute_time,
                         update_time,
                     )
+                    if (
+                        self._gec_planner is not None
+                        and self._gec_planner.rounds % 16 == 0
+                    ):
+                        logger.debug("[kt-gec-telemetry] %s", self._gec_planner.summary())
             else:
                 if self.tp_rank == 0:
                     logger.info(
@@ -4742,6 +5775,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if _needs_repack:
                 ctx._restore_raw_attrs()
 
+            self._kt_trace(trace_id, trace_started_ns, "apply_exit", path="full_gpu")
             return result
 
         # Hybrid execution needs explicit logical ids for the CPU kernel and
@@ -4752,10 +5786,99 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if topk_output is not dispatch_output.topk_output:
             dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
+        # GEC must update the resident set before the CPU task is submitted.
+        # The CPU wrapper keeps a pointer to its mask; submitting first creates
+        # a race in which a newly admitted H2D expert can also enter CPU GEMM.
+        gec_stream_plan = None
+        if (
+            _gec_persistent_mxfp4
+            and bool(get_forward().is_extend_in_batch)
+        ) or (
+            self._gec_enabled
+            and bool(get_forward().is_extend_in_batch)
+            and any(
+                tag in (self.kt_config.method or "").upper()
+                for tag in ("BF16", "FP8", "MXFP8")
+            )
+        ):
+            self._gec_h2d_before_compute = True
+            self._kt_trace(trace_id, trace_started_ns, "gec_update_start")
+            gec_context = self._build_gec_cpu_context(layer)
+            gec_stream_plan = self._update_gpu_experts_from_batch(
+                layer=layer,
+                ctx=gec_context,
+                dispatch_output=dispatch_output,
+                # Every GEC format uses device-local H2D events to stream
+                # batches into the compute path. batch_size=1 gives the
+                # requested one-Expert-at-a-time behavior.
+                stream_batches=bool(self._gec_enabled),
+                trace_id=trace_id,
+                trace_started_ns=trace_started_ns,
+            )
+            self._kt_trace(
+                trace_id,
+                trace_started_ns,
+                "gec_update_end",
+                resident_groups=len(gec_stream_plan.get("resident_ids", []))
+                if gec_stream_plan
+                else 0,
+                h2d_batches=len(gec_stream_plan.get("batch_ids", []))
+                if gec_stream_plan
+                else 0,
+            )
+            if self._gec_cuda_pipeline is not None:
+                self._gec_cuda_pipeline.begin_compute()
+
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
-        if self.tp_rank == 0 and self._cpu_stream is not None:
+        self._cpu_forward_submitted = False
+        cpu_topk_ids = mask_gpu_expert_ids_for_cpu(
+            topk_output.topk_ids, self.gpu_experts_mask_cuda
+        )
+        capture_active = (
+            x.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        )
+        _kt_route_count_sync_ms = 0.0
+        _kt_route_count_device = str(cpu_topk_ids.device)
+        if capture_active:
+            # CUDA Graph capture cannot materialize a device predicate with
+            # .item(). Keep the existing graph-safe submit/sync path; the CPU
+            # kernel skips -1 routes even when this batch has no fallback.
+            has_cpu_fallback = True
+        else:
+            _kt_route_count_sync_start_ns = time.perf_counter_ns()
+            if cpu_topk_ids.device.type == "cuda":
+                self._kt_trace(
+                    trace_id,
+                    trace_started_ns,
+                    "cuda_scalar_sync_start",
+                    tensor_device=_kt_route_count_device,
+                    tensor_shape=tuple(cpu_topk_ids.shape),
+                )
+            _kt_cpu_route_count = int((cpu_topk_ids >= 0).sum().item())
+            _kt_route_count_sync_ms = (
+                time.perf_counter_ns() - _kt_route_count_sync_start_ns
+            ) / 1e6
+            if cpu_topk_ids.device.type == "cuda":
+                self._kt_trace(
+                    trace_id,
+                    trace_started_ns,
+                    "cuda_scalar_sync_end",
+                    duration_ms=f"{_kt_route_count_sync_ms:.3f}",
+                    cpu_routes=_kt_cpu_route_count,
+                )
+            has_cpu_fallback = _kt_cpu_route_count > 0
+        self._kt_trace(
+            trace_id,
+            trace_started_ns,
+            "cpu_route_classified",
+            has_cpu_fallback=has_cpu_fallback,
+            cpu_routes=_kt_cpu_route_count,
+            route_count_sync_ms=f"{_kt_route_count_sync_ms:.3f}",
+            tensor_device=_kt_route_count_device,
+        )
+        if self.tp_rank == 0 and self._cpu_stream is not None and has_cpu_fallback:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
@@ -4772,8 +5895,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
-                self._submit_with_staged_input(
+                self._kt_trace(trace_id, trace_started_ns, "cpu_submit_start")
+                self._cpu_forward_submitted = self._submit_with_staged_input(
                     layer, dispatch_output, staging_buffer
+                )
+                self._kt_trace(
+                    trace_id,
+                    trace_started_ns,
+                    "cpu_submit_end",
+                    submitted=self._cpu_forward_submitted,
                 )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
@@ -4792,6 +5922,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         masked_dispatch_output = dispatch_output._replace(
             topk_output=masked_topk_output
         )
+        self._kt_trace(trace_id, trace_started_ns, "gpu_mask_ready")
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -4831,27 +5962,117 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
             gpu_combine_input = None
             output = torch.zeros_like(x)
+            gec_lease = None
         else:
-            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
-            output = gpu_combine_input.hidden_states
+            gec_lease = None
+            if self._gec_planner is not None:
+                # Hold the currently resident logical rows until the GPU
+                # kernel's stream event completes.  The planner drains these
+                # leases before an eviction decision on a later round.
+                resident_ids = self.gpu_index_to_logical.tolist()
+                if gec_stream_plan is None:
+                    for dependency in self._gec_planner.dependencies_for(resident_ids):
+                        torch.cuda.current_stream(x.device).wait_event(dependency)
+                gec_lease = self._gec_planner.begin_gpu_use(resident_ids)
+            try:
+                self._kt_trace(
+                    trace_id,
+                    trace_started_ns,
+                    "gpu_compute_start",
+                    resident_groups=len(gec_stream_plan.get("resident_ids", []))
+                    if gec_stream_plan
+                    else 0,
+                    h2d_groups=len(gec_stream_plan.get("batch_ids", []))
+                    if gec_stream_plan
+                    else 0,
+                )
+                if gec_stream_plan is None:
+                    gpu_combine_input = self.gpu_method.apply(
+                        layer, masked_dispatch_output
+                    )
+                    output = gpu_combine_input.hidden_states
+                else:
+                    output = torch.zeros_like(x)
+                    stream_groups = [gec_stream_plan["resident_ids"]]
+                    stream_groups.extend(gec_stream_plan["batch_ids"])
+                    stream_events = [None]
+                    stream_events.extend(gec_stream_plan["batch_events"])
+                    for group_index, group_ids in enumerate(stream_groups):
+                        if group_index > 0 and stream_events[group_index] is not None:
+                            torch.cuda.current_stream(x.device).wait_event(
+                                stream_events[group_index]
+                            )
+                        if group_index == 0 and self._gec_planner is not None:
+                            for dependency in self._gec_planner.dependencies_for(group_ids):
+                                torch.cuda.current_stream(x.device).wait_event(
+                                    dependency
+                                )
+                        group_mask = torch.zeros(
+                            self.global_num_experts,
+                            dtype=torch.bool,
+                            device=topk_ids.device,
+                        )
+                        if group_ids:
+                            group_mask[torch.tensor(
+                                group_ids,
+                                dtype=torch.long,
+                                device=topk_ids.device,
+                            )] = True
+                        group_topk_ids = mask_topk_ids_for_expert_group(
+                            topk_ids, group_mask
+                        )
+                        group_gpu_ids = mask_and_remap_expert_ids(
+                            group_topk_ids,
+                            self.gpu_experts_mask_cuda,
+                            self.logical_to_gpu_index_cuda,
+                        )
+                        group_dispatch = dispatch_output._replace(
+                            topk_output=topk_output._replace(topk_ids=group_gpu_ids)
+                        )
+                        group_output = self.gpu_method.apply(layer, group_dispatch)
+                        output = output + group_output.hidden_states
+                self._kt_trace(trace_id, trace_started_ns, "gpu_compute_end")
+            except Exception:
+                if self._gec_h2d_before_compute and self._gec_cuda_pipeline is not None:
+                    self._gec_cuda_pipeline.complete_compute(torch.cuda.current_stream(x.device))
+                self._gec_h2d_before_compute = False
+                if gec_lease is not None:
+                    gec_lease.release()
+                raise
+            if self._gec_h2d_before_compute and self._gec_cuda_pipeline is not None:
+                self._gec_cuda_pipeline.complete_compute(torch.cuda.current_stream(x.device))
+            self._gec_h2d_before_compute = False
+            if gec_lease is not None:
+                gec_lease.record(torch.cuda.current_stream(x.device))
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
             _kt_t_after_gpu = time.perf_counter()
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
-        if self.tp_rank == 0 and self._cpu_stream is not None:
+        if (
+            self.tp_rank == 0
+            and self._cpu_stream is not None
+            and self._cpu_forward_submitted
+        ):
             _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
             from contextlib import nullcontext as _ctx_null
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
                 # Use staging_buffer for sync to get correct buffer reference
+                self._kt_trace(trace_id, trace_started_ns, "cpu_sync_start")
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
+                _gec_cpu_sync_start = time.perf_counter_ns()
                 cpu_output = self._sync_with_staged_input(staging_buffer)
+                if self._gec_planner is not None:
+                    self._gec_planner.record_cpu_fallback(
+                        (time.perf_counter_ns() - _gec_cpu_sync_start) // 1000
+                    )
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
                 if not _no_cpu_stream:
                     self._sync_done_event.record(self._cpu_stream)
+                self._kt_trace(trace_id, trace_started_ns, "cpu_sync_end")
             if _kt_timing:
                 _kt_t_after_sync = time.perf_counter()
 
@@ -4859,6 +6080,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             output = output + cpu_output
+            self._kt_trace(trace_id, trace_started_ns, "merge_end")
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU
@@ -4894,12 +6116,111 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 logger.debug(
                     "[kt-time] layer=%s step=%d total=%.2fms submit=%.2f "
                     "mask=%.2f gpu=%.2f sync=%.2f merge=%.2f "
-                    "cpu_wait=%.2fms num_tokens=%d",
+                    "cpu_wait=%.2fms cpu_routes=%d submitted=%s num_tokens=%d",
                     _li, _step, _kt_total_ms, _stage_submit_ms,
                     _stage_mask_ms, _stage_gpu_ms, _stage_sync_ms,
-                    _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
+                    _stage_merge_ms, _kt_t_cpu_wait_ms, _kt_cpu_route_count,
+                    self._cpu_forward_submitted, num_tokens,
                 )
+        self._kt_trace(trace_id, trace_started_ns, "apply_exit", path="hybrid")
         return StandardCombineInput(hidden_states=output)
+
+    def _select_experts_with_gec(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        """GEC residency plan for this round.
+
+        The C++ Global Expert Cache decides: routed residents are refreshed,
+        routed misses go through the candidate filter / priority / Top-N chain
+        and are admitted within the per-round budget (LRU eviction with
+        probation frees their rows). With a model coordinator, the same
+        decision also rebalances physical rows across layers.
+        """
+        flat_ids = topk_ids.flatten()
+        valid_mask = (flat_ids >= 0) & (flat_ids < self.global_num_experts)
+        valid_ids = flat_ids[valid_mask]
+        counts = torch.zeros(
+            self.global_num_experts, dtype=torch.int64, device=topk_ids.device
+        )
+        if valid_ids.numel() > 0:
+            counts.index_add_(0, valid_ids, torch.ones_like(valid_ids))
+        selected = self._gec_planner.plan(counts.tolist())
+        return torch.tensor(selected, dtype=torch.int64, device=topk_ids.device)
+
+    def _copy_selected_expert_weights(
+        self,
+        ctx: "SharedFullContext",
+        layer: torch.nn.Module,
+        selected_experts: torch.Tensor,
+        mxfp4_raw_source: Optional[Dict[str, torch.Tensor]],
+        dst_rows: Optional[torch.Tensor] = None,
+        prefer_cpu_h2d: bool = False,
+    ) -> None:
+        """Copy one batch of selected experts into the given resident rows.
+
+        ``selected_experts[k]`` (logical id) is written to GPU row
+        ``dst_rows[k]``. Dispatches on the quant format exactly like the
+        legacy path did. MXFP4 rebuilds its Marlin image after the raw row
+        update, but the raw transfer can still be limited to new rows.
+        """
+        if dst_rows is None:
+            raise ValueError("dst_rows is required for batched expert copies")
+        if prefer_cpu_h2d:
+            if ctx.copy_selected_cpu_weights(
+                self.wrapper,
+                [int(item) for item in selected_experts.detach().cpu().tolist()],
+                layer,
+                dst_rows,
+            ):
+                return
+            raise RuntimeError(
+                "GEC selected-row CPU copy is unavailable; refusing full-shadow fallback."
+            )
+        if ctx._is_mxfp4_quant:
+            copy_experts_weights_mxfp4(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+                raw_source=mxfp4_raw_source,
+                dst_rows=dst_rows,
+            )
+            return
+        if ctx._is_fp8_quant:
+            # Ampere Marlin vs native FP8 block quant: Marlin repack renames
+            # w13_weight_scale_inv → w13_weight_scale and changes w13_weight
+            # dtype fp8→int32.  Use gpu_method class name (invariant) to pick
+            # the right attribute-name list.
+            if ctx.gpu_method.__class__.__name__.endswith("MarlinMoEMethod"):
+                copy_experts_weights_fp8_channel(
+                    src_layer=ctx.gpu_layer, dst_layer=layer,
+                    selected_experts=selected_experts,
+                    dst_rows=dst_rows,
+                )
+            else:
+                copy_experts_weights_fp8(
+                    src_layer=ctx.gpu_layer, dst_layer=layer,
+                    selected_experts=selected_experts,
+                    dst_rows=dst_rows,
+                )
+        elif ctx._is_fp8_channel_quant:
+            copy_experts_weights_fp8_channel(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+                dst_rows=dst_rows,
+            )
+        elif ctx._is_bf16_quant:
+            copy_experts_weights_bf16(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+                dst_rows=dst_rows,
+            )
+        else:
+            copy_experts_weights_int4(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+                dst_rows=dst_rows,
+            )
 
     def _update_gpu_experts_from_batch(
         self,
@@ -4907,13 +6228,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ctx: "SharedFullContext",
         dispatch_output: "StandardDispatchOutput",
         mxfp4_raw_source: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> None:
+        stream_batches: bool = False,
+        trace_id: int = 0,
+        trace_started_ns: int = 0,
+    ) -> Optional[Dict[str, object]]:
         """Update original layer's GPU experts based on current batch statistics.
 
         This method:
         1. Analyzes topk_ids to find most frequently activated experts
-        2. Copies selected expert weights from ctx.gpu_layer to layer
-           (canonical packed MXFP4 raw tensors on the MXFP4 path)
+        2. Copies selected expert weights into resident rows.  Native BF16/FP8
+           GEC updates use the pinned CPU buffers and a device-local H2D stream;
+           repacked formats use the temporary full-shadow staging path.
         3. Updates all mapping tables (gpu_experts_mask, logical_to_gpu_index, etc.)
         4. Broadcasts changes across TP ranks for consistency
 
@@ -4922,11 +6247,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             ctx: SharedFullContext containing temporary full GPU layer
             dispatch_output: Current batch dispatch output with routing information
         """
-        # Step 1: Select top experts (rank 0 computes, broadcasts to all ranks)
+        # Step 1: Select top experts on TP0.  The coordinator also computes a
+        # complete cross-layer physical layout there; broadcasting only the
+        # selected ids is insufficient because donor/target capacities may
+        # change between rounds.
         topk_ids = dispatch_output.topk_output.topk_ids
         device = topk_ids.device
+        stream_batch_events = []
+        stream_batch_ids = []
 
-        if self.tp_rank == 0:
+        if self._gec_enabled:
+            if self.tp_rank == 0:
+                selected_experts = self._select_experts_with_gec(topk_ids)
+            else:
+                selected_experts = torch.empty(
+                    0, dtype=torch.int64, device=device
+                )
+        elif self.tp_rank == 0:
             selected_experts = select_top_experts_from_batch(
                 topk_ids=topk_ids,
                 num_experts=self.global_num_experts,
@@ -4938,64 +6275,295 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 self.num_gpu_experts, dtype=torch.int64, device=device
             )
 
-        # Broadcast selected experts to all ranks for consistent weight updates
+        self._kt_trace(
+            trace_id,
+            trace_started_ns,
+            "gec_router_selected",
+            selected_count=int(selected_experts.numel()),
+            stream_batches=stream_batches,
+        )
+
+        # Broadcast selected experts to all ranks for consistent weight updates.
+        # Object broadcast deliberately supports a capacity change in the same
+        # round; a tensor broadcast would require all ranks to know the new
+        # row count before the migration plan arrives.
         if dist.is_initialized():
-            dist.broadcast(
-                selected_experts,
-                src=get_tp_group().first_rank,
-                group=get_tp_group().device_group,
+            payload = (
+                selected_experts.detach().cpu().tolist()
+                if self.tp_rank == 0
+                else None
             )
+            object_list = [payload]
+            dist.broadcast_object_list(
+                object_list,
+                src=get_tp_group().first_rank,
+                group=get_tp_group().cpu_group,
+            )
+            selected_experts = torch.tensor(
+                object_list[0], dtype=torch.int64, device=device
+            )
+            self._kt_trace(
+                trace_id,
+                trace_started_ns,
+                "gec_selected_broadcast",
+                selected_count=int(selected_experts.numel()),
+            )
+
+        coordinator = getattr(self.kt_config, "kt_gec_coordinator", None)
+        if self._gec_enabled and coordinator is not None:
+            layout = coordinator.export_layout() if self.tp_rank == 0 else None
+            layout_list = [layout]
+            if dist.is_initialized():
+                dist.broadcast_object_list(
+                    layout_list,
+                    src=get_tp_group().first_rank,
+                    group=get_tp_group().cpu_group,
+                )
+            if layout_list[0] is not None:
+                coordinator.apply_layout(layout_list[0])
+                self._kt_trace(
+                    trace_id,
+                    trace_started_ns,
+                    "gec_layout_applied",
+                    layout_epoch=layout_list[0].get("epoch", -1),
+                )
+
+        selected_cpu = selected_experts.cpu()
 
         # Step 2: Copy selected expert weights from ctx.gpu_layer to layer.
         # Both are already in inference format: apply() already called
         # process_weights_after_loading() which handles Marlin repack.
-        if ctx._is_mxfp4_quant:
-            copy_experts_weights_mxfp4(
-                src_layer=ctx.gpu_layer,
-                dst_layer=layer,
-                selected_experts=selected_experts,
-                raw_source=mxfp4_raw_source,
+        #
+        # GEC path: stable row assignment (doc/KT-CPU-PICE-GPU.md section 13).
+        # Rows keep their resident expert across rounds; only newly admitted
+        # experts are copied into the rows freed by evicted ones, and a round
+        # whose resident set is unchanged is skipped entirely. Every rank
+        # derives the identical assignment from the broadcast resident set.
+        # The legacy frequency path keeps re-copying the full selected set
+        # into rows 0..N-1 each round.
+        if (
+            self._resident_row_owner is not None
+            and len(self._resident_row_owner) == len(selected_cpu)
+        ):
+            from sglang.srt.layers.moe.kt_gec import plan_stable_row_update
+
+            arrived, freed_rows, row_owner = plan_stable_row_update(
+                self._resident_row_owner, selected_cpu
             )
-        elif ctx._is_fp8_quant:
-            # Ampere Marlin vs native FP8 block quant: Marlin repack renames
-            # w13_weight_scale_inv → w13_weight_scale and changes w13_weight
-            # dtype fp8→int32.  Use gpu_method class name (invariant) to pick
-            # the right attribute-name list.
-            if ctx.gpu_method.__class__.__name__.endswith("MarlinMoEMethod"):
-                copy_experts_weights_fp8_channel(
-                    src_layer=ctx.gpu_layer, dst_layer=layer,
-                    selected_experts=selected_experts,
-                )
-            else:
-                copy_experts_weights_fp8(
-                    src_layer=ctx.gpu_layer, dst_layer=layer,
-                    selected_experts=selected_experts,
-                )
-        elif ctx._is_fp8_channel_quant:
-            copy_experts_weights_fp8_channel(
-                src_layer=ctx.gpu_layer,
-                dst_layer=layer,
-                selected_experts=selected_experts,
-            )
-        elif ctx._is_bf16_quant:
-            copy_experts_weights_bf16(
-                src_layer=ctx.gpu_layer,
-                dst_layer=layer,
-                selected_experts=selected_experts,
-            )
+            if arrived.numel() == 0:
+                if self.tp_rank == 0:
+                    logger.debug(
+                        "KT dynamic update: layer %d resident set unchanged, "
+                        "skipping copies",
+                        self.kt_config.layer_idx,
+                    )
+                if stream_batches:
+                    return {
+                        "resident_ids": self.gpu_index_to_logical.tolist(),
+                        "batch_ids": [],
+                        "batch_events": [],
+                    }
+                return None
         else:
-            copy_experts_weights_int4(
-                src_layer=ctx.gpu_layer,
-                dst_layer=layer,
-                selected_experts=selected_experts,
+            # Cross-layer rebalancing changed this layer's physical row
+            # count. The resize callback preserved rows that remained local;
+            # refill the new target set deterministically in row order.
+            arrived = selected_cpu
+            freed_rows = torch.arange(len(selected_cpu), dtype=torch.int64)
+            row_owner = selected_cpu
+
+        self._kt_trace(
+            trace_id,
+            trace_started_ns,
+            "gec_row_diff",
+            arrived=int(arrived.numel()),
+            resident_rows=int(row_owner.numel()),
+        )
+
+        # kt-layer-h2d-batch-size chunks the H2D copies: a batch is
+        # min(available, batch_size) and never waits to be filled (doc
+        # section 5.4). GEC streaming consumes each batch as soon as its H2D
+        # event is ready; with batch_size=1 this is one Expert H2D -> one GPU
+        # GEMM. MXFP4 GEC repacks only the newly admitted rows, so it uses the
+        # same bounded batches as the other native formats.
+        pending_h2d_ids = []
+        _batched_copy_ok = not getattr(ctx, "_is_mxfp4_quant", False) or (
+            self._gec_enabled
+        )
+        if _batched_copy_ok:
+            configured_batch = getattr(self.kt_config, "kt_layer_h2d_batch_size", None)
+            # An unset batch size preserves the low-launch-overhead path: all
+            # newly admitted experts in this round share one H2D/GPU group.
+            # Explicit ``--kt-layer-h2d-batch-size=1`` opts into the
+            # one-Expert-at-a-time latency mode.
+            copy_batch = (
+                len(arrived)
+                if configured_batch is None
+                else max(1, int(configured_batch))
             )
+            arrived_cuda = arrived.to(device)
+            freed_rows_cuda = freed_rows.to(device)
+            gec_pipeline = None
+            if self._gec_enabled and torch.cuda.is_available():
+                from sglang.srt.layers.moe.kt_gec import GecCudaPipeline
+
+                if (
+                    self._gec_cuda_pipeline is None
+                    or self._gec_cuda_pipeline.device != torch.device(device)
+                ):
+                    self._gec_cuda_pipeline = GecCudaPipeline(
+                        torch.device(device),
+                        depth=max(
+                            1,
+                            getattr(self._gec_planner, "buffer_pool_depth", 1),
+                        ),
+                    )
+                gec_pipeline = self._gec_cuda_pipeline
+            for _start in range(0, len(arrived), copy_batch):
+                _t_copy = (
+                    time.perf_counter() if self._gec_planner is not None else None
+                )
+                selected_batch = arrived_cuda[_start : _start + copy_batch]
+                destination_batch = freed_rows_cuda[_start : _start + copy_batch]
+                batch_ids = arrived[_start : _start + copy_batch].tolist()
+                self._kt_trace(
+                    trace_id,
+                    trace_started_ns,
+                    "h2d_batch_prepare",
+                    batch_index=_start // copy_batch,
+                    experts=len(batch_ids),
+                    first_expert=batch_ids[0] if batch_ids else -1,
+                )
+                if self._gec_planner is not None:
+                    new_batch_ids, _ = self._gec_planner.reserve_h2d(batch_ids)
+                    if not new_batch_ids:
+                        continue
+                    new_batch_set = set(new_batch_ids)
+                    new_positions = [
+                        index
+                        for index, expert_id in enumerate(batch_ids)
+                        if int(expert_id) in new_batch_set
+                    ]
+                    position_index = torch.tensor(
+                        new_positions, dtype=torch.long, device=device
+                    )
+                    selected_batch = selected_batch.index_select(0, position_index)
+                    destination_batch = destination_batch.index_select(
+                        0, position_index
+                    )
+                    batch_ids = new_batch_ids
+
+                def _copy_batch(
+                    selected_batch=selected_batch,
+                    destination_batch=destination_batch,
+                    batch_ids=batch_ids,
+                ):
+                    try:
+                        self._copy_selected_expert_weights(
+                            ctx=ctx,
+                            layer=layer,
+                            selected_experts=selected_batch,
+                            mxfp4_raw_source=mxfp4_raw_source,
+                            dst_rows=destination_batch,
+                            prefer_cpu_h2d=self._gec_enabled,
+                        )
+                    except Exception:
+                        if self._gec_planner is not None:
+                            self._gec_planner.abort_h2d(batch_ids)
+                        raise
+
+                if gec_pipeline is not None:
+                    # Streaming callers wait on each event immediately before
+                    # that batch's GPU GEMM; the legacy path keeps the old
+                    # current-stream dependency for one full-layer GEMM.
+                    event = gec_pipeline.submit(
+                        _copy_batch,
+                        wait_on_current=not stream_batches,
+                    )
+                else:
+                    _copy_batch()
+                    event = None
+                self._kt_trace(
+                    trace_id,
+                    trace_started_ns,
+                    "h2d_batch_submitted",
+                    batch_index=_start // copy_batch,
+                    experts=len(batch_ids),
+                    event=event is not None,
+                    queue_us=gec_pipeline.last_queue_us if gec_pipeline is not None else 0,
+                )
+                if stream_batches:
+                    stream_batch_events.append(event)
+                    stream_batch_ids.append(list(batch_ids))
+                pending_h2d_ids.extend(
+                    batch_ids
+                )
+                if self._gec_planner is not None:
+                    queue_us = (
+                        gec_pipeline.last_queue_us if gec_pipeline is not None else 0
+                    )
+                    event_wait_us = (
+                        gec_pipeline.last_event_wait_us
+                        if gec_pipeline is not None
+                        else 0
+                    )
+                    self._gec_planner.record_copy(
+                        len(batch_ids),
+                        int((time.perf_counter() - _t_copy) * 1e6),
+                        queue_us=queue_us,
+                        event_wait_us=event_wait_us,
+                    )
+        else:
+            _t_copy = (
+                time.perf_counter() if self._gec_planner is not None else None
+            )
+            copy_ids = arrived.tolist()
+            copy_experts = row_owner.to(device)
+            copy_rows = None
+            if self._gec_planner is not None:
+                new_ids, _ = self._gec_planner.reserve_h2d(copy_ids)
+                if new_ids:
+                    new_id_set = set(new_ids)
+                    new_positions = [
+                        index
+                        for index, expert_id in enumerate(copy_ids)
+                        if int(expert_id) in new_id_set
+                    ]
+                    position_index = torch.tensor(
+                        new_positions, dtype=torch.long, device=device
+                    )
+                    copy_experts = arrived.to(device).index_select(0, position_index)
+                    copy_rows = freed_rows.to(device).index_select(0, position_index)
+                    copy_ids = new_ids
+                else:
+                    copy_ids = []
+            if copy_ids:
+                try:
+                    self._copy_selected_expert_weights(
+                        ctx=ctx,
+                        layer=layer,
+                        selected_experts=copy_experts,
+                        mxfp4_raw_source=mxfp4_raw_source,
+                        dst_rows=copy_rows,
+                    )
+                except Exception:
+                    if self._gec_planner is not None:
+                        self._gec_planner.abort_h2d(copy_ids)
+                    raise
+                if self._gec_planner is not None:
+                    self._gec_planner.record_copy(
+                        len(copy_ids), int((time.perf_counter() - _t_copy) * 1e6)
+                    )
+                pending_h2d_ids.extend(copy_ids)
+                if stream_batches and copy_ids:
+                    stream_batch_events.append(None)
+                    stream_batch_ids.append(list(copy_ids))
 
         # Step 3: Update mapping tables
-        gpu_experts_mask_cpu, logical_to_gpu_index_cuda, gpu_index_to_logical_cpu = (
+        gpu_experts_mask_cpu, logical_to_gpu_index_cpu, gpu_index_to_logical_cpu = (
             update_gpu_expert_mappings(
-                selected_experts=selected_experts,
+                selected_experts=row_owner,
                 num_experts=self.global_num_experts,
-                device=device,
             )
         )
 
@@ -5005,21 +6573,74 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # in-place rather than replacing the tensor reference
         self.gpu_experts_mask = gpu_experts_mask_cpu  # CPU tensor, safe to replace
         self.gpu_experts_mask_cuda.copy_(gpu_experts_mask_cpu)  # In-place update for CUDA graph
-        self.logical_to_gpu_index = logical_to_gpu_index_cuda.cpu()  # CPU version for weight loading
-        self.logical_to_gpu_index_cuda.copy_(logical_to_gpu_index_cuda)  # In-place update for CUDA graph
+        self.logical_to_gpu_index = logical_to_gpu_index_cpu  # CPU version for weight loading
+        self.logical_to_gpu_index_cuda.copy_(logical_to_gpu_index_cpu)  # In-place update for CUDA graph
         self.gpu_index_to_logical = gpu_index_to_logical_cpu  # CPU tensor, safe to replace
+        if self._resident_row_owner is not None:
+            self._resident_row_owner = row_owner
 
         # Step 4: Update KT wrapper (rank 0 only)
         if self.tp_rank == 0:
             update_kt_wrapper_masks(self.wrapper, gpu_experts_mask_cpu)
+        self._kt_trace(
+            trace_id,
+            trace_started_ns,
+            "gec_mapping_updated",
+            resident_rows=int(row_owner.numel()),
+            pending_h2d=len(pending_h2d_ids),
+        )
 
         # Log expert changes (rank 0 only)
         if self.tp_rank == 0:
             logger.debug(
                 "KT dynamic update: layer %d updated GPU experts to: %s",
                 self.kt_config.layer_idx,
-                selected_experts.cpu().tolist(),
+                row_owner.tolist(),
             )
+
+        # Publish READY only after the H2D copy and mapping writes have been
+        # enqueued on the device. The event is the physical-shard dependency
+        # consumed by the next planner round.
+        if self._gec_planner is not None and pending_h2d_ids:
+            ready_event = None
+            if torch.cuda.is_available():
+                if stream_batches and stream_batch_events:
+                    ready_event = next(
+                        (
+                            event
+                            for event in reversed(stream_batch_events)
+                            if event is not None
+                        ),
+                        None,
+                    )
+                if ready_event is None:
+                    ready_event = torch.cuda.Event(enable_timing=False)
+                    ready_event.record(torch.cuda.current_stream(device))
+            self._gec_planner.track_h2d(pending_h2d_ids, ready_event)
+            self._kt_trace(
+                trace_id,
+                trace_started_ns,
+                "h2d_dependencies_published",
+                experts=len(pending_h2d_ids),
+                event=ready_event is not None,
+            )
+        if (
+            self._gec_cuda_pipeline is not None
+            and not self._gec_h2d_before_compute
+        ):
+            self._gec_cuda_pipeline.release_ready()
+        if stream_batches:
+            copied = {int(item) for group in stream_batch_ids for item in group}
+            return {
+                "resident_ids": [
+                    int(item)
+                    for item in row_owner.tolist()
+                    if int(item) not in copied
+                ],
+                "batch_ids": stream_batch_ids,
+                "batch_events": stream_batch_events,
+            }
+        return None
 
     def __getattr__(self, name: str):
         """Delegate attribute access to the wrapped GPU method.
@@ -5060,3 +6681,78 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
+
+    def _build_gec_cpu_context(self, layer: torch.nn.Module) -> "SharedFullContext":
+        """Create only the pinned CPU staging context for native GEC H2D.
+
+        The full shadow layer is intentionally not loaded here.  Selected
+        experts are materialized directly from the CPU buffers into resident
+        rows by ``copy_selected_cpu_weights``.
+        """
+        global _SHARED_GEC_CPU_CONTEXT
+        if _SHARED_GEC_CPU_CONTEXT is None:
+            _SHARED_GEC_CPU_CONTEXT = SharedFullContext(
+                layer=layer,
+                init_args=self._full_init_args,
+                # GEC uses the context only for per-expert CPU staging. Keep
+                # its GPU-side shape bounded by this layer's resident rows;
+                # legacy full-GPU paths use _build_full_context separately.
+                global_num_experts=max(1, self.num_gpu_experts),
+                moe_runner_config=self.moe_runner_config,
+                cpu_buffer_depth=max(
+                    2, int(getattr(self.kt_config, "kt_layer_h2d_batch_size", 2) or 2)
+                ),
+            )
+        return _SHARED_GEC_CPU_CONTEXT
+
+    def _build_compact_temporary_context(
+        self, layer: torch.nn.Module, expert_ids: List[int]
+    ) -> "SharedFullContext":
+        """Build a temporary quant layer with exactly the selected experts.
+
+        Its rows are compact (0..N-1); the source ids remain logical ids used
+        only when reading CPU weights.  No full-model shadow layer or GEC row
+        is allocated by this path.
+        """
+        if not expert_ids:
+            raise ValueError("compact temporary context requires experts")
+        _poll_deferred_temp_contexts()
+        return SharedFullContext(
+            layer=layer,
+            init_args=self._full_init_args,
+            global_num_experts=len(expert_ids),
+            moe_runner_config=self.moe_runner_config,
+        )
+
+    def _run_gec_compact_temporary_gemm(
+        self, layer: torch.nn.Module, dispatch_output
+    ):
+        """Run GEC MISS experts without Persistent rows or full shadow rows."""
+        active_experts = sorted(
+            {
+                int(item)
+                for item in dispatch_output.topk_output.topk_ids.detach()
+                .cpu()
+                .flatten()
+                .tolist()
+                if 0 <= int(item) < self.global_num_experts
+            }
+        )
+        if not active_experts:
+            return None
+        ctx = self._build_compact_temporary_context(layer, active_experts)
+        ctx.initialize_cpu_buffers()
+        ctx.load_selected_temporary_weights(self.wrapper, active_experts)
+        ctx._router_num_experts = self.global_num_experts
+        try:
+            return ctx.apply_selected_temporary_gemm(
+                dispatch_output, active_experts
+            )
+        finally:
+            ctx.restore_temporary_weights()
+            temp_stream = (
+                torch.cuda.current_stream(layer.w13_weight.device)
+                if torch.cuda.is_available()
+                else None
+            )
+            ctx.defer_close_temporary(temp_stream)

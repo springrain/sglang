@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -240,6 +241,97 @@ logger = logging.getLogger(__name__)
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
+
+
+def _kt_layer0_trace_start(forward_batch: ForwardBatch, layer_id: int, phase: str):
+    """Start a low-overhead layer-0 diagnostic span in debug mode."""
+    if layer_id != 0 or not logger.isEnabledFor(logging.DEBUG):
+        return None
+    started_ns = time.perf_counter_ns()
+    event = None
+    stream_id = "cpu"
+    capture_active = False
+    positions = getattr(forward_batch, "positions", None)
+    if (
+        torch.cuda.is_available()
+        and torch.is_tensor(positions)
+        and positions.device.type == "cuda"
+    ):
+        try:
+            stream = torch.cuda.current_stream()
+            stream_id = getattr(stream, "cuda_stream", "unknown")
+            capture_active = torch.cuda.is_current_stream_capturing()
+            if not capture_active:
+                event = torch.cuda.Event(enable_timing=True)
+                event.record(stream)
+        except Exception:
+            event = None
+    logger.debug(
+        "[kt-layer0] mono_ms=%.3f phase=%s_start pass=%s mode=%s tokens=%s "
+        "stream=%s capture=%s",
+        started_ns / 1e6,
+        phase,
+        getattr(forward_batch, "_kt_debug_pass_id", -1),
+        getattr(forward_batch, "forward_mode", "unknown"),
+        getattr(forward_batch, "_forward_num_tokens", lambda: -1)(),
+        stream_id,
+        capture_active,
+    )
+    return started_ns, event, stream_id
+
+
+def _kt_layer0_trace_end(
+    forward_batch: ForwardBatch, layer_id: int, phase: str, state
+) -> None:
+    if state is None:
+        return
+    started_ns, start_event, stream_id = state
+    cuda_ms = None
+    if start_event is not None:
+        try:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(torch.cuda.current_stream())
+            if end_event.query():
+                cuda_ms = start_event.elapsed_time(end_event)
+        except Exception:
+            pass
+    logger.debug(
+        "[kt-layer0] mono_ms=%.3f phase=%s_end pass=%s wall_ms=%.3f "
+        "cuda_ms=%s stream=%s",
+        time.perf_counter_ns() / 1e6,
+        phase,
+        getattr(forward_batch, "_kt_debug_pass_id", -1),
+        (time.perf_counter_ns() - started_ns) / 1e6,
+        f"{cuda_ms:.3f}" if cuda_ms is not None else "na",
+        stream_id,
+    )
+
+
+def _kt_stream_wait_trace(
+    forward_batch: Optional[ForwardBatch], layer_id: int, phase: str, action
+) -> None:
+    if (
+        layer_id != 0
+        or forward_batch is None
+        or not logger.isEnabledFor(logging.DEBUG)
+    ):
+        action()
+        return
+    started_ns = time.perf_counter_ns()
+    logger.debug(
+        "[kt-stream] mono_ms=%.3f phase=%s_start pass=%s layer=0",
+        started_ns / 1e6,
+        phase,
+        getattr(forward_batch, "_kt_debug_pass_id", -1),
+    )
+    action()
+    logger.debug(
+        "[kt-stream] mono_ms=%.3f phase=%s_end pass=%s layer=0 enqueue_ms=%.3f",
+        time.perf_counter_ns() / 1e6,
+        phase,
+        getattr(forward_batch, "_kt_debug_pass_id", -1),
+        (time.perf_counter_ns() - started_ns) / 1e6,
+    )
 
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
@@ -1280,7 +1372,12 @@ class DeepseekV2MoE(nn.Module):
                         # the shared experts overlap nothing. The alt stream
                         # is kept for record_stream: without that marking the
                         # allocator recycles shared_output across the break.
-                        torch.cuda.current_stream().wait_event(shared_event)
+                        _kt_stream_wait_trace(
+                            forward_batch,
+                            self.layer_id,
+                            "shared_expert_event",
+                            lambda: torch.cuda.current_stream().wait_event(shared_event),
+                        )
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1466,7 +1563,12 @@ class DeepseekV2MoE(nn.Module):
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
         ):
-            torch.cuda.current_stream().wait_event(shared_event)
+            _kt_stream_wait_trace(
+                forward_batch,
+                self.layer_id,
+                "shared_expert_event",
+                lambda: torch.cuda.current_stream().wait_event(shared_event),
+            )
 
         if shared_output is not None:
             x = shared_output
@@ -2394,6 +2496,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             ),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
+        self.layer_communicator._context.kt_layer_id = layer_id
+        if getattr(self.layer_communicator, "_sp_variant", None) is not None:
+            self.layer_communicator._sp_variant._context.kt_layer_id = layer_id
 
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
@@ -2447,7 +2552,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
+        layer_trace_state = _kt_layer0_trace_start(
+            forward_batch, self.layer_id, "layer"
+        )
         hidden_states_orig = hidden_states
+        trace_state = _kt_layer0_trace_start(
+            forward_batch, self.layer_id, "comm_prepare_attn"
+        )
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -2457,7 +2568,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_format=self._resolve_gfx95_quant_format(),
             )
         )
+        _kt_layer0_trace_end(
+            forward_batch, self.layer_id, "comm_prepare_attn", trace_state
+        )
 
+        trace_state = _kt_layer0_trace_start(forward_batch, self.layer_id, "attention")
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 positions=positions,
@@ -2468,6 +2583,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 layer_scatter_modes=self.layer_scatter_modes,
                 prev_topk_indices=prev_topk_indices,
             )
+        _kt_layer0_trace_end(forward_batch, self.layer_id, "attention", trace_state)
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
@@ -2478,8 +2594,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
+        trace_state = _kt_layer0_trace_start(
+            forward_batch, self.layer_id, "comm_prepare_mlp"
+        )
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        _kt_layer0_trace_end(
+            forward_batch, self.layer_id, "comm_prepare_mlp", trace_state
         )
 
         fuse_mlp_allreduce = (
@@ -2512,20 +2634,33 @@ class DeepseekV2DecoderLayer(nn.Module):
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
+                trace_state = _kt_layer0_trace_start(
+                    forward_batch, self.layer_id, "mlp"
+                )
                 hidden_states = self.mlp(
                     hidden_states,
                     forward_batch,
                     gemm_output_zero_allocator,
                 )
+                _kt_layer0_trace_end(forward_batch, self.layer_id, "mlp", trace_state)
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
 
         if not fuse_mlp_allreduce:
+            trace_state = _kt_layer0_trace_start(
+                forward_batch, self.layer_id, "comm_postprocess"
+            )
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+            _kt_layer0_trace_end(
+                forward_batch, self.layer_id, "comm_postprocess", trace_state
+            )
 
+        _kt_layer0_trace_end(
+            forward_batch, self.layer_id, "layer", layer_trace_state
+        )
         return hidden_states, residual, topk_indices
 
     def op_comm_prepare_attn(

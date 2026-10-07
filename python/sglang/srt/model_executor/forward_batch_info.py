@@ -570,6 +570,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attn_tp_sequence_sharded: bool = False
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
+    # KTransformers debug correlation id. Keeping this as a declared field
+    # avoids silently losing it on ForwardBatch implementations that restrict
+    # dynamic attributes.
+    _kt_debug_pass_id: int = -1
+
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 

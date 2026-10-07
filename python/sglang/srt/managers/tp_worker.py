@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -600,6 +601,8 @@ class TpModelWorker(BaseTpWorker):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
+        trace_start_ns = time.perf_counter_ns()
+
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch
@@ -620,15 +623,42 @@ class TpModelWorker(BaseTpWorker):
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-worker] mono_ms=%.3f phase=forward_batch_start tp_rank=%s "
+                "mode=%s batch=%s tokens=%s extend_tokens=%s",
+                time.perf_counter_ns() / 1e6,
+                getattr(self.ps, "tp_rank", -1),
+                getattr(forward_batch, "forward_mode", "unknown"),
+                getattr(forward_batch, "batch_size", -1),
+                forward_batch._forward_num_tokens(),
+                getattr(batch, "extend_num_tokens", 0) if batch is not None else 0,
+            )
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         if self.pp_group.is_last_rank:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-worker] mono_ms=%.3f phase=model_forward_start tp_rank=%s "
+                    "elapsed_ms=%.3f",
+                    time.perf_counter_ns() / 1e6,
+                    getattr(self.ps, "tp_rank", -1),
+                    (time.perf_counter_ns() - trace_start_ns) / 1e6,
+                )
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-worker] mono_ms=%.3f phase=model_forward_end tp_rank=%s "
+                    "elapsed_ms=%.3f",
+                    time.perf_counter_ns() / 1e6,
+                    getattr(self.ps, "tp_rank", -1),
+                    (time.perf_counter_ns() - trace_start_ns) / 1e6,
+                )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -642,6 +672,14 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
+                        "tp_rank=%s total_ms=%.3f path=verify",
+                        time.perf_counter_ns() / 1e6,
+                        getattr(self.ps, "tp_rank", -1),
+                        (time.perf_counter_ns() - trace_start_ns) / 1e6,
+                    )
                 return batch_result
 
             # Delay sampling only for normal generation requests.
@@ -665,13 +703,31 @@ class TpModelWorker(BaseTpWorker):
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
+                        "tp_rank=%s total_ms=%.3f path=delay_sample",
+                        time.perf_counter_ns() / 1e6,
+                        getattr(self.ps, "tp_rank", -1),
+                        (time.perf_counter_ns() - trace_start_ns) / 1e6,
+                    )
                 return batch_result
 
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
+                sample_start_ns = time.perf_counter_ns()
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[kt-worker] mono_ms=%.3f phase=sample_end tp_rank=%s "
+                        "sample_ms=%.3f total_ms=%.3f",
+                        time.perf_counter_ns() / 1e6,
+                        getattr(self.ps, "tp_rank", -1),
+                        (time.perf_counter_ns() - sample_start_ns) / 1e6,
+                        (time.perf_counter_ns() - trace_start_ns) / 1e6,
+                    )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -689,6 +745,15 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, forward_batch
                     )
 
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
+                    "tp_rank=%s total_ms=%.3f prefill_only=%s",
+                    time.perf_counter_ns() / 1e6,
+                    getattr(self.ps, "tp_rank", -1),
+                    (time.perf_counter_ns() - trace_start_ns) / 1e6,
+                    forward_batch.is_prefill_only,
+                )
             return batch_result
         else:
             out = self.model_runner.forward(
@@ -696,11 +761,20 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
-            return GenerationBatchResult(
+            result = GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
+                    "tp_rank=%s total_ms=%.3f path=pp_proxy",
+                    time.perf_counter_ns() / 1e6,
+                    getattr(self.ps, "tp_rank", -1),
+                    (time.perf_counter_ns() - trace_start_ns) / 1e6,
+                )
+            return result
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

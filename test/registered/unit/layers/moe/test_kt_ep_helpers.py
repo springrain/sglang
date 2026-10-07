@@ -88,6 +88,23 @@ def test_front_loading_masks_are_deterministic_and_bounded():
     assert torch.equal(masks, kt_ep.generate_front_loading_masks(4, 4, 5, 0, 1))
 
 
+def test_global_gec_slots_fill_layer_major_without_averaging():
+    masks = kt_ep.generate_global_slot_masks(
+        num_layers=60,
+        num_experts=256,
+        global_slots=2560,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+    )
+
+    assert [int(masks[layer].sum()) for layer in range(12)] == [
+        *([256] * 10),
+        0,
+        0,
+    ]
+    assert int(masks.sum()) == 2560
+
+
 def test_frequency_masks_do_not_spend_budget_on_pinned_layers():
     activation_freq = torch.zeros(6, 4)
     activation_freq[:2] = 1000
@@ -155,6 +172,15 @@ def test_mask_and_remap_preserves_invalid_routing_sentinels():
     output = remap(topk_ids, mask, logical_to_gpu)
 
     assert torch.equal(output, torch.tensor([[-1, -1, 1]], dtype=torch.int32))
+
+
+def test_mask_gpu_expert_ids_for_cpu_keeps_only_fallback_routes():
+    mask = torch.tensor([True, False, True, False])
+    topk_ids = torch.tensor([[0, 1, 2], [3, -1, 4]], dtype=torch.int64)
+
+    output = kt_ep.mask_gpu_expert_ids_for_cpu(topk_ids, mask)
+
+    assert torch.equal(output, torch.tensor([[-1, 1, -1], [3, -1, -1]]))
 
 
 def test_materialize_kt_topk_output_resolves_bypassed_routing_once(monkeypatch):
@@ -284,7 +310,6 @@ def test_update_gpu_expert_mappings_round_trip():
     mask, logical_to_gpu, gpu_to_logical = kt_ep.update_gpu_expert_mappings(
         selected_experts=torch.tensor([5, 1, 3]),
         num_experts=8,
-        device=torch.device("cpu"),
     )
     assert torch.equal(
         mask, torch.tensor([False, True, False, True, False, True, False, False])

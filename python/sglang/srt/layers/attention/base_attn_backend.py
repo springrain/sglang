@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from abc import ABC
 from enum import Enum
 from typing import TYPE_CHECKING, Iterable, Optional
@@ -8,6 +10,8 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
@@ -259,10 +263,32 @@ class AttentionBackend(ABC):
         **kwargs,
     ):
         """Run forward on an attention layer."""
+        trace = (
+            layer.layer_id == 0
+            and logger.isEnabledFor(logging.DEBUG)
+        )
+        started_ns = time.perf_counter_ns() if trace else 0
+        mode_name = str(forward_batch.forward_mode)
+        if trace:
+            logger.debug(
+                "[kt-attn-backend] mono_ms=%.3f phase=enter layer=0 mode=%s "
+                "backend=%s q_shape=%s k_shape=%s v_shape=%s save_kv_cache=%s "
+                "out_cache_loc=%s",
+                started_ns / 1e6,
+                mode_name,
+                type(self).__name__,
+                tuple(q.shape),
+                tuple(k.shape) if torch.is_tensor(k) else None,
+                tuple(v.shape) if torch.is_tensor(v) else None,
+                save_kv_cache,
+                tuple(forward_batch.out_cache_loc.shape)
+                if torch.is_tensor(getattr(forward_batch, "out_cache_loc", None))
+                else None,
+            )
         if forward_batch.forward_mode.is_idle():
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            result = q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
-            return self.forward_decode(
+            result = self.forward_decode(
                 q,
                 k,
                 v,
@@ -272,7 +298,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         elif forward_batch.forward_mode.is_mixed() and is_npu():
-            return self.forward_mixed(
+            result = self.forward_mixed(
                 q,
                 k,
                 v,
@@ -282,7 +308,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         else:
-            return self.forward_extend(
+            result = self.forward_extend(
                 q,
                 k,
                 v,
@@ -291,6 +317,16 @@ class AttentionBackend(ABC):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+        if trace:
+            logger.debug(
+                "[kt-attn-backend] mono_ms=%.3f phase=exit layer=0 mode=%s "
+                "backend=%s wall_ms=%.3f",
+                time.perf_counter_ns() / 1e6,
+                mode_name,
+                type(self).__name__,
+                (time.perf_counter_ns() - started_ns) / 1e6,
+            )
+        return result
 
     def forward_decode(
         self,

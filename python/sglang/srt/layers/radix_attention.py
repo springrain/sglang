@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
@@ -43,6 +45,7 @@ _is_hip = is_hip()
 # region for multi-seq-correct short-conv metadata) sets this so the attn does not
 # start a nested break (which would assert on the ended segment). Default off.
 _force_eager_attn: ContextVar[bool] = ContextVar("_force_eager_attn", default=False)
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -155,6 +158,94 @@ class RadixAttention(nn.Module):
         self.xai_temperature_len = -1
 
     def forward(
+        self,
+        q,
+        k,
+        v,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        key_value_num_tokens: Optional[int] = None,
+        **kwargs,
+    ):
+        trace_state = None
+        if self.layer_id == 0 and logger.isEnabledFor(logging.DEBUG):
+            started_ns = time.perf_counter_ns()
+            start_event = None
+            stream_id = "cpu"
+            capture_active = False
+            if q is not None and q.device.type == "cuda":
+                try:
+                    stream = torch.cuda.current_stream(q.device)
+                    stream_id = getattr(stream, "cuda_stream", "unknown")
+                    capture_active = torch.cuda.is_current_stream_capturing()
+                    if not capture_active:
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record(stream)
+                except Exception:
+                    start_event = None
+            trace_state = (started_ns, start_event, stream_id)
+            try:
+                backend_name = type(get_attn_backend()).__name__
+            except Exception:
+                backend_name = "unknown"
+            attn_kind = "mqa" if self.tp_k_head_num == 1 else "mha"
+            out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            logger.debug(
+                "[kt-attn] mono_ms=%.3f phase=enter pass=%s layer=0 mode=%s "
+                "tokens=%s q_shape=%s k_shape=%s v_shape=%s save_kv_cache=%s "
+                "key_value_num_tokens=%s out_cache_loc=%s positions=%s "
+                "stream=%s capture=%s backend=%s kind=%s",
+                started_ns / 1e6,
+                getattr(forward_batch, "_kt_debug_pass_id", -1),
+                getattr(forward_batch, "forward_mode", "unknown"),
+                getattr(forward_batch, "_forward_num_tokens", lambda: -1)(),
+                tuple(q.shape) if torch.is_tensor(q) else None,
+                tuple(k.shape) if torch.is_tensor(k) else None,
+                tuple(v.shape) if torch.is_tensor(v) else None,
+                save_kv_cache,
+                key_value_num_tokens,
+                tuple(out_cache_loc.shape) if torch.is_tensor(out_cache_loc) else None,
+                tuple(forward_batch.positions.shape)
+                if torch.is_tensor(getattr(forward_batch, "positions", None))
+                else None,
+                stream_id,
+                capture_active,
+                backend_name,
+                attn_kind,
+            )
+        try:
+            return self._forward_impl(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                key_value_num_tokens=key_value_num_tokens,
+                **kwargs,
+            )
+        finally:
+            if trace_state is not None:
+                started_ns, start_event, stream_id = trace_state
+                cuda_ms = None
+                if start_event is not None:
+                    try:
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        end_event.record(torch.cuda.current_stream(q.device))
+                        if end_event.query():
+                            cuda_ms = start_event.elapsed_time(end_event)
+                    except Exception:
+                        pass
+                logger.debug(
+                    "[kt-attn] mono_ms=%.3f phase=exit pass=%s layer=0 wall_ms=%.3f "
+                    "cuda_ms=%s stream=%s",
+                    time.perf_counter_ns() / 1e6,
+                    getattr(forward_batch, "_kt_debug_pass_id", -1),
+                    (time.perf_counter_ns() - started_ns) / 1e6,
+                    f"{cuda_ms:.3f}" if cuda_ms is not None else "na",
+                    stream_id,
+                )
+
+    def _forward_impl(
         self,
         q,
         k,

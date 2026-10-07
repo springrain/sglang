@@ -30,6 +30,9 @@ KT_DOWNSTREAM_FIELDS = (
     "kt_numa_nodes",
     "kt_gpu_experts_ratio",
     "kt_num_gpu_layers",
+    "kt_expert_gpu_slots",
+    "kt_layer_h2d_slots",
+    "kt_layer_h2d_batch_size",
     "kt_gpu_prefill_token_threshold",
     "record_kt_gpu_expert_distribution",
     "kt_enable_dynamic_expert_update",
@@ -67,6 +70,12 @@ class TestKTFieldMigration(unittest.TestCase):
                 "0.5",
                 "--kt-num-gpu-layers",
                 "3",
+                "--kt-expert-gpu-slots",
+                "2560",
+                "--kt-layer-h2d-slots",
+                "64",
+                "--kt-layer-h2d-batch-size",
+                "8",
                 "--kt-gpu-prefill-token-threshold",
                 "128",
                 "--record-kt-gpu-expert-distribution",
@@ -83,6 +92,9 @@ class TestKTFieldMigration(unittest.TestCase):
         self.assertEqual(args.kt_numa_nodes, [0, 1])
         self.assertEqual(args.kt_gpu_experts_ratio, 0.5)
         self.assertEqual(args.kt_num_gpu_layers, 3)
+        self.assertEqual(args.kt_expert_gpu_slots, 2560)
+        self.assertEqual(args.kt_layer_h2d_slots, 64)
+        self.assertEqual(args.kt_layer_h2d_batch_size, 8)
         self.assertEqual(args.kt_gpu_prefill_token_threshold, 128)
         self.assertTrue(args.record_kt_gpu_expert_distribution)
         self.assertTrue(args.kt_enable_dynamic_expert_update)
@@ -100,6 +112,9 @@ class TestKTFieldMigration(unittest.TestCase):
             "kt_num_gpu_experts",
             "kt_gpu_experts_ratio",
             "kt_num_gpu_layers",
+            "kt_expert_gpu_slots",
+            "kt_layer_h2d_slots",
+            "kt_layer_h2d_batch_size",
             "kt_max_deferred_experts_per_token",
             "kt_gpu_prefill_token_threshold",
             "record_kt_gpu_expert_distribution",
@@ -200,6 +215,12 @@ class TestKTValidation(unittest.TestCase):
             ("num-gpu-experts must be non-negative", {"kt_num_gpu_experts": -1}),
             ("ratio must be between 0 and 1", {"kt_gpu_experts_ratio": 1.1}),
             ("num-gpu-layers must be non-negative", {"kt_num_gpu_layers": -1}),
+            ("expert-gpu-slots must be non-negative", {"kt_expert_gpu_slots": -1}),
+            ("layer-h2d-slots must be non-negative", {"kt_layer_h2d_slots": -1}),
+            (
+                "layer-h2d-batch-size must be at least 1",
+                {"kt_layer_h2d_batch_size": 0},
+            ),
             (
                 "deferred-experts-per-token must be non-negative",
                 {"kt_max_deferred_experts_per_token": -1},
@@ -213,11 +234,34 @@ class TestKTValidation(unittest.TestCase):
                 {"kt_expert_placement_strategy": "invalid"},
             ),
         )
+        gec_dependency_cases = (
+            (
+                "require --kt-expert-gpu-slots",
+                {"kt_layer_h2d_slots": 64},
+            ),
+            (
+                "require --kt-expert-gpu-slots",
+                {"kt_layer_h2d_batch_size": 8},
+            ),
+        )
+        for message, fields in gec_dependency_cases:
+            with self.subTest(fields=fields):
+                self.assert_invalid(message, **fields)
         for message, fields in cases:
             with self.subTest(fields=fields):
                 self.assert_invalid(message, **fields)
 
     def test_weight_runtime_constraints(self):
+        # GEC slots activate residency updates on their own; the legacy
+        # dynamic-update flag and its prefill threshold are independent.
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
+                kt_expert_gpu_slots=2560,
+                kt_layer_h2d_slots=64,
+                kt_layer_h2d_batch_size=8,
+            )
+        )
         self.assert_invalid("requires --kt-num-gpu-experts", kt_weight_path="/w")
         self.assert_invalid(
             "requires --moe-a2a-backend none",

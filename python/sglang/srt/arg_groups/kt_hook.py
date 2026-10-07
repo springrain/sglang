@@ -160,6 +160,22 @@ def validate_kt_args(server_args: Any) -> None:
         raise ValueError("--kt-gpu-experts-ratio must be between 0 and 1.")
     if cfg.kt_num_gpu_layers is not None and cfg.kt_num_gpu_layers < 0:
         raise ValueError("--kt-num-gpu-layers must be non-negative.")
+    if cfg.kt_expert_gpu_slots is not None and cfg.kt_expert_gpu_slots < 0:
+        raise ValueError("--kt-expert-gpu-slots must be non-negative.")
+    if cfg.kt_layer_h2d_slots is not None and cfg.kt_layer_h2d_slots < 0:
+        raise ValueError("--kt-layer-h2d-slots must be non-negative.")
+    if (
+        cfg.kt_layer_h2d_batch_size is not None
+        and cfg.kt_layer_h2d_batch_size < 1
+    ):
+        raise ValueError("--kt-layer-h2d-batch-size must be at least 1.")
+    if (
+        cfg.kt_layer_h2d_slots is not None or cfg.kt_layer_h2d_batch_size is not None
+    ) and cfg.kt_expert_gpu_slots is None:
+        raise ValueError(
+            "--kt-layer-h2d-slots/--kt-layer-h2d-batch-size require "
+            "--kt-expert-gpu-slots."
+        )
     if (
         cfg.kt_max_deferred_experts_per_token is not None
         and cfg.kt_max_deferred_experts_per_token < 0
@@ -180,10 +196,13 @@ def validate_kt_args(server_args: Any) -> None:
         )
 
     if cfg.kt_weight_path is not None and (
-        cfg.kt_num_gpu_experts is None and cfg.kt_gpu_experts_ratio is None
+        cfg.kt_num_gpu_experts is None
+        and cfg.kt_gpu_experts_ratio is None
+        and cfg.kt_expert_gpu_slots is None
     ):
         raise ValueError(
-            "--kt-weight-path requires --kt-num-gpu-experts or --kt-gpu-experts-ratio."
+            "--kt-weight-path requires --kt-num-gpu-experts, "
+            "--kt-gpu-experts-ratio, or --kt-expert-gpu-slots."
         )
 
     if cfg.kt_weight_path is not None:

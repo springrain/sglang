@@ -231,6 +231,26 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
+
+def _kt_v4_trace(forward_batch, layer_id: int, phase: str, start_ns=None, **fields):
+    if not logger.isEnabledFor(logging.DEBUG):
+        return time.perf_counter_ns() if start_ns is None else None
+    now_ns = time.perf_counter_ns()
+    suffix = ""
+    if start_ns is not None:
+        suffix = f" elapsed_ms={(now_ns - start_ns) / 1e6:.3f}"
+    logger.debug(
+        "[kt-v4] mono_ms=%.3f phase=%s pass=%s layer=%d tp_rank=%s%s %s",
+        now_ns / 1e6,
+        phase,
+        getattr(forward_batch, "_kt_debug_pass_id", -1),
+        layer_id,
+        get_parallel().tp_rank,
+        suffix,
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
+    return None
+
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 _HC_PRENORM_DEEPGEMM_MIN_TOKENS = 1024
@@ -2162,6 +2182,36 @@ class DeepseekV4DecoderLayer(nn.Module):
         norm: Optional[nn.Module] = None,
         forward_batch: Optional[ForwardBatch] = None,
     ):
+        trace_ns = _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "hc_pre_start",
+            tokens=x.shape[0],
+            flashinfer=envs.SGLANG_OPT_USE_FLASHINFER_MHC.get(),
+            tilelang=envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get(),
+            fused=self.use_fused_mhc_post_pre,
+        )
+        try:
+            return self._hc_pre_impl(
+                x, hc_fn, hc_scale, hc_base, norm=norm, forward_batch=forward_batch
+            )
+        finally:
+            _kt_v4_trace(
+                forward_batch,
+                self.layer_id,
+                "hc_pre_end",
+                start_ns=trace_ns,
+            )
+
+    def _hc_pre_impl(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        norm: Optional[nn.Module] = None,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
 
@@ -2320,6 +2370,33 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
+        forward_batch = getattr(self, "_kt_debug_forward_batch", None)
+        trace_ns = _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "hc_post_start",
+            tokens=x.shape[0],
+            flashinfer=envs.SGLANG_OPT_USE_FLASHINFER_MHC.get(),
+            tilelang=envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get(),
+            fused=self.use_fused_mhc_post_pre,
+        )
+        try:
+            return self._hc_post_impl(x, residual, post, comb)
+        finally:
+            _kt_v4_trace(
+                forward_batch,
+                self.layer_id,
+                "hc_post_end",
+                start_ns=trace_ns,
+            )
+
+    def _hc_post_impl(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ):
 
         if x.shape[0] == 0:
             return torch.empty(
@@ -2387,6 +2464,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
+        self._kt_debug_forward_batch = forward_batch
+        layer_trace_ns = _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "layer_start",
+            tokens=hidden_states.shape[0],
+            fused_mhc=self.use_fused_mhc_post_pre,
+        )
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
@@ -2479,6 +2564,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
+        _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "attention_start",
+            backend=type(self.self_attn).__name__,
+            shape=tuple(hidden_states.shape),
+        )
+        attention_start_ns = time.perf_counter_ns()
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 x=hidden_states,
@@ -2486,6 +2579,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 x_quant=x_quant,
             )
+        _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "attention_end",
+            start_ns=attention_start_ns,
+            shape=tuple(hidden_states.shape),
+        )
 
         if use_fused:
             post_attn_norm_weight = (
@@ -2541,11 +2641,25 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
+        mlp_boundary_start_ns = time.perf_counter_ns()
+        _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "mlp_boundary_start",
+            shape=tuple(hidden_states.shape),
+        )
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
+        )
+        _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "mlp_boundary_end",
+            start_ns=mlp_boundary_start_ns,
+            shape=tuple(hidden_states.shape),
         )
 
         if not use_fused:
@@ -2554,6 +2668,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
+        _kt_v4_trace(
+            forward_batch,
+            self.layer_id,
+            "layer_end",
+            start_ns=layer_trace_ns,
+        )
         return hidden_states, residual, post, comb
 
     def _run_moe_ffn_dp_sync(

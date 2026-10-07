@@ -4252,6 +4252,22 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
+        sched_trace_start = time.perf_counter_ns()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-sched] mono_ms=%.3f phase=run_batch_start iter=%s mode=%s "
+                "batch=%s extend_tokens=%s running=%s queued=%s after_idle=%s",
+                sched_trace_start / 1e6,
+                batch.forward_iter,
+                getattr(batch, "forward_mode", "unknown"),
+                len(getattr(batch, "reqs", ())),
+                getattr(batch, "extend_num_tokens", 0),
+                len(getattr(self.running_batch, "reqs", ()))
+                if self.running_batch is not None
+                else 0,
+                len(self.waiting_queue),
+                self._sched_idled,
+            )
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
@@ -4270,7 +4286,16 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            result = self._run_batch_prebuilt(batch)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[kt-sched] mono_ms=%.3f phase=run_batch_end iter=%s "
+                    "elapsed_ms=%.3f path=prebuilt",
+                    time.perf_counter_ns() / 1e6,
+                    batch.forward_iter,
+                    (time.perf_counter_ns() - sched_trace_start) / 1e6,
+                )
+            return result
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -4473,6 +4498,17 @@ class Scheduler(
                 )
 
         self._maybe_report_active_ranks()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-sched] mono_ms=%.3f phase=run_batch_end iter=%s elapsed_ms=%.3f "
+                "mode=%s extend_tokens=%s",
+                time.perf_counter_ns() / 1e6,
+                batch.forward_iter,
+                (time.perf_counter_ns() - sched_trace_start) / 1e6,
+                getattr(batch, "forward_mode", "unknown"),
+                getattr(batch, "extend_num_tokens", 0),
+            )
 
         return ret
 

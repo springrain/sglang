@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -54,6 +55,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -781,6 +784,29 @@ class C4IndexerBackendMixin:
             fn = fp8_paged_mqa_logits_triton
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
+
+        if logger.isEnabledFor(logging.DEBUG):
+            backend = (
+                "fp4-deepgemm"
+                if use_fp4_indexer and not use_aiter_fp4
+                else "aiter"
+                if use_aiter_fp4 or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                else "tilelang"
+                if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                else "torch"
+                if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                else "deepgemm"
+            )
+            logger.debug(
+                "[kt-dsv4-indexer] layer=%s backend=%s tokens=%d "
+                "tilelang=%s torch=%s aiter=%s",
+                c4_indexer.layer_id,
+                backend,
+                q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0],
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.get(),
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get(),
+                envs.SGLANG_OPT_USE_AITER_INDEXER.get(),
+            )
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 

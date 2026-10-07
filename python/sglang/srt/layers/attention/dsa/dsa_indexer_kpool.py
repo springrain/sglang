@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -46,6 +47,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_device
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -765,6 +768,12 @@ class IndexerKPool(MultiPlatformOp):
 
     @staticmethod
     def _should_use_tilelang_paged_mqa_logits(q_fp8: torch.Tensor) -> bool:
+        # Keep KPool consistent with the ordinary DSA indexer: TileLang is an
+        # explicit opt-in. Without this gate, SM90 silently JIT-compiles a new
+        # kernel for each split_kv/shape combination on the request path,
+        # producing multi-second TTFT spikes.
+        if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            return False
         if not is_cuda():
             return False
         arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
@@ -827,6 +836,17 @@ class IndexerKPool(MultiPlatformOp):
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-dsa-indexer] layer=%s backend=%s batch=%d heads=%d "
+                "max_seq_len=%d opt_tilelang=%s",
+                layer_id,
+                "tilelang" if use_tilelang_paged_mqa else "deepgemm",
+                q_fp8.shape[0],
+                q_fp8.shape[2],
+                pool_max_seq_len,
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.get(),
+            )
         if use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,

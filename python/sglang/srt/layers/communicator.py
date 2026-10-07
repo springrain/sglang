@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import logging
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -101,6 +102,30 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _kt_comm_trace_enabled(context, forward_batch) -> bool:
+    return (
+        logger.isEnabledFor(logging.DEBUG)
+        and getattr(context, "kt_layer_id", -1) == 0
+        and getattr(forward_batch, "_kt_debug_pass_id", None) is not None
+    )
+
+
+def _kt_comm_trace(context, forward_batch, phase: str, start: bool, **fields):
+    if not _kt_comm_trace_enabled(context, forward_batch):
+        return
+    logger.debug(
+        "[kt-comm] mono_ms=%.3f phase=%s_%s pass=%s layer=0 tp_rank=%s "
+        "shape=%s %s",
+        time.perf_counter_ns() / 1e6,
+        phase,
+        "start" if start else "end",
+        getattr(forward_batch, "_kt_debug_pass_id", -1),
+        getattr(context, "tp_rank", -1),
+        fields.pop("shape", None),
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
 
 if _use_aiter:
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
@@ -870,14 +895,38 @@ class LayerCommunicator:
             )
         if cache is not None:
             self._context.cache = cache
-
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
+        fn_name = getattr(
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+            "__name__",
+            repr(self._communicate_with_all_reduce_and_layer_norm_fn),
+        )
+        _kt_comm_trace(
+            self._context,
+            forward_batch,
+            "prepare_mlp",
+            True,
+            fn=fn_name,
+            shape=tuple(hidden_states.shape),
+            input_scattered=get_attn_tp_context().input_scattered,
+        )
+        started_ns = time.perf_counter_ns()
+        result = self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+        _kt_comm_trace(
+            self._context,
+            forward_batch,
+            "prepare_mlp",
+            False,
+            fn=fn_name,
+            elapsed_ms=f"{(time.perf_counter_ns() - started_ns) / 1e6:.3f}",
+            shape=tuple(result[0].shape) if result else None,
+        )
+        return result
 
     def maybe_prefetch_next_full_attention_kv(
         self,
@@ -997,6 +1046,7 @@ class CommunicateContext:
     cache = None
     tp_rank: int
     force_layernorm_before_dp_gather: bool = False
+    kt_layer_id: int = -1
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1225,7 +1275,25 @@ class CommunicateWithAllReduceAndLayerNormFn:
         (``moe_dense_tp_size > 1``): both hidden states and residual stay in
         ``TP_ATTN_FULL`` across the boundary.
         """
+        _kt_comm_trace(
+            context,
+            forward_batch,
+            "attn_tp_all_reduce",
+            True,
+            shape=tuple(hidden_states.shape),
+            group="attn_tp",
+        )
+        comm_started_ns = time.perf_counter_ns()
         hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
+        _kt_comm_trace(
+            context,
+            forward_batch,
+            "attn_tp_all_reduce",
+            False,
+            elapsed_ms=f"{(time.perf_counter_ns() - comm_started_ns) / 1e6:.3f}",
+            shape=tuple(hidden_states.shape),
+            group="attn_tp",
+        )
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
@@ -1300,6 +1368,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     not forward_batch.forward_mode.is_decode_or_idle()
                     and get_exec().comm.enable_quant_communications
                 )
+                _kt_comm_trace(
+                    context,
+                    forward_batch,
+                    "attn_tp_all_reduce",
+                    True,
+                    shape=tuple(hidden_states.shape),
+                    group="attn_tp",
+                    quantized=quantize_communications,
+                )
+                comm_started_ns = time.perf_counter_ns()
                 if quantize_communications:
                     hidden_states = attention_tensor_model_parallel_quant_all_reduce(
                         hidden_states
@@ -1308,6 +1386,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states = attention_tensor_model_parallel_all_reduce(
                         hidden_states
                     )
+                _kt_comm_trace(
+                    context,
+                    forward_batch,
+                    "attn_tp_all_reduce",
+                    False,
+                    elapsed_ms=f"{(time.perf_counter_ns() - comm_started_ns) / 1e6:.3f}",
+                    shape=tuple(hidden_states.shape),
+                    group="attn_tp",
+                )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -1327,7 +1414,25 @@ class CommunicateWithAllReduceAndLayerNormFn:
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
         ]
+        _kt_comm_trace(
+            context,
+            forward_batch,
+            "attn_tp_reduce_scatter",
+            True,
+            shape=tuple(input_hidden_states.shape),
+            group="attn_tp",
+        )
+        comm_started_ns = time.perf_counter_ns()
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        _kt_comm_trace(
+            context,
+            forward_batch,
+            "attn_tp_reduce_scatter",
+            False,
+            elapsed_ms=f"{(time.perf_counter_ns() - comm_started_ns) / 1e6:.3f}",
+            shape=tuple(hidden_states.shape),
+            group="attn_tp",
+        )
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:

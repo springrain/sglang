@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import time
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -977,7 +978,25 @@ def dp_gather_partial_async(
     global_tokens.record_stream(comm)
     ev = _tbo_event(event_key)
     with torch.cuda.stream(comm):
+        wait_started_ns = time.perf_counter_ns()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-dp-stream] mono_ms=%.3f phase=wait_stream_start pass=%s "
+                "kind=gather comm_stream=%s compute_stream=%s",
+                wait_started_ns / 1e6,
+                getattr(forward_batch, "_kt_debug_pass_id", -1),
+                getattr(comm, "cuda_stream", "unknown"),
+                getattr(compute, "cuda_stream", "unknown"),
+            )
         comm.wait_stream(compute)  # inputs were produced on the compute stream
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-dp-stream] mono_ms=%.3f phase=wait_stream_end pass=%s "
+                "kind=gather enqueue_ms=%.3f",
+                time.perf_counter_ns() / 1e6,
+                getattr(forward_batch, "_kt_debug_pass_id", -1),
+                (time.perf_counter_ns() - wait_started_ns) / 1e6,
+            )
         dp_gather_partial(global_tokens, local_tokens, forward_batch)
         ev.record(comm)
     return ev
@@ -1021,7 +1040,25 @@ def dp_reduce_scatterv_async(
     compute = torch.cuda.current_stream()
     ev = _tbo_event(event_key)
     with torch.cuda.stream(comm):
+        wait_started_ns = time.perf_counter_ns()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-dp-stream] mono_ms=%.3f phase=wait_stream_start pass=%s "
+                "kind=reduce_scatterv comm_stream=%s compute_stream=%s",
+                wait_started_ns / 1e6,
+                -1,
+                getattr(comm, "cuda_stream", "unknown"),
+                getattr(compute, "cuda_stream", "unknown"),
+            )
         comm.wait_stream(compute)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[kt-dp-stream] mono_ms=%.3f phase=wait_stream_end pass=%s "
+                "kind=reduce_scatterv enqueue_ms=%.3f",
+                time.perf_counter_ns() / 1e6,
+                -1,
+                (time.perf_counter_ns() - wait_started_ns) / 1e6,
+            )
         get_tp_group().reduce_scatterv(global_tokens, output=output_local, sizes=sizes)
         ev.record(comm)
     return ev
