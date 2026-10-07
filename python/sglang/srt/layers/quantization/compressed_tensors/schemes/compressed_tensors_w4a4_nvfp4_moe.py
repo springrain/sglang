@@ -287,6 +287,17 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
+            # All-None unless the runner config carries a clamp limit.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                self.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -373,7 +384,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             else:
                 moe_ep_size = layer.moe_ep_size
                 moe_ep_rank = layer.moe_ep_rank
-
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
@@ -389,6 +400,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 ],
                 moe_ep_size=moe_ep_size,
                 moe_ep_rank=moe_ep_rank,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
