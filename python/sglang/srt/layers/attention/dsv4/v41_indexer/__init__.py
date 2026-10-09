@@ -85,6 +85,17 @@ def make_full_topk_indexer(
     )
 
 
+def _use_torch_paged_mqa_logits() -> bool:
+    """True when the paged indexer metadata will carry no DeepGEMM schedule:
+    the torch fallback forced on, without the SM120 FP4-indexer override."""
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_exec, get_platform
+
+    return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not (
+        get_exec().kernel.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+    )
+
+
 def make_candidate_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
@@ -107,6 +118,11 @@ def make_candidate_indexer(
     )
     # Without candidate blocks no layer is a candidate source or consumer.
     if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+        return dense_blocks, dense_blocks
+
+    # The sparse table scores decode rows with DeepGEMM paged logits; keep the
+    # dense blocks when the metadata will have no DeepGEMM schedule.
+    if _use_torch_paged_mqa_logits():
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (

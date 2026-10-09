@@ -379,9 +379,9 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook

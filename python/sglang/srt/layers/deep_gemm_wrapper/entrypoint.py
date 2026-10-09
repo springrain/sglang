@@ -78,7 +78,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
             if recipe_b is not None:
                 fp4_kwargs["recipe_b"] = recipe_b
 
-            return deep_gemm.fp8_m_grouped_gemm_nt_masked(
+            return deep_gemm.m_grouped_fp8_gemm_nt_masked(
                 lhs,
                 rhs,
                 out,

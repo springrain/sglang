@@ -5383,7 +5383,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = materialize_kt_topk_output(
             dispatch_output.topk_output, self.kt_config.layer_idx
         )
-        topk_weights, topk_ids, _ = topk_output
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
 
         # Submit forward task to CPU (non-blocking)
         self._submit_cpu_forward(x, topk_ids, topk_weights)
@@ -5428,7 +5429,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = materialize_kt_topk_output(
             dispatch_output.topk_output, self.kt_config.layer_idx
         )
-        topk_weights, topk_ids, _ = topk_output
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
 
         # Submit only CPU-fallback routes. GEC has already updated the resident
         # mask before this method is called, so newly admitted H2D experts are

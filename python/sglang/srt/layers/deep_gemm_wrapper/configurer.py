@@ -62,8 +62,21 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
-    if not DEEPGEMM_BLACKWELL:
+    if not ENABLE_JIT_DEEPGEMM:
         return False
+    sm_version = get_device_sm()
+    if sm_version not in (100, 120, 121):
+        return False
+    if sm_version in (120, 121):
+        import deep_gemm
+        from pathlib import Path
+
+        sm120_sparse_kernel = (
+            Path(deep_gemm.__file__).parent
+            / "include/deep_gemm/impls/sm120_fp8_fp4_sparse_mqa_logits.cuh"
+        )
+        if not sm120_sparse_kernel.is_file():
+            return False
     import deep_gemm
 
     return all(

@@ -391,7 +391,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
     def execute(self, m):
-        deep_gemm.fp8_m_grouped_gemm_nt_masked(
+        deep_gemm.m_grouped_fp8_gemm_nt_masked(
             (self.lhs_q, self.lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out,

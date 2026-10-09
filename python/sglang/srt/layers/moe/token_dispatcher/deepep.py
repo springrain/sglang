@@ -817,9 +817,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         fp8_deepgemm_scale_opts = (
             dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
             if self.use_fp8
             else dict()
