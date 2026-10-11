@@ -59,7 +59,13 @@ class FullTopKIndexer:
         self._deep_gemm_prefill_captured(inputs, out)
 
     def topk_decode(self, inputs: DecodeInputs, out: Selection) -> None:
-        if self.use_deep_gemm_decode:
+        # The paged metadata carries no DeepGEMM schedule when the torch fallback
+        # is forced (e.g. SGLANG_FP8_PAGED_MQA_LOGITS_TORCH, the SM120 default
+        # without --enable-deepseek-v4-fp4-indexer).
+        if (
+            self.use_deep_gemm_decode
+            and inputs.paged_metadata.deep_gemm_metadata is not None
+        ):
             self._deep_gemm_decode(inputs, out)
         else:
             self._torch_decode(inputs, out)

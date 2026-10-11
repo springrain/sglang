@@ -5,6 +5,7 @@ DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -19,6 +20,8 @@ from .types import (
     PrefillInputs,
     Selection,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -114,10 +117,14 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
-        raise RuntimeError(
-            "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
-            "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
+        # sgl-deep-gemm ships no SM120 paged sparse MQA logits kernel (the
+        # sparse candidate table is SM100-only); fall back to the dense
+        # candidate blocks path, which only uses kernels SM120 already has.
+        logger.warning(
+            "DeepGEMM paged sparse MQA logits unavailable on this GPU; "
+            "using the dense candidate blocks indexer"
         )
+        return dense_blocks, dense_blocks
     from .sparse_table import SparseTableBackend
 
     sparse_table = SparseTableBackend(
