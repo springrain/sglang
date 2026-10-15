@@ -296,6 +296,18 @@ class TestGlobalGecCoordinator(unittest.TestCase):
             module, capacity=4, max_running_requests=17, h2d_batch_size=4
         )
         self.assertEqual(coordinator.buffer_pool_depth, 17)
+        self.assertEqual(coordinator.h2d_batch_size, 4)
+
+    def test_default_h2d_batch_size_is_single_expert(self):
+        module = kt_gec._load_gec_module()
+        coordinator = kt_gec.GlobalGecCoordinator(module, capacity=1)
+        self.assertEqual(coordinator.h2d_batch_size, 1)
+
+    def test_layer_planner_inherits_global_h2d_batch_size(self):
+        source = Path(kt_gec.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            "config.layer_h2d_batch_size = coordinator.h2d_batch_size", source
+        )
 
     def test_default_h2d_budget_uses_layer_capacity(self):
         wrapper = Path(kt_gec.__file__).with_name("kt_gec.py")
@@ -431,6 +443,71 @@ class TestRuntimeContract(unittest.TestCase):
         end = text.index("    def __getattr__", start)
         self.assertNotIn("torch.cuda.synchronize", text[start:end])
         self.assertIn("GecCudaPipeline", text[start:end])
+
+    def test_hybrid_gate_skips_the_scalar_readback_without_gpu_rows(self):
+        """Doc section 14.5: no per-layer device readback without GPU rows."""
+
+        wrapper = Path(kt_gec.__file__).with_name("kt_ep_wrapper.py")
+        text = wrapper.read_text(encoding="utf-8")
+        gate_start = text.index("        capture_active = (")
+        gate_end = text.index('            "cpu_route_classified",', gate_start)
+        gate_text = text[gate_start:gate_end]
+        shortcut = gate_text.index("elif self.num_gpu_experts == 0:")
+        sync = gate_text.index(
+            "_kt_cpu_route_count = int((cpu_topk_ids >= 0).sum().item())"
+        )
+        self.assertLess(shortcut, sync)
+        branch = gate_text[shortcut:sync]
+        self.assertIn("_kt_cpu_route_count = cpu_topk_ids.numel()", branch)
+        self.assertIn("has_cpu_fallback = _kt_cpu_route_count > 0", branch)
+        self.assertNotIn(".item()", branch)
+
+        manager_start = text.index("    def note_cpu_routes(")
+        manager_end = text.index("    def _record_layer_telemetry(", manager_start)
+        self.assertIn(
+            "self.telemetry.add_cpu_routes(count)", text[manager_start:manager_end]
+        )
+        # The gate hands the host-side count over without a readback.
+        self.assertIn("_mxfp4_manager.note_cpu_routes(_kt_cpu_route_count)", text)
+
+    def test_layerwise_host_write_runs_one_drain_per_batch(self):
+        """Doc section 20 item 8: batch the KT writer, not one expert at a time."""
+
+        wrapper = Path(kt_gec.__file__).with_name("kt_ep_wrapper.py")
+        text = wrapper.read_text(encoding="utf-8")
+
+        # The pinned host ring carries one free event per slot.
+        self.assertIn('getattr(context, "cpu_buffer_depth", 2)', text)
+        self.assertIn("self.host_write_batch = max(1, self.host_slots // 2)", text)
+        self.assertIn("self._host_generation ^= 1", text)
+        self.assertIn("host_ring_depth(", text)
+        # Doc section 7.5: the layerwise ring starts from the documented
+        # k = 8 generation when --kt-layer-h2d-batch-size is unset.
+        self.assertIn(
+            'int(getattr(method.kt_config, "kt_layer_h2d_batch_size", 8) or 8)',
+            text,
+        )
+
+        # The single-expert submit helper must not drain the KT writer itself.
+        submit_start = text.index("    def _submit_host_write(")
+        submit_end = text.index("    def _postprocess_slot(", submit_start)
+        self.assertNotIn(
+            "method.wrapper.sync_write_weight_scale_to_buffer()",
+            text[submit_start:submit_end],
+        )
+
+        # The layer transport loop batches ids and drains once per batch.
+        load_start = text.index("    def _load_slot(")
+        load_end = text.index("    def _acquire(", load_start)
+        load_text = text[load_start:load_end]
+        self.assertIn("for batch_ids in host_write_batches(", load_text)
+        self.assertIn("host_generation_slots(", load_text)
+        self.assertIn("batch_slots[offset]", load_text)
+        self.assertIn("method.wrapper.sync_write_weight_scale_to_buffer()", load_text)
+        self.assertEqual(
+            load_text.count("method.wrapper.sync_write_weight_scale_to_buffer()"), 1
+        )
+        self.assertNotIn("host_slot = position % 2", load_text)
 
 
 if __name__ == "__main__":

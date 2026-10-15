@@ -641,7 +641,7 @@ class TpModelWorker(BaseTpWorker):
                 "[kt-worker] mono_ms=%.3f phase=forward_batch_start tp_rank=%s "
                 "mode=%s batch=%s tokens=%s extend_tokens=%s",
                 time.perf_counter_ns() / 1e6,
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self.model_runner, "tp_rank", -1),
                 getattr(forward_batch, "forward_mode", "unknown"),
                 getattr(forward_batch, "batch_size", -1),
                 forward_batch._forward_num_tokens(),
@@ -657,7 +657,7 @@ class TpModelWorker(BaseTpWorker):
                     "[kt-worker] mono_ms=%.3f phase=model_forward_start tp_rank=%s "
                     "elapsed_ms=%.3f",
                     time.perf_counter_ns() / 1e6,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self.model_runner, "tp_rank", -1),
                     (time.perf_counter_ns() - trace_start_ns) / 1e6,
                 )
             out = self.model_runner.forward(
@@ -669,7 +669,7 @@ class TpModelWorker(BaseTpWorker):
                     "[kt-worker] mono_ms=%.3f phase=model_forward_end tp_rank=%s "
                     "elapsed_ms=%.3f",
                     time.perf_counter_ns() / 1e6,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self.model_runner, "tp_rank", -1),
                     (time.perf_counter_ns() - trace_start_ns) / 1e6,
                 )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
@@ -690,7 +690,7 @@ class TpModelWorker(BaseTpWorker):
                         "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
                         "tp_rank=%s total_ms=%.3f path=verify",
                         time.perf_counter_ns() / 1e6,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self.model_runner, "tp_rank", -1),
                         (time.perf_counter_ns() - trace_start_ns) / 1e6,
                     )
                 return batch_result
@@ -722,7 +722,7 @@ class TpModelWorker(BaseTpWorker):
                         "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
                         "tp_rank=%s total_ms=%.3f path=delay_sample",
                         time.perf_counter_ns() / 1e6,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self.model_runner, "tp_rank", -1),
                         (time.perf_counter_ns() - trace_start_ns) / 1e6,
                     )
                 return batch_result
@@ -738,7 +738,7 @@ class TpModelWorker(BaseTpWorker):
                         "[kt-worker] mono_ms=%.3f phase=sample_end tp_rank=%s "
                         "sample_ms=%.3f total_ms=%.3f",
                         time.perf_counter_ns() / 1e6,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self.model_runner, "tp_rank", -1),
                         (time.perf_counter_ns() - sample_start_ns) / 1e6,
                         (time.perf_counter_ns() - trace_start_ns) / 1e6,
                     )
@@ -764,7 +764,7 @@ class TpModelWorker(BaseTpWorker):
                     "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
                     "tp_rank=%s total_ms=%.3f prefill_only=%s",
                     time.perf_counter_ns() / 1e6,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self.model_runner, "tp_rank", -1),
                     (time.perf_counter_ns() - trace_start_ns) / 1e6,
                     forward_batch.is_prefill_only,
                 )
@@ -786,7 +786,7 @@ class TpModelWorker(BaseTpWorker):
                     "[kt-worker] mono_ms=%.3f phase=forward_batch_end "
                     "tp_rank=%s total_ms=%.3f path=pp_proxy",
                     time.perf_counter_ns() / 1e6,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self.model_runner, "tp_rank", -1),
                     (time.perf_counter_ns() - trace_start_ns) / 1e6,
                 )
             return result

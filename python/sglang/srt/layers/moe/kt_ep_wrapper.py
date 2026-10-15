@@ -45,7 +45,7 @@ from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -58,6 +58,19 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+from sglang.srt.layers.moe.kt_prefill_staging import (
+    StagingPrefetchPlanner,
+    StagingTelemetry,
+    clamp_staging_window,
+    effective_experts,
+    format_round_summary,
+    host_generation_slots,
+    host_ring_depth,
+    host_write_batches,
+    is_prefill_like_mode,
+    published_forward_mode,
+    staging_requested_for_batch,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -92,6 +105,22 @@ logger = logging.getLogger(__name__)
 def _kt_debug_trace_enabled() -> bool:
     return logger.isEnabledFor(logging.DEBUG)
 
+
+def _kt_is_prefill_like() -> bool:
+    """Whether this forward must run the prefill staging pipeline.
+
+    ``ModelRunner`` publishes ``forward_batch.forward_mode`` once per forward
+    (doc section 14.6).  ``runtime_context.ForwardFlags`` deliberately has no
+    ``forward_mode`` slot, so the sticky ``is_extend_in_batch`` flag is only
+    the compatibility fallback for forwards that were never published.
+    """
+
+    mode = published_forward_mode()
+    if mode is not None:
+        return is_prefill_like_mode(mode)
+    return bool(get_forward().is_extend_in_batch)
+
+
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 
@@ -112,6 +141,8 @@ class KTConfig:
         num_layers: Total number of layers in the model (optional)
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
+        kt_layer_h2d_slots: Per-bank cross-layer prefill staging window
+            (doc/KT-GEC-PREFETCH-STREAMING-PLAN.md section 3.3)
         expert_lora_path: Optional PEFT adapter directory for KT CPU expert LoRA
     """
 
@@ -2441,8 +2472,25 @@ class _Mxfp4PrefillSlot:
         self.has_consumed_event = False
         self.reuse_guard = None
 
+        # Staging ownership (doc sections 3.5 and 7.1).  The bank always holds
+        # the resident rows (copied D2D from the original layer) plus the
+        # planner-selected staged rows (host write + H2D).  ``effective_ids``
+        # is exactly ``resident(L) + staged(L)``; when it does not cover the
+        # whole layer the remaining experts take the CPU fallback.
+        self.resident_ids: List[int] = []
+        self.staged_ids: List[int] = []
+        self.effective_ids: List[int] = []
+        self.partial = False
+        self.candidate_count = 0
+        # Device-side scalar counting the routes that took the CPU fallback.
+        # Section 14.5 forbids reading it back in the layer hot path, so the
+        # value is only folded into the telemetry at the next layer boundary.
+        self.cpu_routes_scalar = None
+        self.effective_mask_cuda = None
+
         self.raw_ready_event = torch.cuda.Event()
         self.ready_event = torch.cuda.Event()
+        self.ready_ts = torch.cuda.Event(enable_timing=True)
         self.consumed_event = torch.cuda.Event()
 
         self.intermediate_size = self.w2_weight.shape[2] * 2
@@ -2454,6 +2502,7 @@ class _Mxfp4PrefillSlot:
         self.state = "EMPTY"
         self.layer_idx = None
         self.epoch = -1
+        self.effective_mask_cuda = None
 
 
 class _Mxfp4LayerwisePrefillManager:
@@ -2462,6 +2511,12 @@ class _Mxfp4LayerwisePrefillManager:
     GPU work is ordered exclusively with stream events.  Python launches the
     current layer first, then performs the successor's KT host write and GPU
     enqueue work while the current layer is already running on the main stream.
+
+    ``staging_window`` is the ``--kt-layer-h2d-slots`` logical window
+    (doc section 3.3).  ``None`` keeps the legacy behaviour of staging every
+    non-resident expert; a positive window selects only the target layer's
+    top-S experts from its own history (section 8) and routes the uncovered
+    experts through the CPU fallback.
     """
 
     def __init__(
@@ -2470,6 +2525,7 @@ class _Mxfp4LayerwisePrefillManager:
         signature: tuple,
         slot1_raw_tensors: Dict[str, torch.Tensor],
         slot_marlin_prepared: tuple,
+        staging_window: Optional[int] = None,
     ):
         self.context = context
         self.signature = signature
@@ -2482,6 +2538,23 @@ class _Mxfp4LayerwisePrefillManager:
             _Mxfp4PrefillSlot(0, slot0_raw, slot_marlin_prepared[0]),
             _Mxfp4PrefillSlot(1, slot1_raw_tensors, slot_marlin_prepared[1]),
         )
+        self.num_experts = self.slots[0].num_experts
+        self.staging_window = clamp_staging_window(staging_window, self.num_experts)
+        self.planner = (
+            StagingPrefetchPlanner(self.num_experts, self.staging_window)
+            if self.staging_window is not None
+            else None
+        )
+        self.telemetry = StagingTelemetry() if self.planner is not None else None
+        # History D2H runs on its own stream so neither the compute stream nor
+        # the TP control stream ever waits for the statistics copy (section
+        # 9.1 step 3).
+        self.history_stream = torch.cuda.Stream(device=self.device)
+        # (layer_idx, epoch, staged_ids, pinned_counts, d2h_event,
+        #  pinned_cpu_routes)
+        self._pending_demand: List[tuple] = []
+        self._layer_metrics: Dict[int, Dict[str, float]] = {}
+        self._layer_staged: Dict[int, Tuple[int, ...]] = {}
         self.transfer_stream = torch.cuda.Stream(device=self.device)
         self.postprocess_stream = torch.cuda.Stream(device=self.device)
         # Runtime transport control must not use the main stream: it is
@@ -2489,8 +2562,23 @@ class _Mxfp4LayerwisePrefillManager:
         # that compute.  A one-element NCCL reduction on this dedicated stream
         # is substantially cheaper than a Gloo round-trip per transport phase.
         self.control_stream = torch.cuda.Stream(device=self.device)
-        self.host_slot_free_events = (torch.cuda.Event(), torch.cuda.Event())
-        self.host_slot_was_used = [False, False]
+        # Host-slot ring (doc section 7.5).  The pinned CPU staging context owns
+        # the physical slots; the ring spans two rolling generations of
+        # ``--kt-layer-h2d-batch-size`` slots, so a batch always writes the
+        # generation the previous batch's H2D is not reading and the host write
+        # of batch b+1 overlaps the DMA of batch b.  Section 20 item 8 is what
+        # makes the wider ring worth paying for: one ``sync`` and one TP fence
+        # per batch replace the per-expert round trips.
+        context_depth = int(getattr(context, "cpu_buffer_depth", 2) or 2)
+        self.host_slots = max(2, context_depth)
+        self.host_write_batch = max(1, self.host_slots // 2)
+        # Parity runs across layers on purpose: the first batch of L+1 must not
+        # wait for the last batch of L (see ``host_generation_slots``).
+        self._host_generation = 0
+        self.host_slot_free_events = tuple(
+            torch.cuda.Event() for _ in range(self.host_slots)
+        )
+        self.host_slot_was_used = [False] * self.host_slots
         self.host_write_status = torch.ones(
             (1,), dtype=torch.int32, device="cpu"
         )
@@ -2516,9 +2604,220 @@ class _Mxfp4LayerwisePrefillManager:
         pos = bisect.bisect_right(order, layer_idx)
         return order[pos] if pos < len(order) else None
 
+    # ------------------------------------------------------------------
+    # Router demand pump (doc sections 9.1 and 14.5)
+    # ------------------------------------------------------------------
+
+    def _stage_router_demand(
+        self,
+        layer_idx: int,
+        topk_ids: Optional[torch.Tensor],
+        staged_ids: Sequence[int],
+        cpu_routes: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Queue a side-stream D2H copy of layer L's per-expert demand.
+
+        The histogram never leaves the device synchronously: the int32 copy is
+        issued on a dedicated stream and folded into the history at the next
+        layer boundary, so the compute stream never pays for ``.tolist()`` in
+        the hot loop.  Layer L's router only updates ``history[L]``.
+
+        ``topk_ids`` must be the explicit logical ids of the standard carrier.
+        A deferred carrier exposes none on ``dispatch_output``; the partial
+        path hands over the ids it already materialized for CPU/GPU masking,
+        so only the fully-GPU path can skip a layer here.  The partial path's
+        CPU route counter rides the same stream into pinned memory, so folding
+        it never reads a device scalar (section 14.5).
+        """
+
+        if self.planner is None or topk_ids is None:
+            return
+        host_routes = None
+        try:
+            flat = topk_ids.reshape(-1)
+            valid = flat[(flat >= 0) & (flat < self.num_experts)]
+            counts = torch.bincount(
+                valid.to(torch.int64), minlength=self.num_experts
+            )
+            host = torch.empty(self.num_experts, dtype=torch.int32, pin_memory=True)
+            if cpu_routes is not None:
+                host_routes = torch.empty((), dtype=torch.int64, pin_memory=True)
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(self.history_stream):
+                self.history_stream.wait_event(ready)
+                host.copy_(counts, non_blocking=True)
+                # ``counts`` and the CPU route scalar are produced on the
+                # compute stream but read asynchronously on the history
+                # stream.  Pin their allocations to that stream so the
+                # caching allocator cannot recycle either block before the
+                # D2H has run and silently corrupt the histogram.
+                counts.record_stream(self.history_stream)
+                if host_routes is not None:
+                    cpu_routes.record_stream(self.history_stream)
+                    host_routes.copy_(cpu_routes, non_blocking=True)
+                done = torch.cuda.Event()
+                done.record(self.history_stream)
+        except Exception:
+            logger.debug(
+                "KT prefill staging: router demand D2H skipped for layer %d",
+                layer_idx,
+                exc_info=True,
+            )
+            return
+        self._pending_demand.append(
+            (
+                layer_idx,
+                self.epoch,
+                tuple(int(e) for e in staged_ids),
+                host,
+                done,
+                host_routes,
+            )
+        )
+
+    def _flush_router_demand(self) -> None:
+        """Fold completed demand histograms into the history table."""
+
+        if not self._pending_demand:
+            return
+        pending = []
+        for (
+            layer_idx,
+            epoch,
+            staged_ids,
+            host,
+            event,
+            host_routes,
+        ) in self._pending_demand:
+            if not event.query():
+                pending.append(
+                    (layer_idx, epoch, staged_ids, host, event, host_routes)
+                )
+                continue
+            counts = host.to(torch.float32)
+            self.planner.record_router_counts(layer_idx, counts)
+            if epoch != self.epoch:
+                # Tail demand from an earlier round: the per-layer statistics
+                # are still valid, but the staged ids and the timing pair
+                # belong to an expired epoch and must not be folded into the
+                # current round's telemetry.
+                continue
+            demand = counts.tolist()
+            staging_hits = sum(
+                1 for expert_id in staged_ids if demand[expert_id] > 0
+            )
+            route_count = None
+            if host_routes is not None:
+                # The pinned scalar was written by the same side stream that
+                # published ``event``, so this read is host-only (section
+                # 14.5): no device synchronization on the layer boundary.
+                route_count = int(host_routes.item())
+            self._record_layer_telemetry(
+                layer_idx,
+                staging_hits=staging_hits,
+                cpu_routes=route_count,
+            )
+        self._pending_demand = pending
+
+    def _per_expert_raw_bytes(self) -> int:
+        cached = getattr(self, "_raw_bytes_per_expert", None)
+        if cached is not None:
+            return cached
+        total = 0
+        for name in _Mxfp4PrefillSlot.RAW_NAMES:
+            tensor = getattr(self.slots[0], name)
+            total += (
+                tensor.numel() * tensor.element_size() // max(1, self.num_experts)
+            )
+        self._raw_bytes_per_expert = total
+        return total
+
+    def note_cpu_routes(self, count: int) -> None:
+        """Fold a zero-sync CPU route count into the next round summary (section 15.1).
+
+        The hybrid gate already holds this value on the host (section 14.5), so
+        merging it costs one host-side add and never a device readback.
+        """
+
+        if self.telemetry is not None:
+            self.telemetry.add_cpu_routes(count)
+
+    def _record_layer_telemetry(
+        self,
+        layer_idx: int,
+        staging_hits: int = 0,
+        cpu_routes: Optional[int] = None,
+    ) -> None:
+        """Record one layer's counters and emit the round summary (section 15)."""
+
+        if self.telemetry is None:
+            return
+        staged_ids = self._layer_staged.pop(layer_idx, None)
+        metrics = self._layer_metrics.pop(layer_idx, None)
+        if staged_ids is None and metrics is None:
+            return
+        staged_count = len(staged_ids) if staged_ids is not None else 0
+        metrics = metrics or {}
+        self.telemetry.record_layer(
+            candidate_count=metrics.get("candidate_count", 0.0),
+            selected_count=staged_count,
+            resident_count=metrics.get("resident_count", 0.0),
+            staging_hit_count=staging_hits,
+            staging_miss_count=max(0, staged_count - staging_hits),
+            cpu_expert_count=metrics.get("cpu_expert_count", 0.0),
+            gpu_expert_count=metrics.get("gpu_expert_count", 0.0),
+            cpu_route_count=cpu_routes,
+            copy_bytes=metrics.get("copy_bytes"),
+            copy_ms=metrics.get("copy_ms"),
+            postprocess_ms=metrics.get("postprocess_ms"),
+            bank_reuse_wait_ms=metrics.get("bank_reuse_wait_ms"),
+            ready_wait_ms=self._resolve_ready_wait(metrics.get("ready_pair")),
+            compute_ms=metrics.get("compute_ms"),
+        )
+        summary = self.telemetry.take_summary()
+        if summary is not None and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s", format_round_summary(summary))
+
+    @staticmethod
+    def _resolve_ready_wait(ready_pair) -> Optional[float]:
+        """Time the layer spent waiting for its staged weights (section 15.1).
+
+        Both timestamps live on different streams, so the pair can only be read
+        once the compute stream has actually passed the layer boundary.  The
+        measurement is therefore resolved here, at the next layer boundary,
+        instead of inside the layer's own launch (section 14.5).
+        """
+
+        if ready_pair is None:
+            return None
+        ready_ts, probe = ready_pair
+        try:
+            if ready_ts.query() and probe.query():
+                return max(0.0, ready_ts.elapsed_time(probe))
+        except Exception:
+            return None
+        return None
+
     def abort_round(self) -> None:
         if not self.round_active:
             return
+        # Fold the completed tail demand before tearing the round down: the
+        # last layer has no following layer boundary in this round, so this is
+        # the only place where its counters can still reach the history and
+        # the round summary.  Whatever is left is unresolvable and is dropped
+        # together with the per-layer telemetry so a stale ``ready_pair`` can
+        # never be read against a future round.
+        try:
+            self._flush_router_demand()
+        except Exception:
+            logger.debug(
+                "KT prefill staging: tail demand flush failed during abort",
+                exc_info=True,
+            )
+        self._pending_demand.clear()
+        self._layer_metrics.clear()
+        self._layer_staged.clear()
         self.epoch += 1
         self.last_layer_position = None
         self.current_slot_index = None
@@ -2542,6 +2841,13 @@ class _Mxfp4LayerwisePrefillManager:
         ):
             self.epoch += 1
             self.round_active = True
+            # Round wrap: telemetry state that the previous round never
+            # consumed belongs to an expired epoch.  Its demand entry (if any)
+            # is skipped by the epoch check in the flush, and clearing the
+            # staged ids and timing pairs here keeps them from leaking into
+            # this round's metrics.
+            self._layer_metrics.clear()
+            self._layer_staged.clear()
             for slot in self.slots:
                 if slot.epoch != self.epoch:
                     slot.invalidate()
@@ -2653,7 +2959,7 @@ class _Mxfp4LayerwisePrefillManager:
 
         def expert_nbytes(name: str) -> int:
             tensor = buffers[name]
-            return tensor.numel() // 2 * tensor.element_size()
+            return tensor.numel() // self.host_slots * tensor.element_size()
 
         offsets = {
             name: host_slot * expert_nbytes(name)
@@ -2663,6 +2969,11 @@ class _Mxfp4LayerwisePrefillManager:
         def rank_pointers(name: str) -> List[int]:
             return [ptr + offsets[name] for ptr in pointers[name]]
 
+        # Submission only.  The drain is deliberately not part of this helper:
+        # the layerwise loop queues a whole host-write batch and pays a single
+        # ``sync_write_weight_scale_to_buffer`` for it (doc section 20 item 8),
+        # which is what takes the per-expert Python/KT round trip off the
+        # critical path.
         method.wrapper.submit_write_weight_scale_to_buffer(
             get_tensor_model_parallel_world_size(),
             expert_id,
@@ -2671,7 +2982,6 @@ class _Mxfp4LayerwisePrefillManager:
             rank_pointers("w2_weight"),
             rank_pointers("w2_weight_scale_inv"),
         )
-        method.wrapper.sync_write_weight_scale_to_buffer()
 
     def _postprocess_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         from sglang.srt.layers.quantization.v4_marlin_moe import (
@@ -2696,6 +3006,10 @@ class _Mxfp4LayerwisePrefillManager:
                 # before this slot can be overwritten on a retry.
                 try:
                     slot.ready_event.record(self.postprocess_stream)
+                    # Timestamped companion used to measure how long the next
+                    # layer's compute had to wait for staged weights
+                    # (doc section 15.1 ``ready_wait_ms``).
+                    slot.ready_ts.record(self.postprocess_stream)
                     slot.reuse_guard = "ready"
                 except Exception:
                     self.postprocess_stream.synchronize()
@@ -2754,6 +3068,19 @@ class _Mxfp4LayerwisePrefillManager:
                         gpu_expert_ids.append(expert_id)
                     else:
                         cpu_expert_ids.append(expert_id)
+
+                # Prefetch candidates strictly come from the target layer
+                # (section 8.1).  ``gpu_expert_ids`` is this layer's resident
+                # set and is the dedup exclusion; the bank about to be
+                # overwritten is not an exclusion set.  Without a staging
+                # window every non-resident expert is staged, which is the
+                # legacy whole-layer prefetch.
+                if self.planner is not None:
+                    staged_expert_ids = self.planner.select(
+                        layer_idx, gpu_expert_ids
+                    )
+                else:
+                    staged_expert_ids = cpu_expert_ids
 
                 if hasattr(os, "sched_getaffinity"):
                     saved_affinity = os.sched_getaffinity(0)
@@ -2821,9 +3148,26 @@ class _Mxfp4LayerwisePrefillManager:
                 gpu_copy_error, f"GPU expert copy for layer {layer_idx}"
             )
 
+            transfer_start = time.perf_counter()
             pending_h2d_error = None
-            for position, expert_id in enumerate(cpu_expert_ids):
-                host_slot = position % 2
+            # Section 15.2 ``bank reuse wait``: how long the host write had to
+            # wait for the previous generation's H2D to release its host slot.
+            reuse_wait_ms = 0.0
+            # Doc section 20 item 8: the pinned host ring is sized by
+            # ``--kt-layer-h2d-batch-size``, so one batch owns a whole
+            # generation of host slots.  Per batch the layer therefore pays
+            # exactly one ``sync_write_weight_scale_to_buffer``, one
+            # host-slot-free TP fence and one write TP fence instead of one of
+            # each per expert.
+            for batch_ids in host_write_batches(
+                staged_expert_ids, self.host_write_batch
+            ):
+                # Rolling double buffer: batch b writes generation b % 2 while
+                # batch b-1's H2D drains the other one.
+                batch_slots = host_generation_slots(
+                    self._host_generation, self.host_write_batch, len(batch_ids)
+                )
+                self._host_generation ^= 1
 
                 # Rank 0 writes every rank's SHM.  Every rank must therefore
                 # finish its own DMA before that host slot can be overwritten.
@@ -2832,15 +3176,19 @@ class _Mxfp4LayerwisePrefillManager:
                 # the same collective order instead of stranding a peer.
                 host_free_error = pending_h2d_error
                 pending_h2d_error = None
-                try:
-                    if self.host_slot_was_used[host_slot]:
+                reuse_wait_start = time.perf_counter()
+                for host_slot in batch_slots:
+                    if not self.host_slot_was_used[host_slot]:
+                        continue
+                    try:
                         self.host_slot_free_events[host_slot].synchronize()
-                except Exception as exc:
-                    if host_free_error is None:
-                        host_free_error = exc
+                    except Exception as exc:
+                        if host_free_error is None:
+                            host_free_error = exc
+                reuse_wait_ms += (time.perf_counter() - reuse_wait_start) * 1000.0
                 self._commit_tp_device_runtime_phase(
                     host_free_error,
-                    f"host-slot {host_slot} reuse for expert {expert_id}",
+                    f"host-slot reuse before expert {batch_ids[0]}",
                 )
 
                 write_error = None
@@ -2851,48 +3199,64 @@ class _Mxfp4LayerwisePrefillManager:
                                 "MXFP4 TP0 has no KT wrapper for host weight "
                                 "transport"
                             )
-                        self._submit_host_write(method, expert_id, host_slot)
+                        for offset, expert_id in enumerate(batch_ids):
+                            self._submit_host_write(
+                                method, expert_id, batch_slots[offset]
+                            )
+                        # One drain for the whole batch.  The KT task queue
+                        # already holds every expert of the batch, so its worker
+                        # thread starts the next write without waiting for a new
+                        # Python submit, and this host thread pays a single
+                        # ``cpu_infer.sync()`` instead of one per expert.
+                        method.wrapper.sync_write_weight_scale_to_buffer()
                     except Exception as exc:
                         write_error = exc
 
                 # The device reduction is both the producer-ready fence and
                 # an error broadcast.  TP0 therefore cannot strand peer ranks
-                # in a later phase if its KT writer fails.
+                # in a later phase if its KT writer fails, and no rank starts
+                # the H2D of a batch whose host slots are not fully written.
                 self._commit_tp_device_runtime_phase(
-                    write_error, f"host write for expert {expert_id}"
+                    write_error,
+                    f"host write for experts {batch_ids[0]}..{batch_ids[-1]}",
                 )
 
                 host_free_recorded = False
                 try:
                     with torch.cuda.stream(self.transfer_stream):
                         try:
-                            for _, cpu_buffer, destination in weight_infos:
-                                destination[expert_id].copy_(
-                                    cpu_buffer[host_slot], non_blocking=True
-                                )
+                            for offset, expert_id in enumerate(batch_ids):
+                                for _, cpu_buffer, destination in weight_infos:
+                                    destination[expert_id].copy_(
+                                        cpu_buffer[batch_slots[offset]],
+                                        non_blocking=True,
+                                    )
                         finally:
                             # Once any DMA may have been enqueued, a peer's
                             # failure must not make this rank forget the local
-                            # host-slot fence before the consensus raises.
-                            self.host_slot_was_used[host_slot] = True
-                            self.host_slot_free_events[host_slot].record(
-                                self.transfer_stream
-                            )
+                            # host-slot fences before the consensus raises.
+                            for host_slot in batch_slots:
+                                self.host_slot_was_used[host_slot] = True
+                            for host_slot in batch_slots:
+                                self.host_slot_free_events[host_slot].record(
+                                    self.transfer_stream
+                                )
                             host_free_recorded = True
                 except Exception as exc:
                     pending_h2d_error = exc
-                    if self.host_slot_was_used[host_slot] and not host_free_recorded:
+                    if not host_free_recorded:
                         try:
                             # Event publication itself failed.  A local-stream
                             # sync is the exception-only safe fallback before
                             # this rank reports failure to its peers.
                             self.transfer_stream.synchronize()
-                            self.host_slot_was_used[host_slot] = False
+                            for host_slot in batch_slots:
+                                self.host_slot_was_used[host_slot] = False
                         except Exception:
                             pass
 
             # H2D launch errors are reported at the next pre-write consensus.
-            # The final expert has no successor, so combine its sticky status
+            # The final batch has no successor, so combine its sticky status
             # with raw-fence publication and commit it once per layer.
             raw_ready_error = pending_h2d_error
             try:
@@ -2910,7 +3274,9 @@ class _Mxfp4LayerwisePrefillManager:
             self._commit_tp_runtime_phase(
                 raw_ready_error, f"raw-ready fence for layer {layer_idx}"
             )
+            copy_ms = (time.perf_counter() - transfer_start) * 1000.0
 
+            postprocess_start = time.perf_counter()
             postprocess_error = None
             try:
                 self._postprocess_slot(slot)
@@ -2919,7 +3285,28 @@ class _Mxfp4LayerwisePrefillManager:
             self._commit_tp_runtime_phase(
                 postprocess_error, f"postprocess for layer {layer_idx}"
             )
+            postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
             slot.state = "READY"
+            slot.resident_ids = list(gpu_expert_ids)
+            slot.staged_ids = list(staged_expert_ids)
+            slot.effective_ids, slot.partial = effective_experts(
+                gpu_expert_ids, staged_expert_ids, slot.num_experts
+            )
+            slot.candidate_count = len(cpu_expert_ids)
+            slot.effective_mask_cuda = None
+            slot.cpu_routes_scalar = None
+            if self.telemetry is not None:
+                self._layer_staged[layer_idx] = tuple(staged_expert_ids)
+                self._layer_metrics.setdefault(layer_idx, {}).update(
+                    candidate_count=float(len(cpu_expert_ids)),
+                    resident_count=float(len(gpu_expert_ids)),
+                    copy_bytes=float(
+                        self._per_expert_raw_bytes() * len(staged_expert_ids)
+                    ),
+                    copy_ms=copy_ms,
+                    postprocess_ms=postprocess_ms,
+                    bank_reuse_wait_ms=reuse_wait_ms,
+                )
         except Exception:
             # Fence any partial transfer generation before a caller can retry
             # and overwrite this slot.  _postprocess_slot upgrades the guard
@@ -3004,6 +3391,11 @@ class _Mxfp4LayerwisePrefillManager:
 
     def apply(self, method, layer, dispatch_output):
         layer_idx = method.kt_config.layer_idx
+        # Fold the previous layer's asynchronously copied demand histogram
+        # into its history before this layer's prefetch decision reads it.
+        self._flush_router_demand()
+        if self.planner is not None:
+            self.planner.note_layer_visit(layer_idx)
         slot, prefetch_hit = self._acquire(layer_idx, method, layer)
         if slot.layer_idx != layer_idx or slot.epoch != self.epoch:
             raise RuntimeError(
@@ -3015,14 +3407,40 @@ class _Mxfp4LayerwisePrefillManager:
         main_stream = None
         result = None
         compute_error = None
+        compute_ms = None
+        # Explicit logical ids materialized by the partial path; reused for
+        # the demand pump when the outer carrier is deferred.
+        partial_topk_ids = None
+        ready_pair = None
         try:
             main_stream = torch.cuda.current_stream(self.device)
             main_stream.wait_event(slot.ready_event)
+            if self.telemetry is not None:
+                # Timestamp the moment the staged weights were admitted onto
+                # the compute stream.  The wait is only *measured* at the next
+                # layer boundary: the host runs ahead of the device, so the
+                # value is not observable here without a synchronous read
+                # (section 14.5).
+                ready_probe = torch.cuda.Event(enable_timing=True)
+                ready_probe.record(main_stream)
+                ready_pair = (slot.ready_ts, ready_probe)
             self._bind_slot(slot)
             self._record_prepared_backing_on_stream(slot, main_stream)
-            result = self.context.gpu_method.apply(
-                self.context.gpu_layer, dispatch_output
-            )
+            if slot.partial:
+                # GPU = resident + staged; the uncovered experts run the CPU
+                # fallback in parallel (doc section 9.3).  The helper reports
+                # the GPU submission segment itself so the successor prefetch
+                # and the blocking CPU join stay out of ``compute_ms``
+                # (section 15.2).
+                result, partial_topk_ids, compute_ms = self._apply_effective_set(
+                    method, layer, dispatch_output, slot
+                )
+            else:
+                compute_start = time.perf_counter()
+                result = self.context.gpu_method.apply(
+                    self.context.gpu_layer, dispatch_output
+                )
+                compute_ms = (time.perf_counter() - compute_start) * 1000.0
         except Exception as exc:
             compute_error = exc
         finally:
@@ -3052,10 +3470,52 @@ class _Mxfp4LayerwisePrefillManager:
             compute_error, f"compute launch for layer {layer_idx}"
         )
 
+        # GPU compute is now enqueued: publish this layer's router demand on
+        # the history stream so the statistics never block the compute stream
+        # (doc section 9.1 step 3).
+        topk_output = getattr(dispatch_output, "topk_output", None)
+        demand_ids = getattr(topk_output, "topk_ids", None)
+        if demand_ids is None:
+            # Deferred carrier: the partial path already materialized explicit
+            # logical ids for the CPU/GPU split, so the history pump reuses
+            # them instead of leaving this layer on cold-start rotation.
+            demand_ids = partial_topk_ids
+        self._stage_router_demand(
+            layer_idx,
+            demand_ids,
+            slot.staged_ids,
+            cpu_routes=slot.cpu_routes_scalar,
+        )
+        if self.telemetry is not None:
+            metrics = self._layer_metrics.setdefault(layer_idx, {})
+            metrics.update(
+                gpu_expert_count=float(len(slot.effective_ids)),
+                cpu_expert_count=float(
+                    self.num_experts - len(slot.effective_ids)
+                ),
+                compute_ms=compute_ms,
+            )
+            if ready_pair is not None:
+                metrics["ready_pair"] = ready_pair
+
         # Dynamic MXFP4 placement must consume the raw image for the slot just
         # executed.  Run it before successor prefetch can overwrite the shared
         # shadow context's raw tensors.
-        if method._gec_enabled or method.kt_config.kt_enable_dynamic_expert_update:
+        #
+        # While the staging window is active the resident pool keeps its
+        # startup layout: migrating rows between layers would build a second,
+        # staging-unrelated H2D stream in dense prefill, and the prefetch that
+        # already ran for L+1 selected against the pre-update resident set
+        # (doc sections 3.3.1 and 10).  Only the async history update runs.
+        #
+        # ``--kt-enable-dynamic-expert-update`` (legacy top-N admission) and
+        # ``--kt-expert-gpu-slots`` (GEC residency) are alternative resident
+        # modes that are never configured together; the staging window
+        # suppresses the physical update of whichever one is active.
+        if self.staging_window is None and (
+            method._gec_enabled
+            or method.kt_config.kt_enable_dynamic_expert_update
+        ):
             dynamic_error = None
             try:
                 method._update_gpu_experts_from_batch(
@@ -3075,16 +3535,144 @@ class _Mxfp4LayerwisePrefillManager:
 
         # GPU compute is now enqueued.  Host KT writes and successor transfer
         # scheduling can overlap it without requiring an async kt-kernel API.
-        self._prefetch_successor(slot)
+        # The partial path already submitted the successor inside
+        # ``_apply_effective_set`` so the prefetch also overlaps the CPU
+        # fallback (section 14.1 ordering).
+        if not slot.partial:
+            self._prefetch_successor(slot)
         if method.tp_rank == 0:
-            logger.info(
-                "KT MXFP4 layerwise prefill: layer=%d epoch=%d slot=%d %s",
+            logger.debug(
+                "KT MXFP4 layerwise prefill: layer=%d epoch=%d slot=%d %s "
+                "partial=%s cpu=%s staged=%d resident=%d",
                 layer_idx,
                 self.epoch,
                 slot.index,
                 "prefetch-hit" if prefetch_hit else "prime",
+                slot.partial,
+                # Gate confirmation only (section 14.6): whether this layer has
+                # experts outside the frozen GPU set.  The route-level CPU
+                # counts are reported asynchronously in the round summary.
+                bool(slot.partial and len(slot.effective_ids) < slot.num_experts),
+                len(slot.staged_ids),
+                len(slot.resident_ids),
             )
         return result
+
+    def _effective_mask_for_slot(
+        self, slot: _Mxfp4PrefillSlot, device
+    ) -> torch.Tensor:
+        """Device bool mask of ``resident(L) + staged(L)`` (doc section 3.5)."""
+
+        mask = slot.effective_mask_cuda
+        if mask is None or mask.device != device:
+            mask = torch.zeros(slot.num_experts, dtype=torch.bool, device=device)
+            if slot.effective_ids:
+                mask[
+                    torch.tensor(
+                        slot.effective_ids, dtype=torch.long, device=device
+                    )
+                ] = True
+            slot.effective_mask_cuda = mask
+        return mask
+
+    def _apply_effective_set(
+        self,
+        method,
+        layer: torch.nn.Module,
+        dispatch_output,
+        slot: _Mxfp4PrefillSlot,
+    ):
+        """Partial staging: GPU experts plus a parallel CPU fallback.
+
+        Section 9.3 freezes both expert sets right after the router and runs
+        the CPU GEMM, the GPU GEMM and the L+1 prefetch concurrently.  The
+        shadow layer holds every expert row, so masked ids stay logical ids
+        and the remap is the identity.  Both the effective-set mask and the
+        CPU fallback consume explicit logical ids, so a deferred top-k carrier
+        is materialized here exactly like the hybrid path does; the fully-GPU
+        path keeps its original carrier for backends that route internally.
+
+        Returns ``(result, topk_ids, gpu_submit_ms)``.  The ids let the caller
+        reuse the materialization for the demand pump; the timing covers only
+        the GPU submission prefix (section 15.2), so the successor prefetch and
+        the blocking CPU join never inflate ``compute_ms``.
+        """
+
+        from contextlib import nullcontext
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        device = x.device
+        submit_start = time.perf_counter()
+        topk_output = materialize_kt_topk_output(
+            dispatch_output.topk_output, method.kt_config.layer_idx
+        )
+        if topk_output is not dispatch_output.topk_output:
+            dispatch_output = dispatch_output._replace(topk_output=topk_output)
+        topk_ids = topk_output.topk_ids
+        effective_mask = self._effective_mask_for_slot(slot, topk_ids.device)
+
+        cpu_topk_ids = mask_gpu_expert_ids_for_cpu(topk_ids, effective_mask)
+        gpu_topk_ids = mask_topk_ids_for_expert_group(topk_ids, effective_mask)
+        # Keep the route count on the device: reading it back here would add a
+        # scalar sync to the layer hot path (section 14.5).  It is folded into
+        # the telemetry at the next layer boundary instead.
+        slot.cpu_routes_scalar = (cpu_topk_ids >= 0).sum()
+
+        no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
+        staging_buffer = None
+        cpu_submitted = False
+        if method.tp_rank == 0 and method._cpu_stream is not None:
+            if method._shared_staging_buffer is None:
+                raise RuntimeError(
+                    "MXFP4 partial staging requires the shared staging buffer "
+                    "for the CPU expert fallback"
+                )
+            staging_buffer = method._shared_staging_buffer.get_slice(x.shape[0])
+            staging_buffer.copy_(x, non_blocking=True)
+            if not no_cpu_stream:
+                method._cpu_stream.wait_stream(torch.cuda.current_stream(device))
+            stream_ctx = (
+                nullcontext()
+                if no_cpu_stream
+                else torch.cuda.stream(method._cpu_stream)
+            )
+            with stream_ctx:
+                cpu_submitted = method._submit_with_staged_input(
+                    layer, dispatch_output, staging_buffer, gpu_mask=effective_mask
+                )
+
+        gpu_dispatch = dispatch_output._replace(
+            topk_output=topk_output._replace(topk_ids=gpu_topk_ids)
+        )
+        output = self.context.gpu_method.apply(
+            self.context.gpu_layer, gpu_dispatch
+        ).hidden_states
+        gpu_submit_ms = (time.perf_counter() - submit_start) * 1000.0
+
+        # Section 14.1 ordering: L's compute is enqueued, so submit L+1's host
+        # write / H2D / postprocess before the CPU and GPU paths are joined.
+        # The prefetch then overlaps the CPU fallback instead of following it.
+        # ``apply`` skips its own successor submission for this path.
+        self._prefetch_successor(slot)
+
+        if cpu_submitted:
+            stream_ctx = (
+                nullcontext()
+                if no_cpu_stream
+                else torch.cuda.stream(method._cpu_stream)
+            )
+            with stream_ctx:
+                cpu_output = method._sync_with_staged_input(staging_buffer)
+                if not no_cpu_stream:
+                    method._sync_done_event.record(method._cpu_stream)
+            if not no_cpu_stream:
+                torch.cuda.current_stream(device).wait_event(
+                    method._sync_done_event
+                )
+            output = output + cpu_output
+        return StandardCombineInput(hidden_states=output), topk_ids, gpu_submit_ms
 
 
 def _mxfp4_pipeline_signature(method, layer: torch.nn.Module) -> tuple:
@@ -3380,6 +3968,22 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
             global_num_experts=method.global_num_experts,
             moe_runner_config=method.moe_runner_config,
             defer_cpu_buffers=True,
+            # The pinned host ring is what lets the layerwise loop queue a whole
+            # host-write batch before draining it, and the two rolling
+            # generations are what keep the host write of batch b+1 overlapping
+            # the H2D of batch b (doc sections 7.5 and 20 item 8).
+            # ``--kt-layer-h2d-batch-size`` is the documented H2D batch
+            # granularity, so it sizes one generation exactly like the GEC
+            # staging context does.  An unset flag starts from the documented
+            # prefill default of 8 experts per drain (about 168MB of pinned
+            # SHM per rank on DeepSeek-V4.1-Flash at TP=2), which keeps the
+            # per-layer drain and TP-fence count at ceil(S / 8) instead of the
+            # old two-slot pair's one round trip per expert.  Explicit
+            # ``--kt-layer-h2d-batch-size 1`` still degenerates to that pair,
+            # because ``SharedFullContext`` floors the ring depth at two.
+            cpu_buffer_depth=host_ring_depth(
+                int(getattr(method.kt_config, "kt_layer_h2d_batch_size", 8) or 8)
+            ),
         )
     )
 
@@ -3426,7 +4030,11 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
 
     manager, manager_failure = _try_mxfp4_initialization(
         lambda: _Mxfp4LayerwisePrefillManager(
-            context, signature, slot1_raw, slot_marlin_prepared
+            context,
+            signature,
+            slot1_raw,
+            slot_marlin_prepared,
+            getattr(method.kt_config, "kt_layer_h2d_slots", None),
         )
     )
     if not _all_tp_ranks_succeeded(manager_failure is None):
@@ -3473,11 +4081,12 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
         logger.info(
             "KT MXFP4 layerwise prefill lazily initialized two raw + two Marlin "
             "prepared full-layer slots on %s (raw=%.2f GiB, "
-            "prepared=%.2f GiB, total=%.2f GiB)",
+            "prepared=%.2f GiB, total=%.2f GiB, staging_window=%s)",
             manager.device,
             raw_bytes / 1024**3,
             prepared_bytes / 1024**3,
             (raw_bytes + prepared_bytes) / 1024**3,
+            manager.staging_window if manager.staging_window is not None else "full",
         )
 
 
@@ -5411,6 +6020,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
         staged_hidden_states: torch.Tensor,
+        gpu_mask: Optional[torch.Tensor] = None,
     ) -> bool:
         """Submit CPU expert computation using staged hidden states.
 
@@ -5418,6 +6028,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
             staged_hidden_states: Pre-copied hidden states in staging buffer
+            gpu_mask: GPU expert mask to split against.  The hybrid path uses
+                the persistent resident mask; partial staging passes the
+                per-layer effective mask (resident + staged) so staged experts
+                are never submitted to the CPU GEMM twice.
         """
         assert self.moe_runner_config.activation in ("silu", "situ"), (
             "KT CPU experts support only SiLU and SiTU activations."
@@ -5436,7 +6050,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # mask before this method is called, so newly admitted H2D experts are
         # never submitted to the CPU GEMM as duplicate work.
         cpu_topk_ids = mask_gpu_expert_ids_for_cpu(
-            topk_ids, self.gpu_experts_mask_cuda
+            topk_ids,
+            self.gpu_experts_mask_cuda if gpu_mask is None else gpu_mask,
         )
         self._submit_cpu_forward(staged_hidden_states, cpu_topk_ids, topk_weights)
         return True
@@ -5594,6 +6209,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
         )
+        # Prefill staging (doc section 13.1) is jointly gated by
+        # --kt-layer-h2d-slots (S > 0 selects the feature and sizes the
+        # per-bank window) and --kt-gpu-prefill-token-threshold, and only runs
+        # on prefill-like forwards.  With S unset the legacy full-layer
+        # layerwise path stays exactly as before.
+        _prefill_like = _kt_is_prefill_like()
+        _staging_window = clamp_staging_window(
+            getattr(self.kt_config, "kt_layer_h2d_slots", None),
+            self.global_num_experts,
+        )
+        _staging_requested = staging_requested_for_batch(
+            _staging_window,
+            self.gpu_prefill_token_threshold,
+            num_tokens,
+            prefill_like=_prefill_like,
+            runtime_supported=_mxfp4_pipeline_runtime_supported(self, layer),
+        )
         # GEC is independent of the legacy full-GPU prefill flag. Use the
         # existing full-layer path to observe extend batches and update hot
         # residency; decode-sized batches consume the resulting resident set.
@@ -5621,6 +6253,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             trace_id,
             trace_started_ns,
             "path_select",
+            extend=_prefill_like,
+            staging_window=_staging_window,
             legacy_full_gpu=_legacy_full_gpu_gate,
             gec_full_gpu=_gec_full_gpu_gate,
             gec_persistent_mxfp4=_gec_persistent_mxfp4,
@@ -5638,8 +6272,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if _mxfp4_signature is not None
             else False
         )
+        _staging_gate = _staging_requested and not _mxfp4_disabled_after_oom
+        if _staging_gate:
+            self._kt_trace(
+                trace_id,
+                trace_started_ns,
+                "staging_gate",
+                staging_window=_staging_window,
+                prefill_like=_prefill_like,
+            )
 
-        if _mxfp4_manager is not None and not _full_gpu_gate:
+        if _mxfp4_manager is not None and not (_full_gpu_gate or _staging_gate):
             _mxfp4_manager.abort_round()
 
         # Allocate the persistent full-layer slots only when a request actually
@@ -5648,7 +6291,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # records a disabled reason and this same request falls through to the
         # existing hybrid CPU/GPU path below.
         if (
-            _full_gpu_gate
+            (_full_gpu_gate or _staging_gate)
             and _mxfp4_requested
             and not _mxfp4_disabled_after_oom
             and _mxfp4_manager is None
@@ -5663,6 +6306,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if _mxfp4_signature is not None
                 else False
             )
+            _staging_gate = _staging_requested and not _mxfp4_disabled_after_oom
+
+        # Prefill streaming has priority over the GEC resident path: the
+        # staging manager keeps the startup resident layout fixed and drives
+        # decode through the ordinary GEC path afterwards (doc sections 10 and
+        # 13.2).
+        if _staging_gate and _mxfp4_manager is not None:
+            self._kt_trace(
+                trace_id, trace_started_ns, "staging_mxfp4_start"
+            )
+            result = _mxfp4_manager.apply(self, layer, dispatch_output)
+            self._kt_trace(trace_id, trace_started_ns, "staging_mxfp4_end")
+            return result
 
         if _full_gpu_gate and not (
             _mxfp4_requested and _mxfp4_disabled_after_oom
@@ -5843,11 +6499,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
         _kt_route_count_sync_ms = 0.0
         _kt_route_count_device = str(cpu_topk_ids.device)
+        _kt_route_count_source = "synced"
         if capture_active:
             # CUDA Graph capture cannot materialize a device predicate with
             # .item(). Keep the existing graph-safe submit/sync path; the CPU
             # kernel skips -1 routes even when this batch has no fallback.
             has_cpu_fallback = True
+            _kt_route_count_source = "capture"
+        elif self.num_gpu_experts == 0:
+            # Section 14.5: with no GPU-resident row the mask is empty, so
+            # ``mask_gpu_expert_ids_for_cpu`` kept every id and the route count
+            # is ``numel`` without touching the device.  Dropping the scalar
+            # readback here removes the dominant host stall of the CPU-only
+            # tail (about 18 ms per layer call in the 2026-10-15 log).
+            _kt_cpu_route_count = cpu_topk_ids.numel()
+            has_cpu_fallback = _kt_cpu_route_count > 0
+            _kt_route_count_source = "mask_empty"
         else:
             _kt_route_count_sync_start_ns = time.perf_counter_ns()
             if cpu_topk_ids.device.type == "cuda":
@@ -5879,7 +6546,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             cpu_routes=_kt_cpu_route_count,
             route_count_sync_ms=f"{_kt_route_count_sync_ms:.3f}",
             tensor_device=_kt_route_count_device,
+            route_count_source=_kt_route_count_source,
         )
+        if _kt_cpu_route_count and _mxfp4_manager is not None:
+            # Sections 14.5/15.1: the count already sits on the host, so the
+            # round summary picks it up without any extra device readback.
+            _mxfp4_manager.note_cpu_routes(_kt_cpu_route_count)
         if self.tp_rank == 0 and self._cpu_stream is not None and has_cpu_fallback:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
             assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"

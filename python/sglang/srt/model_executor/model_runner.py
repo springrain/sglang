@@ -277,6 +277,31 @@ def _prefill_cuda_graph_allows_context_parallel(
     )
 
 
+# Lazily resolved KT staging publication hook.  Importing the (dependency-free)
+# KT staging module at runner construction time would pull the MoE layer stack
+# into core startup, so the publisher is memoized on first use instead.
+_KT_FORWARD_MODE_PUBLISHER = None
+_KT_FORWARD_MODE_PUBLISHER_READY = False
+
+
+def _publish_kt_forward_mode(forward_mode) -> None:
+    """Publish the batch mode for the KT prefill-staging gate (KT doc 14.6)."""
+
+    global _KT_FORWARD_MODE_PUBLISHER, _KT_FORWARD_MODE_PUBLISHER_READY
+    if not _KT_FORWARD_MODE_PUBLISHER_READY:
+        try:
+            from sglang.srt.layers.moe.kt_prefill_staging import (
+                publish_forward_mode,
+            )
+
+            _KT_FORWARD_MODE_PUBLISHER = publish_forward_mode
+        except Exception:
+            _KT_FORWARD_MODE_PUBLISHER = None
+        _KT_FORWARD_MODE_PUBLISHER_READY = True
+    if _KT_FORWARD_MODE_PUBLISHER is not None:
+        _KT_FORWARD_MODE_PUBLISHER(forward_mode)
+
+
 @dataclass
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
@@ -1753,7 +1778,7 @@ class ModelRunner:
                                     "elapsed_ms=%.3f",
                                     time.perf_counter_ns() / 1e6,
                                     self.forward_pass_id,
-                                    getattr(self.ps, "tp_rank", -1),
+                                    getattr(self, "tp_rank", -1),
                                     _idx,
                                     code.co_name,
                                     code.co_filename,
@@ -1779,7 +1804,7 @@ class ModelRunner:
                     "layer=%d name=%s stream=%s capture=%s",
                     started_ns / 1e6,
                     self.forward_pass_id,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self, "tp_rank", -1),
                     _idx,
                     _name,
                     stream_id,
@@ -1833,7 +1858,7 @@ class ModelRunner:
                     "layer=%d name=%s wall_ms=%.3f cuda_pending=%s stream=%s capture=%s",
                     time.perf_counter_ns() / 1e6,
                     self.forward_pass_id,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self, "tp_rank", -1),
                     _idx,
                     _name,
                     (time.perf_counter_ns() - started_ns) / 1e6,
@@ -1853,7 +1878,7 @@ class ModelRunner:
             len(layers),
             [item[0] for item in layers],
             type(self.model).__module__ + "." + type(self.model).__name__,
-            getattr(self.ps, "tp_rank", -1),
+            getattr(self, "tp_rank", -1),
         )
 
         # Layer-wide hooks identify the slow transformer block, but a block can
@@ -1894,7 +1919,7 @@ class ModelRunner:
                         "tp_rank=%s layer=%d module=%s stream=%s capture=%s",
                         started_ns / 1e6,
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                         _layer_idx,
                         _name,
                         stream_id,
@@ -1940,7 +1965,7 @@ class ModelRunner:
                         "cuda_pending=%s stream=%s capture=%s",
                         time.perf_counter_ns() / 1e6,
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                         _layer_idx,
                         _name,
                         (time.perf_counter_ns() - started_ns) / 1e6,
@@ -1966,7 +1991,7 @@ class ModelRunner:
                     (name, type(module).__module__ + "." + type(module).__name__)
                     for name, module in child_layer.named_children()
                 ],
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self, "tp_rank", -1),
             )
 
     def _kt_poll_layer_events(self) -> None:
@@ -2016,7 +2041,7 @@ class ModelRunner:
                 "layer=%d name=%s cuda_ms=%.3f host_wall_ms=%.3f stream=%s",
                 now_ns / 1e6,
                 pass_id,
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self, "tp_rank", -1),
                 layer_idx,
                 name,
                 cuda_ms,
@@ -2055,7 +2080,7 @@ class ModelRunner:
                 "tokens=%s stream=%s host_submit_ms=%.3f",
                 state["host_submit_ns"] / 1e6,
                 state["pass"],
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self, "tp_rank", -1),
                 state["tokens"],
                 state["stream"],
                 (state["host_submit_ns"] - state["host_start_ns"]) / 1e6,
@@ -2086,7 +2111,7 @@ class ModelRunner:
                 "submit_to_complete_ms=%.3f",
                 now_ns / 1e6,
                 state["pass"],
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self, "tp_rank", -1),
                 state["tokens"],
                 state["stream"],
                 cuda_ms,
@@ -2132,6 +2157,11 @@ class ModelRunner:
         self.forward_pass_id += 1
         self._kt_poll_decode_events()
         self._kt_poll_layer_events()
+        # KT prefill-staging gate: publish the authoritative batch mode once
+        # per forward.  ``runtime_context.ForwardFlags`` has no forward_mode
+        # slot, so this publication is the KT wrapper's primary signal and the
+        # sticky is_extend_in_batch flag is only its compatibility fallback.
+        _publish_kt_forward_mode(getattr(forward_batch, "forward_mode", None))
         try:
             forward_batch._kt_debug_pass_id = self.forward_pass_id
         except Exception:
@@ -2152,7 +2182,7 @@ class ModelRunner:
                 "stream=%s out_cache_loc=%s pending_decode_events=%d",
                 time.perf_counter_ns() / 1e6,
                 self.forward_pass_id,
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self, "tp_rank", -1),
                 forward_mode,
                 getattr(forward_batch, "batch_size", -1),
                 forward_batch._forward_num_tokens(),
@@ -2209,7 +2239,7 @@ class ModelRunner:
                     "elapsed_ms=%.3f can_run_graph=%s",
                     time.perf_counter_ns() / 1e6,
                     self.forward_pass_id,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self, "tp_rank", -1),
                     (time.perf_counter_ns() - forward_trace_start) / 1e6,
                     output.can_run_graph,
                 )
@@ -2266,7 +2296,7 @@ class ModelRunner:
                 "elapsed_ms=%.3f can_run_graph=%s",
                 time.perf_counter_ns() / 1e6,
                 self.forward_pass_id,
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self, "tp_rank", -1),
                 (time.perf_counter_ns() - forward_trace_start) / 1e6,
                 output.can_run_graph,
             )
@@ -2335,7 +2365,7 @@ class ModelRunner:
                 "mode=%s tokens=%s",
                 time.perf_counter_ns() / 1e6,
                 self.forward_pass_id,
-                getattr(self.ps, "tp_rank", -1),
+                getattr(self, "tp_rank", -1),
                 str(forward_batch.forward_mode),
                 forward_batch._forward_num_tokens(),
             )
@@ -2371,7 +2401,7 @@ class ModelRunner:
                         "[kt-forward] phase=decode_graph_start pass=%d tp_rank=%s "
                         "elapsed_ms=%.3f stream=%s",
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                         (time.perf_counter_ns() - raw_trace_start) / 1e6,
                         getattr(torch.cuda.current_stream(), "cuda_stream", "unknown")
                         if self.device != "cpu"
@@ -2391,7 +2421,7 @@ class ModelRunner:
                         "[kt-forward] phase=decode_graph_end pass=%d tp_rank=%s "
                         "elapsed_ms=%.3f",
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                         (time.perf_counter_ns() - raw_trace_start) / 1e6,
                     )
                 return output
@@ -2408,7 +2438,7 @@ class ModelRunner:
                     "tp_rank=%s",
                     time.perf_counter_ns() / 1e6,
                     self.forward_pass_id,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self, "tp_rank", -1),
                 )
             self._prepare_eager_forward_batch(forward_batch)
             if logger.isEnabledFor(logging.DEBUG):
@@ -2417,7 +2447,7 @@ class ModelRunner:
                     "tp_rank=%s elapsed_ms=%.3f",
                     time.perf_counter_ns() / 1e6,
                     self.forward_pass_id,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self, "tp_rank", -1),
                     (time.perf_counter_ns() - raw_trace_start) / 1e6,
                 )
 
@@ -2438,7 +2468,7 @@ class ModelRunner:
                         "tp_rank=%s branch=%s",
                         time.perf_counter_ns() / 1e6,
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                         branch,
                     )
                 ret = self.forward_split_prefill(
@@ -2464,7 +2494,7 @@ class ModelRunner:
                         "tp_rank=%s branch=%s",
                         time.perf_counter_ns() / 1e6,
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                         branch,
                     )
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
@@ -2490,7 +2520,7 @@ class ModelRunner:
                         "tp_rank=%s branch=%s",
                         time.perf_counter_ns() / 1e6,
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                         branch,
                     )
                 ret = self.eager_runner.execute(
@@ -2507,7 +2537,7 @@ class ModelRunner:
                         "pass=%d tp_rank=%s",
                         time.perf_counter_ns() / 1e6,
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                     )
                 forward_batch.post_forward_mlp_sync_batch(ret)
                 if logger.isEnabledFor(logging.DEBUG):
@@ -2516,7 +2546,7 @@ class ModelRunner:
                         "pass=%d tp_rank=%s",
                         time.perf_counter_ns() / 1e6,
                         self.forward_pass_id,
-                        getattr(self.ps, "tp_rank", -1),
+                        getattr(self, "tp_rank", -1),
                     )
 
             output = ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
@@ -2527,7 +2557,7 @@ class ModelRunner:
                     "elapsed_ms=%.3f can_run_graph=%s",
                     time.perf_counter_ns() / 1e6,
                     self.forward_pass_id,
-                    getattr(self.ps, "tp_rank", -1),
+                    getattr(self, "tp_rank", -1),
                     branch,
                     (time.perf_counter_ns() - raw_trace_start) / 1e6,
                     can_run_graph,

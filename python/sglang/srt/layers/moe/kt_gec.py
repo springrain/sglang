@@ -379,6 +379,7 @@ class GlobalGecCoordinator:
         config.num_gpu_layers = max(0, int(num_gpu_layers))
         config.expert_gpu_slots = int(capacity)
         config.layer_h2d_slots = int(capacity)
+        config.layer_h2d_batch_size = max(1, int(h2d_batch_size))
         # Each concurrently running request may own one current H2D batch;
         # batch size determines the number of Logical slots in that batch,
         # not the number of reusable request slots.
@@ -390,6 +391,7 @@ class GlobalGecCoordinator:
         self._gec = gec_module
         self.capacity = int(capacity)
         self.tp_size = max(1, int(tp_size))
+        self.h2d_batch_size = config.layer_h2d_batch_size
         self.buffer_pool_depth = config.h2d_buffer_pool_depth
         self._cache = gec_module.GlobalExpertCache(
             config, gec_module.Topology(self.tp_size, 1, self.tp_size)
@@ -723,6 +725,8 @@ class GecResidencyPlanner:
             coordinator.capacity if coordinator is not None else self.capacity
         )
         config.layer_h2d_slots = self.budget
+        if coordinator is not None:
+            config.layer_h2d_batch_size = coordinator.h2d_batch_size
         config.validate()
         self._cache = (
             coordinator.cache

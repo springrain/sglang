@@ -907,11 +907,11 @@ class ExecMoe(msgspec.Struct):
     ] = None
     kt_layer_h2d_slots: A[
         Optional[int],
-        "[ktransformers parameter] Per-layer GEC H2D admission budget, counted in Logical Experts; requires --kt-expert-gpu-slots.",
+        "[ktransformers parameter] Per-layer staging window, counted in Logical Experts: the GEC per-round H2D admission budget when --kt-expert-gpu-slots is set, and the cross-layer prefill prefetch window when --kt-gpu-prefill-token-threshold is positive.",
     ] = None
     kt_layer_h2d_batch_size: A[
         Optional[int],
-        "[ktransformers parameter] Maximum Logical Experts per GEC H2D batch; a batch is min(available, batch_size) and never waits to be filled.",
+        "[ktransformers parameter] Maximum Logical Experts per GEC H2D batch; a batch is min(available, batch_size) and never waits to be filled. The layerwise prefill path also sizes one rolling host-ring generation with it (2 * k slots) and starts from 8 experts per batch when unset.",
     ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],
@@ -919,7 +919,7 @@ class ExecMoe(msgspec.Struct):
     ] = None
     kt_gpu_prefill_token_threshold: A[
         Optional[int],
-        "[ktransformers parameter] Independent token threshold for the legacy layerwise full-GPU prefill path.",
+        "[ktransformers parameter] Token threshold above which prefill forwards may migrate expert weights: the legacy layerwise full-GPU prefill path, and jointly with --kt-layer-h2d-slots the cross-layer prefill staging window.",
     ] = None
     record_kt_gpu_expert_distribution: A[
         bool,

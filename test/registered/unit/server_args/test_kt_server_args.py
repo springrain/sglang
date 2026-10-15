@@ -262,6 +262,18 @@ class TestKTValidation(unittest.TestCase):
                 kt_layer_h2d_batch_size=8,
             )
         )
+        # The staging window is also selectable without the GEC resident pool:
+        # --kt-layer-h2d-slots plus a positive prefill threshold is the joint
+        # gate of the cross-layer prefill staging mode.
+        validate_kt_args(
+            ServerArgs(
+                model_path="dummy",
+                kt_num_gpu_layers=3,
+                kt_layer_h2d_slots=256,
+                kt_layer_h2d_batch_size=8,
+                kt_gpu_prefill_token_threshold=2048,
+            )
+        )
         self.assert_invalid("requires --kt-num-gpu-experts", kt_weight_path="/w")
         self.assert_invalid(
             "requires --moe-a2a-backend none",
