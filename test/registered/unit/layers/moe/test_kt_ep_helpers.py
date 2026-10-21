@@ -76,6 +76,22 @@ def test_uniform_masks_keep_dense_layers_on_gpu():
     assert [int(row.sum()) for row in masks[1:]] == [2, 2, 2, 2]
 
 
+def test_uniform_masks_reserve_shared_experts_before_routed_ids():
+    masks = kt_ep.generate_uniform_masks(
+        num_layers=3,
+        num_experts=8,
+        num_gpu_experts=8,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        num_fused_shared_experts=2,
+    )
+
+    assert [int(row.sum()) for row in masks] == [3, 3, 2]
+    assert masks[0, [6, 7, 0]].all()
+    assert masks[1, [6, 7, 0]].all()
+    assert masks[2, [6, 7]].all()
+
+
 def test_front_loading_masks_are_deterministic_and_bounded():
     masks = kt_ep.generate_front_loading_masks(
         num_layers=4,
@@ -320,6 +336,173 @@ def test_update_gpu_expert_mappings_round_trip():
     assert torch.equal(gpu_to_logical, torch.tensor([5, 1, 3], dtype=torch.int32))
 
 
+def _make_mxfp4_refresh_fixture(canonical_rows: int):
+    raw_names = kt_ep._Mxfp4PrefillSlot.RAW_NAMES
+
+    def rows(count: int, seed: float) -> torch.Tensor:
+        return torch.arange(count * 2, dtype=torch.float32).reshape(count, 2) + seed
+
+    layer_raw = {name: torch.zeros(2, 2) for name in raw_names}
+    slot_raw = {
+        name: rows(3, 10.0 * (index + 1))
+        for index, name in enumerate(raw_names)
+    }
+    canonical = {
+        name: rows(canonical_rows, 100.0 * (index + 1))
+        for index, name in enumerate(raw_names)
+    }
+    layer = SimpleNamespace(**layer_raw)
+    layer._kt_mxfp4_raw_weights = canonical
+    layer._v4_marlin_weights = SimpleNamespace(
+        w13=torch.zeros(2, 2),
+        w13_scale=torch.zeros(2, 2),
+        w2=torch.zeros(2, 2),
+        w2_scale=torch.zeros(2, 2),
+    )
+    slot = SimpleNamespace(**slot_raw)
+    slot.marlin_prepared = SimpleNamespace(
+        w13=rows(3, 1.0),
+        w13_scale=rows(3, 11.0),
+        w2=rows(3, 21.0),
+        w2_scale=rows(3, 31.0),
+    )
+    slot.num_experts = 4
+    slot.logical_to_row = [-1, -1, -1, 2]
+    manager = kt_ep._Mxfp4LayerwisePrefillManager.__new__(
+        kt_ep._Mxfp4LayerwisePrefillManager
+    )
+    return manager, layer, slot, canonical, layer_raw, slot_raw
+
+
+def test_boundary_refresh_leaves_the_full_canonical_shadow_unchanged():
+    manager, layer, slot, canonical, layer_raw, slot_raw = (
+        _make_mxfp4_refresh_fixture(canonical_rows=4)
+    )
+    before = {name: tensor.clone() for name, tensor in canonical.items()}
+
+    manager._refresh_original_layer_rows(
+        method=None,
+        layer=layer,
+        slot=slot,
+        row_owner=[2, 1],
+        pairs=[(2, 3)],
+    )
+
+    for name in kt_ep._Mxfp4PrefillSlot.RAW_NAMES:
+        assert torch.equal(canonical[name], before[name])
+        assert torch.equal(layer_raw[name][0], slot_raw[name][2])
+
+
+def test_boundary_refresh_updates_a_compact_canonical_row():
+    manager, layer, slot, canonical, layer_raw, _ = _make_mxfp4_refresh_fixture(
+        canonical_rows=2
+    )
+    untouched = {name: tensor[1].clone() for name, tensor in canonical.items()}
+
+    manager._refresh_original_layer_rows(
+        method=None,
+        layer=layer,
+        slot=slot,
+        row_owner=[2, 1],
+        pairs=[(2, 3)],
+    )
+
+    for name in kt_ep._Mxfp4PrefillSlot.RAW_NAMES:
+        assert torch.equal(canonical[name][0], layer_raw[name][0])
+        assert torch.equal(canonical[name][1], untouched[name])
+
+
+def test_boundary_promotions_commit_a_live_bank_and_queue_a_reused_bank(
+    monkeypatch,
+):
+    class _History:
+        @staticmethod
+        def scores(layer_idx: int) -> torch.Tensor:
+            del layer_idx
+            return torch.tensor(
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, 0.0],
+                dtype=torch.float32,
+            )
+
+    manager = kt_ep._Mxfp4LayerwisePrefillManager.__new__(
+        kt_ep._Mxfp4LayerwisePrefillManager
+    )
+    manager.planner = SimpleNamespace(history=_History())
+    manager.shared_ids = []
+    manager.telemetry = None
+    manager.device = torch.device("cpu")
+    manager._staging_hit_counts = {
+        10: {2: 3, 3: 1},
+        11: {6: 4},
+    }
+    manager._layer_staging_state = {
+        10: (0, (0, 1), (2, 3)),
+        11: (1, (4, 5), (6, 7)),
+    }
+    manager._pending_boundary_promotions = {}
+
+    method10 = SimpleNamespace(
+        _resident_row_owner=torch.tensor([0, 1], dtype=torch.int64)
+    )
+    method11 = SimpleNamespace(
+        _resident_row_owner=torch.tensor([4, 5], dtype=torch.int64)
+    )
+    manager.signature = ("unit-test", "boundary-promotion")
+    monkeypatch.setitem(
+        kt_ep._MXFP4_PREFILL_LAYER_REGISTRY,
+        manager.signature,
+        {10: (method10, object()), 11: (method11, object())},
+    )
+
+    pool = kt_ep.StagingRowPool(
+        8, resident_capacity=2, staging_capacity=2
+    )
+    before = pool.configure(10, [0, 1], [2, 3])
+    slot10 = SimpleNamespace(
+        index=0,
+        loaded_layer_idx=10,
+        row_pool=pool,
+        consumed_event=SimpleNamespace(record=lambda stream: None),
+        resident_ids=[0, 1],
+        staged_ids=[2, 3],
+        effective_ids=[0, 1, 2, 3],
+        partial=True,
+        effective_mask_cuda=object(),
+        num_experts=8,
+    )
+    slot11 = SimpleNamespace(index=1, loaded_layer_idx=99)
+    manager.slots = (slot10, slot11)
+    manager.row_pools = (pool, object())
+
+    refresh_calls = []
+    publish_calls = []
+    manager._refresh_original_layer_rows = lambda *args: refresh_calls.append(args)
+    manager._publish_method_row_owner = (
+        lambda method, row_owner: publish_calls.append((method, list(row_owner)))
+    )
+    monkeypatch.setattr(
+        kt_ep.torch.cuda,
+        "current_stream",
+        lambda *args, **kwargs: object(),
+    )
+
+    manager._apply_boundary_promotions()
+
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0][-1] == [(0, 2), (1, 3)]
+    assert publish_calls == [(method10, [2, 3])]
+    assert manager._pending_boundary_promotions == {11: [(4, 6)]}
+    assert slot10.resident_ids == [2, 3]
+    assert slot10.staged_ids == []
+    assert manager._layer_staging_state[10] == (0, (2, 3), ())
+    assert pool.mapping(10)[2] == before[2]
+    assert pool.mapping(10)[3] == before[3]
+    assert pool.mapping(10)[0] == -1
+    assert pool.row_roles(10)[before[2]] == "resident"
+    assert pool.row_roles(10)[before[3]] == "resident"
+    assert manager._staging_hit_counts == {}
+
+
 def test_kt_cli_matrix_is_accepted():
     server_args = _parse_server_args(
         [
@@ -393,3 +576,142 @@ def test_kt_cli_matrix_is_accepted():
 def test_kt_invalid_runtime_combinations_fail_fast(extra):
     with pytest.raises(ValueError):
         _parse_server_args(extra)
+
+
+def test_mxfp4_prepared_only_requires_a_positive_staging_window(monkeypatch):
+    monkeypatch.delenv(kt_ep._MXFP4_PREPARED_ONLY_ENV, raising=False)
+
+    assert not kt_ep._mxfp4_prepared_only_requested(
+        SimpleNamespace(kt_layer_h2d_slots=None)
+    )
+    assert not kt_ep._mxfp4_prepared_only_requested(
+        SimpleNamespace(kt_layer_h2d_slots=0)
+    )
+    assert kt_ep._mxfp4_prepared_only_requested(
+        SimpleNamespace(kt_layer_h2d_slots=32)
+    )
+
+    monkeypatch.setenv(kt_ep._MXFP4_PREPARED_ONLY_ENV, "0")
+    assert not kt_ep._mxfp4_prepared_only_requested(
+        SimpleNamespace(kt_layer_h2d_slots=32)
+    )
+
+
+def test_mxfp4_prepared_only_layer_requires_prepared_and_cpu_raw_images():
+    names = kt_ep._MXFP4_RAW_WEIGHT_NAMES
+    layer = SimpleNamespace(
+        _v4_marlin_weights=object(),
+        **{name: torch.empty(1) for name in names},
+    )
+    assert kt_ep._mxfp4_prepared_only_layer(layer)
+
+    delattr(layer, names[0])
+    assert not kt_ep._mxfp4_prepared_only_layer(layer)
+
+
+def test_resident_host_ids_prefer_pending_promotions_and_canonical_rows():
+    assert kt_ep._mxfp4_resident_host_ids(
+        prepared_only=False,
+        prepared_source=None,
+        gpu_expert_ids=[1, 2, 3],
+        pending_pairs=[],
+        canonical_ids={1},
+    ) == [2, 3]
+
+    assert kt_ep._mxfp4_resident_host_ids(
+        prepared_only=True,
+        prepared_source=None,
+        gpu_expert_ids=[1, 2, 3],
+        pending_pairs=[],
+        canonical_ids={1, 2, 3},
+    ) == [1, 2, 3]
+
+    assert kt_ep._mxfp4_resident_host_ids(
+        prepared_only=True,
+        prepared_source=object(),
+        gpu_expert_ids=[1, 2, 3],
+        pending_pairs=[(1, 7)],
+        canonical_ids={1, 2, 3},
+    ) == [7]
+
+
+def test_kt_layer_cuda_device_prefers_prepared_image_and_keeps_rank_device():
+    prepared = SimpleNamespace(w13=SimpleNamespace(device=torch.device("cuda:1")))
+    layer = SimpleNamespace(
+        _v4_marlin_weights=prepared,
+        w13_weight=SimpleNamespace(device=torch.device("cuda:0")),
+    )
+    assert kt_ep._kt_layer_cuda_device(layer) == torch.device("cuda:1")
+
+    cpu_layer = SimpleNamespace(
+        _v4_marlin_weights=None,
+        w13_weight=torch.empty(0),
+        parameters=lambda: iter([torch.empty(0)]),
+    )
+    assert kt_ep._kt_layer_cuda_device(
+        cpu_layer, fallback=torch.device("cuda:1")
+    ) == torch.device("cuda:1")
+
+
+def test_mxfp4_scratch_capacity_is_bounded_by_the_staging_window():
+    layer = SimpleNamespace(
+        quant_method=SimpleNamespace(
+            kt_config=SimpleNamespace(kt_layer_h2d_slots=8)
+        )
+    )
+    assert kt_ep._mxfp4_scratch_capacity(layer, 32) == 8
+    assert kt_ep._mxfp4_scratch_capacity(layer, 3) == 3
+    assert kt_ep._mxfp4_scratch_capacity(SimpleNamespace(), 32) == 32
+
+
+def test_mxfp4_raw_scratch_is_model_scoped_and_keeps_legacy_bank():
+    owner = SimpleNamespace(
+        **{
+            name: torch.empty(0, 2, 2)
+            for name in kt_ep._MXFP4_RAW_WEIGHT_NAMES
+        }
+    )
+    legacy = {"raw": "legacy-raw", "prepared": object()}
+    owner._kt_mxfp4_repack_scratch = legacy
+
+    scratch = kt_ep._get_mxfp4_raw_scratch(
+        owner, torch.device("cpu"), 4
+    )
+    assert scratch["w13_weight"].shape == (4, 2, 2)
+    assert owner._kt_mxfp4_raw_h2d_scratch["capacity"] == 4
+    assert owner._kt_mxfp4_repack_scratch is legacy
+    assert (
+        kt_ep._get_mxfp4_raw_scratch(owner, torch.device("cpu"), 2)
+        is scratch
+    )
+
+
+def test_mxfp4_prefill_slot_allows_prepared_only_raw_scratch_rows(monkeypatch):
+    class _Event:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(kt_ep.torch.cuda, "Event", _Event)
+
+    def make_slot(raw_rows, physical_rows, prepared_only):
+        raw = {
+            name: torch.empty(raw_rows, 2, 2)
+            for name in kt_ep._Mxfp4PrefillSlot.RAW_NAMES
+        }
+        return kt_ep._Mxfp4PrefillSlot(
+            0,
+            raw,
+            SimpleNamespace(num_experts=physical_rows),
+            num_experts=8,
+            physical_rows=physical_rows,
+            prepared_only=prepared_only,
+        )
+
+    slot = make_slot(raw_rows=2, physical_rows=5, prepared_only=True)
+    assert slot.raw_rows == 2
+    assert slot.physical_rows == 5
+
+    with pytest.raises(ValueError, match="same row count"):
+        make_slot(raw_rows=2, physical_rows=5, prepared_only=False)
+    with pytest.raises(ValueError, match="selected row layout"):
+        make_slot(raw_rows=6, physical_rows=5, prepared_only=True)

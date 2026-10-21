@@ -32,7 +32,6 @@ KT_DOWNSTREAM_FIELDS = (
     "kt_num_gpu_layers",
     "kt_expert_gpu_slots",
     "kt_layer_h2d_slots",
-    "kt_layer_h2d_batch_size",
     "kt_gpu_prefill_token_threshold",
     "record_kt_gpu_expert_distribution",
     "kt_enable_dynamic_expert_update",
@@ -74,8 +73,6 @@ class TestKTFieldMigration(unittest.TestCase):
                 "2560",
                 "--kt-layer-h2d-slots",
                 "64",
-                "--kt-layer-h2d-batch-size",
-                "8",
                 "--kt-gpu-prefill-token-threshold",
                 "128",
                 "--record-kt-gpu-expert-distribution",
@@ -94,7 +91,6 @@ class TestKTFieldMigration(unittest.TestCase):
         self.assertEqual(args.kt_num_gpu_layers, 3)
         self.assertEqual(args.kt_expert_gpu_slots, 2560)
         self.assertEqual(args.kt_layer_h2d_slots, 64)
-        self.assertEqual(args.kt_layer_h2d_batch_size, 8)
         self.assertEqual(args.kt_gpu_prefill_token_threshold, 128)
         self.assertTrue(args.record_kt_gpu_expert_distribution)
         self.assertTrue(args.kt_enable_dynamic_expert_update)
@@ -114,7 +110,6 @@ class TestKTFieldMigration(unittest.TestCase):
             "kt_num_gpu_layers",
             "kt_expert_gpu_slots",
             "kt_layer_h2d_slots",
-            "kt_layer_h2d_batch_size",
             "kt_max_deferred_experts_per_token",
             "kt_gpu_prefill_token_threshold",
             "record_kt_gpu_expert_distribution",
@@ -218,10 +213,6 @@ class TestKTValidation(unittest.TestCase):
             ("expert-gpu-slots must be non-negative", {"kt_expert_gpu_slots": -1}),
             ("layer-h2d-slots must be non-negative", {"kt_layer_h2d_slots": -1}),
             (
-                "layer-h2d-batch-size must be at least 1",
-                {"kt_layer_h2d_batch_size": 0},
-            ),
-            (
                 "deferred-experts-per-token must be non-negative",
                 {"kt_max_deferred_experts_per_token": -1},
             ),
@@ -239,10 +230,6 @@ class TestKTValidation(unittest.TestCase):
                 "require --kt-expert-gpu-slots",
                 {"kt_layer_h2d_slots": 64},
             ),
-            (
-                "require --kt-expert-gpu-slots",
-                {"kt_layer_h2d_batch_size": 8},
-            ),
         )
         for message, fields in gec_dependency_cases:
             with self.subTest(fields=fields):
@@ -259,7 +246,6 @@ class TestKTValidation(unittest.TestCase):
                 model_path="dummy",
                 kt_expert_gpu_slots=2560,
                 kt_layer_h2d_slots=64,
-                kt_layer_h2d_batch_size=8,
             )
         )
         # The staging window is also selectable without the GEC resident pool:
@@ -270,7 +256,6 @@ class TestKTValidation(unittest.TestCase):
                 model_path="dummy",
                 kt_num_gpu_layers=3,
                 kt_layer_h2d_slots=256,
-                kt_layer_h2d_batch_size=8,
                 kt_gpu_prefill_token_threshold=2048,
             )
         )

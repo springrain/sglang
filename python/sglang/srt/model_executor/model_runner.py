@@ -284,8 +284,8 @@ _KT_FORWARD_MODE_PUBLISHER = None
 _KT_FORWARD_MODE_PUBLISHER_READY = False
 
 
-def _publish_kt_forward_mode(forward_mode) -> None:
-    """Publish the batch mode for the KT prefill-staging gate (KT doc 14.6)."""
+def _publish_kt_forward_mode(forward_mode, forward_id=None) -> None:
+    """Publish the batch mode and pass id for the KT staging gate (doc 14.6)."""
 
     global _KT_FORWARD_MODE_PUBLISHER, _KT_FORWARD_MODE_PUBLISHER_READY
     if not _KT_FORWARD_MODE_PUBLISHER_READY:
@@ -299,7 +299,7 @@ def _publish_kt_forward_mode(forward_mode) -> None:
             _KT_FORWARD_MODE_PUBLISHER = None
         _KT_FORWARD_MODE_PUBLISHER_READY = True
     if _KT_FORWARD_MODE_PUBLISHER is not None:
-        _KT_FORWARD_MODE_PUBLISHER(forward_mode)
+        _KT_FORWARD_MODE_PUBLISHER(forward_mode, forward_id=forward_id)
 
 
 @dataclass
@@ -2161,7 +2161,10 @@ class ModelRunner:
         # per forward.  ``runtime_context.ForwardFlags`` has no forward_mode
         # slot, so this publication is the KT wrapper's primary signal and the
         # sticky is_extend_in_batch flag is only its compatibility fallback.
-        _publish_kt_forward_mode(getattr(forward_batch, "forward_mode", None))
+        _publish_kt_forward_mode(
+            getattr(forward_batch, "forward_mode", None),
+            forward_id=self.forward_pass_id,
+        )
         try:
             forward_batch._kt_debug_pass_id = self.forward_pass_id
         except Exception:

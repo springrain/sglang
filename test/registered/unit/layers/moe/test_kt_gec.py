@@ -16,7 +16,6 @@ def _config(**overrides):
         layer_idx=3,
         kt_expert_gpu_slots=None,
         kt_layer_h2d_slots=None,
-        kt_layer_h2d_batch_size=None,
         kt_enable_dynamic_expert_update=False,
     )
     for key, value in overrides.items():
@@ -293,21 +292,24 @@ class TestGlobalGecCoordinator(unittest.TestCase):
     def test_request_concurrency_derives_copy_pool_depth(self):
         module = kt_gec._load_gec_module()
         coordinator = kt_gec.GlobalGecCoordinator(
-            module, capacity=4, max_running_requests=17, h2d_batch_size=4
+            module, capacity=4, max_running_requests=17
         )
         self.assertEqual(coordinator.buffer_pool_depth, 17)
-        self.assertEqual(coordinator.h2d_batch_size, 4)
 
-    def test_default_h2d_batch_size_is_single_expert(self):
+    def test_copy_pool_depth_scales_with_running_requests(self):
         module = kt_gec._load_gec_module()
-        coordinator = kt_gec.GlobalGecCoordinator(module, capacity=1)
-        self.assertEqual(coordinator.h2d_batch_size, 1)
+        for requests in (1, 4, 64):
+            coordinator = kt_gec.GlobalGecCoordinator(
+                module, capacity=1, max_running_requests=requests
+            )
+            self.assertEqual(coordinator.buffer_pool_depth, requests)
 
-    def test_layer_planner_inherits_global_h2d_batch_size(self):
+    def test_h2d_selection_is_taken_in_one_pass(self):
+        """Without a batch-size knob the round budget drains in a single pass."""
+
         source = Path(kt_gec.__file__).read_text(encoding="utf-8")
-        self.assertIn(
-            "config.layer_h2d_batch_size = coordinator.h2d_batch_size", source
-        )
+        self.assertNotIn("h2d_batch_size", source)
+        self.assertNotIn("layer_h2d_batch_size", source)
 
     def test_default_h2d_budget_uses_layer_capacity(self):
         wrapper = Path(kt_gec.__file__).with_name("kt_gec.py")
@@ -409,8 +411,7 @@ class TestRuntimeContract(unittest.TestCase):
         self.assertIn("stream_batches", text)
         self.assertIn("wait_on_current=not stream_batches", text)
         self.assertIn("stream_batches=bool(self._gec_enabled)", text)
-        self.assertIn('configured_batch = getattr(self.kt_config, "kt_layer_h2d_batch_size", None)', text)
-        self.assertIn("copy_batch = (", text)
+        self.assertIn("copy_batch = len(arrived)", text)
         self.assertIn("stream_batch_events", text)
 
     def test_int4_gec_uses_selected_row_cpu_copy(self):
@@ -471,22 +472,25 @@ class TestRuntimeContract(unittest.TestCase):
         self.assertIn("_mxfp4_manager.note_cpu_routes(_kt_cpu_route_count)", text)
 
     def test_layerwise_host_write_runs_one_drain_per_batch(self):
-        """Doc section 20 item 8: batch the KT writer, not one expert at a time."""
+        """Doc section 20 item 8: the writer drains once for the whole staged set."""
 
         wrapper = Path(kt_gec.__file__).with_name("kt_ep_wrapper.py")
         text = wrapper.read_text(encoding="utf-8")
 
-        # The pinned host ring carries one free event per slot.
+        # The pinned host ring carries one free event per slot and spans two
+        # generations of the staging window (FreeToken's prefill shape).
         self.assertIn('getattr(context, "cpu_buffer_depth", 2)', text)
-        self.assertIn("self.host_write_batch = max(1, self.host_slots // 2)", text)
-        self.assertIn("self._host_generation ^= 1", text)
-        self.assertIn("host_ring_depth(", text)
-        # Doc section 7.5: the layerwise ring starts from the documented
-        # k = 8 generation when --kt-layer-h2d-batch-size is unset.
         self.assertIn(
-            'int(getattr(method.kt_config, "kt_layer_h2d_batch_size", 8) or 8)',
+            "self.host_write_batch = self.staging_window or (self.host_slots // 2)",
             text,
         )
+        self.assertIn("self._host_generation ^= 1", text)
+        self.assertIn("host_generation_range(", text)
+        self.assertIn("host_ring_depth(", text)
+        # No batch-size knob survives anywhere on this path.
+        self.assertNotIn("host_write_batches", text)
+        self.assertNotIn("host_generation_slots", text)
+        self.assertNotIn("kt_layer_h2d_batch_size", text)
 
         # The single-expert submit helper must not drain the KT writer itself.
         submit_start = text.index("    def _submit_host_write(")
@@ -496,12 +500,18 @@ class TestRuntimeContract(unittest.TestCase):
             text[submit_start:submit_end],
         )
 
-        # The layer transport loop batches ids and drains once per batch.
+        # The layer transport loop takes the whole staged set in one pass and
+        # therefore drains the KT writer exactly once.
         load_start = text.index("    def _load_slot(")
         load_end = text.index("    def _acquire(", load_start)
         load_text = text[load_start:load_end]
-        self.assertIn("for batch_ids in host_write_batches(", load_text)
-        self.assertIn("host_generation_slots(", load_text)
+        self.assertIn(
+            "batch_slots = host_generation_range(\n"
+            "                    self._host_generation, self.host_slots, len(batch_ids)\n"
+            "                )",
+            load_text,
+        )
+        self.assertNotIn("for batch_ids in host_write_batches(", load_text)
         self.assertIn("batch_slots[offset]", load_text)
         self.assertIn("method.wrapper.sync_write_weight_scale_to_buffer()", load_text)
         self.assertEqual(

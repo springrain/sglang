@@ -59,17 +59,34 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.layers.moe.kt_prefill_staging import (
+    ForwardBoundaryTracker,
     StagingPrefetchPlanner,
+    StagingRowPool,
     StagingTelemetry,
+    apply_row_owner_promotions,
     clamp_staging_window,
+    contiguous_copy_runs,
+    contiguous_stage_runs,
     effective_experts,
+    fit_staged_window,
     format_round_summary,
-    host_generation_slots,
+    fused_shared_expert_ids,
+    host_generation_range,
     host_ring_depth,
-    host_write_batches,
     is_prefill_like_mode,
     published_forward_mode,
+    published_forward_id,
+    select_boundary_promotions,
+    shared_first_resident_ids,
     staging_requested_for_batch,
+    uniform_resident_counts,
+)
+from sglang.srt.layers.moe.kt_prefill_copy import (
+    BatchCopy,
+    build_row_copy_plan,
+    row_nbytes,
+    try_batch_memcpy,
+    try_multi_row_copy,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -163,7 +180,6 @@ class KTConfig:
     # counted in Logical Experts; see sglang.srt.layers.moe.kt_gec.
     kt_expert_gpu_slots: Optional[int] = None
     kt_layer_h2d_slots: Optional[int] = None
-    kt_layer_h2d_batch_size: Optional[int] = None
     # Shared model-scope coordinator.  It is populated by
     # create_kt_config_from_server_args so every MoE layer uses one global
     # Logical-Expert cache rather than constructing a cache per layer.
@@ -173,10 +189,242 @@ class KTConfig:
     max_running_requests: int = 0
 
 
+_MXFP4_PREPARED_ONLY_ENV = "SGLANG_KT_MXFP4_PREPARED_ONLY"
+_MXFP4_RAW_SCRATCH_ATTR = "_kt_mxfp4_raw_h2d_scratch"
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_MXFP4_RAW_WEIGHT_NAMES = (
+    "w13_weight",
+    "w13_weight_scale_inv",
+    "w2_weight",
+    "w2_weight_scale_inv",
+)
+
+
+def _kt_layer_cuda_device(
+    layer: torch.nn.Module, fallback: Optional[torch.device] = None
+) -> torch.device:
+    """Resolve a layer's real CUDA device after prepared-only raw offload.
+
+    KT moves checkpoint-native MXFP4 tensors to CPU once the Marlin image is
+    ready.  ``next(layer.parameters()).device`` can therefore report CPU even
+    though the executable weights remain on the rank's GPU.  Prefer the
+    prepared kernel image, then any remaining CUDA weight/buffer/parameter.
+    """
+
+    prepared = getattr(layer, "_v4_marlin_weights", None)
+    if prepared is not None:
+        for name in ("w13", "w13_scale", "w2", "w2_scale"):
+            tensor = getattr(prepared, name, None)
+            device = getattr(tensor, "device", None)
+            if device is not None and getattr(device, "type", None) == "cuda":
+                return device
+
+    tensor_names = (
+        *_MXFP4_RAW_WEIGHT_NAMES,
+        "w13_weight_packed",
+        "w13_weight_scale",
+        "w2_weight_packed",
+        "w2_weight_scale",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    )
+    for name in tensor_names:
+        tensor = getattr(layer, name, None)
+        device = getattr(tensor, "device", None)
+        if device is not None and getattr(device, "type", None) == "cuda":
+            return device
+
+    parameters = getattr(layer, "parameters", None)
+    if callable(parameters):
+        for parameter in parameters():
+            device = getattr(parameter, "device", None)
+            if device is not None and getattr(device, "type", None) == "cuda":
+                return device
+    buffers = getattr(layer, "buffers", None)
+    if callable(buffers):
+        for buffer in buffers():
+            device = getattr(buffer, "device", None)
+            if device is not None and getattr(device, "type", None) == "cuda":
+                return device
+
+    if fallback is not None:
+        return torch.device(fallback)
+    if callable(parameters):
+        try:
+            return next(parameters()).device
+        except StopIteration:
+            pass
+    return torch.device("cpu")
+
+
+def _mxfp4_raw_weights_on_cpu(layer: torch.nn.Module) -> bool:
+    tensors = [getattr(layer, name, None) for name in _MXFP4_RAW_WEIGHT_NAMES]
+    return all(
+        getattr(getattr(tensor, "device", None), "type", None) == "cpu"
+        for tensor in tensors
+    )
+
+
+def _mxfp4_prepared_only_layer(layer: torch.nn.Module) -> bool:
+    return (
+        getattr(layer, "_v4_marlin_weights", None) is not None
+        and _mxfp4_raw_weights_on_cpu(layer)
+    )
+
+
+def _mxfp4_resident_host_ids(
+    *,
+    prepared_only: bool,
+    prepared_source,
+    gpu_expert_ids: Sequence[int],
+    pending_pairs: Sequence[Tuple[int, int]],
+    canonical_ids: set,
+) -> List[int]:
+    """Return resident experts that must arrive through the pinned H2D path."""
+
+    if not prepared_only:
+        return [
+            expert_id
+            for expert_id in gpu_expert_ids
+            if expert_id not in canonical_ids
+        ]
+    if prepared_source is None:
+        return list(gpu_expert_ids)
+    if pending_pairs:
+        return [promoted_id for _, promoted_id in pending_pairs]
+    return [
+        expert_id
+        for expert_id in gpu_expert_ids
+        if expert_id not in canonical_ids
+    ]
+
+
+def _get_mxfp4_raw_scratch(
+    layer: torch.nn.Module, device: torch.device, capacity: int
+) -> Dict[str, torch.Tensor]:
+    """Return a bounded GPU scratch bank for selected raw expert rows.
+
+    The scratch belongs to a model-scoped owner (the shared context's shadow
+    layer), not to every destination layer.  Keeping one bank per layer would
+    reserve ``num_layers * capacity`` expert rows for a path that only uses one
+    layer's rows at a time.
+    """
+
+    capacity = max(1, int(capacity))
+    scratch = getattr(layer, _MXFP4_RAW_SCRATCH_ATTR, None)
+    if (
+        scratch is not None
+        and scratch.get("capacity", 0) >= capacity
+        and scratch.get("device") == torch.device(device)
+    ):
+        return scratch["raw"]
+
+    raw = {
+        name: torch.empty(
+            (capacity, *getattr(layer, name).shape[1:]),
+            dtype=getattr(layer, name).dtype,
+            device=device,
+        )
+        for name in _MXFP4_RAW_WEIGHT_NAMES
+    }
+    setattr(
+        layer,
+        _MXFP4_RAW_SCRATCH_ATTR,
+        {
+            "capacity": capacity,
+            "device": torch.device(device),
+            "raw": raw,
+        },
+    )
+    return raw
+
+
+def _mxfp4_scratch_capacity(layer: torch.nn.Module, requested: int) -> int:
+    """Bound a temporary raw scratch bank by the configured staging window."""
+
+    capacity = max(1, int(requested))
+    config = getattr(getattr(layer, "quant_method", None), "kt_config", None)
+    if config is None:
+        config = getattr(layer, "kt_config", None)
+    window = getattr(config, "kt_layer_h2d_slots", None)
+    try:
+        window = int(window) if window is not None else None
+    except (TypeError, ValueError):
+        window = None
+    if window is not None and window > 0:
+        capacity = min(capacity, window)
+    return max(1, capacity)
+
+
+def _mxfp4_prepared_only_requested(config: KTConfig) -> bool:
+    """Whether the staging path should keep only one kernel-ready GPU image.
+
+    FreeToken's slot cache stores the exact layout consumed by its expert
+    kernel.  KT's Marlin path needs a short-lived raw image for the CPU writer
+    and the repack kernels, but resident rows do not need a second permanent
+    raw copy.  Prepared-only mode is therefore tied to the positive staging
+    window and can be disabled for A/B diagnostics.
+    """
+
+    if os.environ.get(_MXFP4_PREPARED_ONLY_ENV, "1").strip().lower() in (
+        _FALSE_ENV_VALUES
+    ):
+        return False
+    window = getattr(config, "kt_layer_h2d_slots", None)
+    try:
+        return window is not None and int(window) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _move_mxfp4_raw_layer_bytes_to_cpu(layer: torch.nn.Module) -> int:
+    """Move one MXFP4 layer's checkpoint-native tensors to CPU."""
+
+    moved_bytes = 0
+    for name in _Mxfp4PrefillSlot.RAW_NAMES:
+        tensor = getattr(layer, name, None)
+        if tensor is None or tensor.device.type == "cpu":
+            continue
+        moved_bytes += tensor.numel() * tensor.element_size()
+        tensor.data = tensor.data.to(device="cpu", non_blocking=False)
+    canonical = getattr(layer, "_kt_mxfp4_raw_weights", None)
+    if canonical is not None:
+        layer._kt_mxfp4_raw_weights = {
+            name: getattr(layer, name).detach()
+            for name in _Mxfp4PrefillSlot.RAW_NAMES
+            if hasattr(layer, name)
+        }
+    if all(
+        getattr(layer, name, None) is not None
+        and getattr(layer, name).device.type == "cpu"
+        for name in _Mxfp4PrefillSlot.RAW_NAMES
+    ):
+        layer._kt_mxfp4_raw_weights_on_cpu = True
+    return moved_bytes
+
+
+def _move_mxfp4_raw_weights_to_cpu(layer: torch.nn.Module) -> int:
+    """Drop the resident raw GPU image after Marlin preparation.
+
+    The returned bytes are the approximate device memory released.  A CPU
+    canonical copy is retained because the existing GEC/full-fallback APIs may
+    still ask for the checkpoint-native tensors; the streaming hot path only
+    reads the prepared image.
+    """
+
+    if getattr(layer, "_v4_marlin_weights", None) is None:
+        return 0
+    return _move_mxfp4_raw_layer_bytes_to_cpu(layer)
+
+
 def _should_pack_all_experts_on_load(config: KTConfig) -> bool:
     """Whether the native CPU image must retain GPU-resident experts too."""
 
-    if config.kt_enable_dynamic_expert_update or config.kt_expert_gpu_slots:
+    if (
+        getattr(config, 'kt_enable_dynamic_expert_update', False)
+        or getattr(config, 'kt_expert_gpu_slots', None)
+        or _mxfp4_prepared_only_requested(config)
+    ):
         return True
     # RAWINT4's layerwise full-GPU prefill writer currently reconstructs every
     # expert from the CPU backend. Keep resident experts in the owned CPU image
@@ -490,7 +738,7 @@ class SharedFullContext:
         )
 
         hidden_size, intermediate_size_per_partition, params_dtype = init_args
-        target_device = next(layer.parameters()).device
+        target_device = _kt_layer_cuda_device(layer)
 
         # Create gpu_layer as a shallow copy, then override specific attributes
         self.gpu_layer = copy.copy(layer)
@@ -1512,6 +1760,17 @@ class SharedFullContext:
 
         Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat).
         """
+        if original_layer is not None and _mxfp4_prepared_only_layer(
+            original_layer
+        ):
+            # The CPU canonical raw rows are not a second resident copy in
+            # prepared-only mode.  A fallback must therefore rebuild every row
+            # from the KT CPU writer instead of reading a potentially stale
+            # compact canonical image.
+            original_layer = None
+            gpu_experts_mask = None
+            logical_to_gpu_index = None
+
         # Phase 1+2: byte-copy via the FP8 path (works for FP4-packed bytes).
         self._prepare_weight_fp8(
             wrapper,
@@ -1858,7 +2117,12 @@ class SharedFullContext:
                 delattr(self.gpu_layer, _stale)
         for _sn, (_shape, _dtype, _device) in self._raw_weight_shapes.items():
             _cur = getattr(self.gpu_layer, _sn, None)
-            if _cur is None or _cur.shape != _shape or _cur.dtype != _dtype:
+            if (
+                _cur is None
+                or _cur.shape != _shape
+                or _cur.dtype != _dtype
+                or getattr(_cur, "device", None) != _device
+            ):
                 setattr(self.gpu_layer, _sn,
                         torch.nn.Parameter(
                             torch.empty(_shape, dtype=_dtype, device=_device)))
@@ -2070,6 +2334,10 @@ class SharedFullContext:
                 for name in _Mxfp4PrefillSlot.RAW_NAMES
             ) or getattr(destination_layer, "_v4_marlin_weights", None) is None:
                 return False
+            if _mxfp4_prepared_only_layer(destination_layer):
+                return self._copy_selected_cpu_mxfp4_prepared_only(
+                    wrapper, expert_ids, destination_layer, destination_rows
+                )
         for name in names:
             target = getattr(destination_layer, name, None)
             source = self.cpu_buffers[name][0]
@@ -2150,7 +2418,10 @@ class SharedFullContext:
             device = destination_layer.w13_weight.device
             rows = torch.tensor(destination_row_ids, dtype=torch.long, device=device)
             resident = destination_layer._v4_marlin_weights
-            scratch = getattr(destination_layer, "_kt_mxfp4_repack_scratch", None)
+            # The scratch is model-scoped.  A per-destination-layer bank would
+            # scale its raw+prepared rows by the number of MoE layers even
+            # though only one layer is copied at a time.
+            scratch = getattr(self.gpu_layer, "_kt_mxfp4_repack_scratch", None)
             scratch_capacity = max(self.cpu_buffer_depth, len(destination_row_ids))
             if scratch is None or scratch["capacity"] < scratch_capacity:
                 raw_scratch = {
@@ -2172,7 +2443,7 @@ class SharedFullContext:
                     "raw": raw_scratch,
                     "prepared": prepared,
                 }
-                destination_layer._kt_mxfp4_repack_scratch = scratch
+                self.gpu_layer._kt_mxfp4_repack_scratch = scratch
             raw_scratch = scratch["raw"]
             prepared_storage = scratch["prepared"]
             batch_prepared = V4MarlinPreparedWeights(
@@ -2201,6 +2472,172 @@ class SharedFullContext:
             for name in ("w13", "w13_scale", "w2", "w2_scale"):
                 getattr(resident, name).index_copy_(
                     0, rows, getattr(batch_prepared, name)
+                )
+        return True
+
+    def _copy_selected_cpu_mxfp4_prepared_only(
+        self,
+        wrapper,
+        expert_ids: List[int],
+        destination_layer: torch.nn.Module,
+        destination_rows: torch.Tensor,
+    ) -> bool:
+        """Repack selected CPU rows straight into the resident Marlin image.
+
+        The checkpoint-native destination tensors are CPU-only in prepared-only
+        mode.  Keep a bounded raw scratch bank on the GPU, copy the pinned host
+        rows there, and let ``prepare_v4_mxfp4_marlin`` write the kernel-ready
+        rows directly into the resident prepared pool.
+        """
+
+        if not expert_ids:
+            return True
+        device = _kt_layer_cuda_device(destination_layer)
+        resident = getattr(destination_layer, "_v4_marlin_weights", None)
+        if device.type != "cuda" or resident is None:
+            return False
+        if len(expert_ids) != int(destination_rows.numel()):
+            raise ValueError("expert_ids and destination_rows must have equal length")
+        if not getattr(self, "_cpu_buffers_initialized", False):
+            self.initialize_cpu_buffers()
+
+        names = list(_Mxfp4PrefillSlot.RAW_NAMES)
+        if not all(name in self.cpu_buffers for name in names):
+            return False
+        tp_world_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        if tp_rank == 0 and wrapper is None:
+            return False
+
+        destination_row_ids = destination_rows.detach().cpu().tolist()
+        buffer_depth = self.cpu_buffer_depth
+        copy_batch = _mxfp4_scratch_capacity(
+            destination_layer, buffer_depth
+        )
+        slot_events = getattr(self, "_cpu_weight_slot_events", None)
+        if slot_events is None or len(slot_events) != buffer_depth:
+            slot_events = [None] * buffer_depth
+            self._cpu_weight_slot_events = slot_events
+
+        raw_scratch = _get_mxfp4_raw_scratch(
+            self.gpu_layer,
+            device,
+            copy_batch,
+        )
+
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            V4MarlinPreparedWeights,
+            prepare_v4_mxfp4_marlin,
+        )
+
+        def expert_nbytes(name: str) -> int:
+            tensor = self.cpu_buffers[name]
+            return tensor.numel() // buffer_depth * tensor.element_size()
+
+        for batch_start in range(0, len(expert_ids), copy_batch):
+            batch_end = min(batch_start + copy_batch, len(expert_ids))
+            batch_ids = expert_ids[batch_start:batch_end]
+            batch_rows = destination_row_ids[batch_start:batch_end]
+            batch_slots = range(batch_end - batch_start)
+            for slot in batch_slots:
+                previous = slot_events[slot]
+                if previous is not None and not previous.query():
+                    previous.synchronize()
+
+            if tp_rank == 0:
+                for local_index, expert_id in enumerate(batch_ids):
+                    slot = local_index
+                    pointers = {
+                        name: [
+                            ptr + slot * expert_nbytes(name)
+                            for ptr in self.all_rank_buffer_ptrs[name]
+                        ]
+                        for name in names
+                    }
+                    wrapper.submit_write_weight_scale_to_buffer(
+                        tp_world_size,
+                        int(expert_id),
+                        pointers.get("w13_weight", []),
+                        pointers.get("w13_weight_scale_inv", [])
+                        or [0] * tp_world_size,
+                        pointers.get("w2_weight", []),
+                        pointers.get("w2_weight_scale_inv", [])
+                        or [0] * tp_world_size,
+                    )
+                wrapper.sync_write_weight_scale_to_buffer()
+
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            for local_index in range(len(batch_ids)):
+                slot = local_index
+                for name in names:
+                    raw_scratch[name][slot].copy_(
+                        self.cpu_buffers[name][slot], non_blocking=True
+                    )
+
+            canonical = getattr(
+                destination_layer, "_kt_mxfp4_raw_weights", None
+            )
+            if canonical is not None:
+                global_num_experts = getattr(
+                    getattr(destination_layer, "quant_method", None),
+                    "global_num_experts",
+                    None,
+                )
+                for local_index, expert_id in enumerate(batch_ids):
+                    slot = local_index
+                    destination_row = int(batch_rows[local_index])
+                    for name in names:
+                        target = canonical.get(name)
+                        if target is None:
+                            continue
+                        if (
+                            global_num_experts is not None
+                            and target.shape[0] == int(global_num_experts)
+                        ):
+                            canonical_row = target[int(expert_id)]
+                        elif target.shape[0] == resident.num_experts:
+                            canonical_row = target[destination_row]
+                        else:
+                            continue
+                        canonical_row.copy_(self.cpu_buffers[name][slot])
+
+            copy_stream = torch.cuda.current_stream(device)
+            for slot in batch_slots:
+                event = torch.cuda.Event(enable_timing=False)
+                event.record(copy_stream)
+                slot_events[slot] = event
+
+            for run_start, run_len in contiguous_copy_runs(
+                batch_rows, list(batch_slots)
+            ):
+                destination_row = int(batch_rows[run_start])
+                if destination_row + run_len > resident.num_experts:
+                    raise ValueError(
+                        "MXFP4 resident destination row is out of range: "
+                        f"{destination_row}+{run_len} > {resident.num_experts}"
+                    )
+                run_prepared = V4MarlinPreparedWeights(
+                    w13=resident.w13[destination_row : destination_row + run_len],
+                    w13_scale=resident.w13_scale[
+                        destination_row : destination_row + run_len
+                    ],
+                    w2=resident.w2[destination_row : destination_row + run_len],
+                    w2_scale=resident.w2_scale[
+                        destination_row : destination_row + run_len
+                    ],
+                    hidden_size=resident.hidden_size,
+                    intermediate_size=resident.intermediate_size,
+                    num_experts=run_len,
+                )
+                source_end = run_start + run_len
+                prepare_v4_mxfp4_marlin(
+                    raw_scratch["w13_weight"][run_start:source_end],
+                    raw_scratch["w13_weight_scale_inv"][run_start:source_end],
+                    raw_scratch["w2_weight"][run_start:source_end],
+                    raw_scratch["w2_weight_scale_inv"][run_start:source_end],
+                    out=run_prepared,
                 )
         return True
 
@@ -2448,29 +2885,55 @@ class SharedFullContext:
 class _Mxfp4PrefillSlot:
     """One complete MXFP4 layer image used by the layerwise prefill pipeline."""
 
-    RAW_NAMES = (
-        "w13_weight",
-        "w13_weight_scale_inv",
-        "w2_weight",
-        "w2_weight_scale_inv",
-    )
+    RAW_NAMES = _MXFP4_RAW_WEIGHT_NAMES
 
     def __init__(
         self,
         index: int,
         raw_tensors: Dict[str, torch.Tensor],
         marlin_prepared,
+        num_experts: int,
+        physical_rows: int,
+        *,
+        prepared_only: bool = False,
     ):
         self.index = index
         for name in self.RAW_NAMES:
             setattr(self, name, raw_tensors[name])
+        self.raw_staging = raw_tensors
         self.marlin_prepared = marlin_prepared
-
+        self.prepared_only = bool(prepared_only)
+        self.num_experts = int(num_experts)
+        self.physical_rows = int(physical_rows)
+        self.raw_rows = int(self.w13_weight.shape[0])
+        if not 0 < self.raw_rows <= self.physical_rows:
+            raise ValueError(
+                "MXFP4 slot raw weights do not match the selected row layout: "
+                f"raw={self.raw_rows}, physical={self.physical_rows}, "
+                f"prepared_only={self.prepared_only}"
+            )
+        if not self.prepared_only and self.raw_rows != self.physical_rows:
+            raise ValueError(
+                "legacy MXFP4 slots require raw and prepared storage to have "
+                f"the same row count: {self.raw_rows} != {self.physical_rows}"
+            )
+        if self.marlin_prepared.num_experts != self.physical_rows:
+            raise ValueError(
+                "MXFP4 prepared slot must match the physical row count: "
+                f"{self.marlin_prepared.num_experts} != {self.physical_rows}"
+            )
         self.state = "EMPTY"
         self.layer_idx: Optional[int] = None
+        # ``layer_idx`` is invalidated on every round boundary; the physical
+        # row contents are not.  ``loaded_layer_idx`` lets a bank keep valid
+        # resident/staging rows when the same layer returns to it.
+        self.loaded_layer_idx: Optional[int] = None
         self.epoch = -1
         self.has_consumed_event = False
         self.reuse_guard = None
+        self.logical_to_row: List[int] = list(range(self.num_experts))
+        self.logical_to_row_cuda = None
+        self.row_pool: Optional[StagingRowPool] = None
 
         # Staging ownership (doc sections 3.5 and 7.1).  The bank always holds
         # the resident rows (copied D2D from the original layer) plus the
@@ -2482,6 +2945,10 @@ class _Mxfp4PrefillSlot:
         self.effective_ids: List[int] = []
         self.partial = False
         self.candidate_count = 0
+        # Logical experts whose raw rows are present in the transient H2D
+        # scratch bank and the prepared rows they must be written to.
+        self.pending_raw_ids: List[int] = []
+        self.pending_prepared_rows: List[int] = []
         # Device-side scalar counting the routes that took the CPU fallback.
         # Section 14.5 forbids reading it back in the layer hot path, so the
         # value is only folded into the telemetry at the next layer boundary.
@@ -2494,7 +2961,6 @@ class _Mxfp4PrefillSlot:
         self.consumed_event = torch.cuda.Event()
 
         self.intermediate_size = self.w2_weight.shape[2] * 2
-        self.num_experts = self.w13_weight.shape[0]
 
     def invalidate(self) -> None:
         # Keep the prepared tensors alive.  Their backing may still be in use on
@@ -2503,6 +2969,9 @@ class _Mxfp4PrefillSlot:
         self.layer_idx = None
         self.epoch = -1
         self.effective_mask_cuda = None
+        self.logical_to_row_cuda = None
+        self.pending_raw_ids = []
+        self.pending_prepared_rows = []
 
 
 class _Mxfp4LayerwisePrefillManager:
@@ -2523,29 +2992,68 @@ class _Mxfp4LayerwisePrefillManager:
         self,
         context: SharedFullContext,
         signature: tuple,
+        slot0_raw_tensors: Dict[str, torch.Tensor],
         slot1_raw_tensors: Dict[str, torch.Tensor],
         slot_marlin_prepared: tuple,
+        resident_capacity: int,
+        physical_rows: int,
         staging_window: Optional[int] = None,
+        prepared_only: bool = False,
     ):
         self.context = context
         self.signature = signature
-        self.device = context.gpu_layer.w13_weight.device
-        slot0_raw = {
-            name: getattr(context.gpu_layer, name).data
-            for name in _Mxfp4PrefillSlot.RAW_NAMES
-        }
-        self.slots = (
-            _Mxfp4PrefillSlot(0, slot0_raw, slot_marlin_prepared[0]),
-            _Mxfp4PrefillSlot(1, slot1_raw_tensors, slot_marlin_prepared[1]),
+        self.device = _kt_layer_cuda_device(context.gpu_layer)
+        self.num_experts = int(context.gpu_layer.w13_weight.shape[0])
+        self.staging_window = clamp_staging_window(
+            staging_window, self.num_experts
         )
-        self.num_experts = self.slots[0].num_experts
-        self.staging_window = clamp_staging_window(staging_window, self.num_experts)
+        self.resident_capacity = int(resident_capacity)
+        self.physical_rows = int(physical_rows)
+        self.prepared_only = bool(prepared_only)
+        self.slots = (
+            _Mxfp4PrefillSlot(
+                0,
+                slot0_raw_tensors,
+                slot_marlin_prepared[0],
+                self.num_experts,
+                self.physical_rows,
+                prepared_only=self.prepared_only,
+            ),
+            _Mxfp4PrefillSlot(
+                1,
+                slot1_raw_tensors,
+                slot_marlin_prepared[1],
+                self.num_experts,
+                self.physical_rows,
+                prepared_only=self.prepared_only,
+            ),
+        )
         self.planner = (
             StagingPrefetchPlanner(self.num_experts, self.staging_window)
             if self.staging_window is not None
             else None
         )
         self.telemetry = StagingTelemetry() if self.planner is not None else None
+        shared_count = _layer_fused_shared_expert_count(context.gpu_layer)
+        self.shared_ids = fused_shared_expert_ids(self.num_experts, shared_count)
+        # The unified owner/role table is required whenever staging is active,
+        # including the `R_max + S == N` edge where the physical row count
+        # happens to equal the layer expert count.  In that case an identity
+        # mapping would still disable boundary promotions.
+        if self.planner is not None:
+            self.row_pools = tuple(
+                StagingRowPool(
+                    self.num_experts,
+                    resident_capacity=self.resident_capacity,
+                    staging_capacity=self.staging_window,
+                    protected_ids=self.shared_ids,
+                )
+                for _ in self.slots
+            )
+            for slot, pool in zip(self.slots, self.row_pools):
+                slot.row_pool = pool
+        else:
+            self.row_pools = ()
         # History D2H runs on its own stream so neither the compute stream nor
         # the TP control stream ever waits for the statistics copy (section
         # 9.1 step 3).
@@ -2555,6 +3063,24 @@ class _Mxfp4LayerwisePrefillManager:
         self._pending_demand: List[tuple] = []
         self._layer_metrics: Dict[int, Dict[str, float]] = {}
         self._layer_staged: Dict[int, Tuple[int, ...]] = {}
+        # Last committed per-layer bank layout.  The bank is reused for a
+        # different layer long before the next forward boundary, so the
+        # boundary policy needs this snapshot to rank promotions for every
+        # layer, not only the two layers that happen to be resident in the
+        # banks at the end of the chunk.
+        self._layer_staging_state: Dict[
+            int, Tuple[int, Tuple[int, ...], Tuple[int, ...]]
+        ] = {}
+        # Route hits accumulated for the completed chunk, consumed once at the
+        # next forward/chunk boundary.
+        self._staging_hit_counts: Dict[int, Dict[int, int]] = {}
+        # Promotions selected at a boundary for a layer whose bank bytes were
+        # already overwritten.  They are committed before that layer is loaded
+        # again, using the same host H2D path as a staged expert.
+        self._pending_boundary_promotions: Dict[
+            int, List[Tuple[int, int]]
+        ] = {}
+        self._forward_boundary = ForwardBoundaryTracker()
         self.transfer_stream = torch.cuda.Stream(device=self.device)
         self.postprocess_stream = torch.cuda.Stream(device=self.device)
         # Runtime transport control must not use the main stream: it is
@@ -2563,25 +3089,39 @@ class _Mxfp4LayerwisePrefillManager:
         # is substantially cheaper than a Gloo round-trip per transport phase.
         self.control_stream = torch.cuda.Stream(device=self.device)
         # Host-slot ring (doc section 7.5).  The pinned CPU staging context owns
-        # the physical slots; the ring spans two rolling generations of
-        # ``--kt-layer-h2d-batch-size`` slots, so a batch always writes the
-        # generation the previous batch's H2D is not reading and the host write
-        # of batch b+1 overlaps the DMA of batch b.  Section 20 item 8 is what
-        # makes the wider ring worth paying for: one ``sync`` and one TP fence
-        # per batch replace the per-expert round trips.
+        # the physical slots; the ring spans two generations of the staging
+        # window ``S`` (``--kt-layer-h2d-slots``), so layer L+1 always writes
+        # the generation layer L's H2D is not reading and the cross-layer
+        # ping-pong survives.  A layer has exactly one pass now, matching the
+        # FreeToken prefill shape: one whole-width generation per layer, no
+        # intra-layer sub-batching.
         context_depth = int(getattr(context, "cpu_buffer_depth", 2) or 2)
         self.host_slots = max(2, context_depth)
-        self.host_write_batch = max(1, self.host_slots // 2)
-        # Parity runs across layers on purpose: the first batch of L+1 must not
-        # wait for the last batch of L (see ``host_generation_slots``).
+        # One generation is the staging window when it is selected, and half the
+        # ring otherwise (the legacy two-slot pair).
+        self.host_write_batch = self.staging_window or (self.host_slots // 2)
+        assert self.host_write_batch >= (self.staging_window or 0), (
+            "host ring generation must hold a whole staged set"
+        )
+        assert 2 * self.host_write_batch == self.host_slots, (
+            "host ring must be exactly two generations"
+        )
+        # Parity runs across layers on purpose: the single pass of L+1 must not
+        # wait for the single pass of L (see ``host_generation_range``).
         self._host_generation = 0
         self.host_slot_free_events = tuple(
             torch.cuda.Event() for _ in range(self.host_slots)
         )
         self.host_slot_was_used = [False] * self.host_slots
-        self.host_write_status = torch.ones(
-            (1,), dtype=torch.int32, device="cpu"
+        # Host-write publish (FreeToken's host-to-copy branch, adapted to a
+        # CPU-side writer).  ``host_write_gates`` is the writing rank's copy-
+        # stream event per host slot; ``_publish_host_write_phase`` funnels it
+        # to every rank once per layer, in the same collective order on every
+        # rank.  ``_host_write_published`` counts published layers.
+        self.host_write_gates: List[Optional[torch.cuda.Event]] = [None] * (
+            self.host_slots
         )
+        self._host_write_published = 0
         self.device_phase_status = torch.ones(
             (1,), dtype=torch.int32, device=self.device
         )
@@ -2590,6 +3130,11 @@ class _Mxfp4LayerwisePrefillManager:
         self.last_layer_position: Optional[int] = None
         self.current_slot_index: Optional[int] = None
         self.round_active = False
+        # Early successor prefetch (FreeToken section 4.1 ordering): the epoch
+        # for which the successor of the last visited layer was already
+        # enqueued, and whether every layer of this round prefetched early.
+        self.prefetch_epoch: Optional[int] = None
+        self.early_prefetch_only = True
 
     @property
     def registry(self):
@@ -2704,6 +3249,11 @@ class _Mxfp4LayerwisePrefillManager:
                 # current round's telemetry.
                 continue
             demand = counts.tolist()
+            layer_hits = self._staging_hit_counts.setdefault(layer_idx, {})
+            for expert_id in staged_ids:
+                count = int(demand[expert_id])
+                if count > 0:
+                    layer_hits[expert_id] = layer_hits.get(expert_id, 0) + count
             staging_hits = sum(
                 1 for expert_id in staged_ids if demand[expert_id] > 0
             )
@@ -2720,6 +3270,271 @@ class _Mxfp4LayerwisePrefillManager:
             )
         self._pending_demand = pending
 
+    @staticmethod
+    def _method_row_owner(method) -> List[int]:
+        """Return this layer's row-ordered resident ids."""
+
+        owner = getattr(method, "_resident_row_owner", None)
+        if owner is not None:
+            return [int(item) for item in owner.tolist()]
+        result = [-1] * int(method.num_gpu_experts)
+        for expert_id, row in enumerate(
+            method.logical_to_gpu_index.tolist()
+        ):
+            if 0 <= int(row) < len(result):
+                result[int(row)] = expert_id
+        return result
+
+    def _remember_layer_staging(
+        self,
+        layer_idx: int,
+        slot: _Mxfp4PrefillSlot,
+        resident_ids: Sequence[int],
+        staged_ids: Sequence[int],
+    ) -> None:
+        self._layer_staging_state[layer_idx] = (
+            slot.index,
+            tuple(int(expert_id) for expert_id in resident_ids),
+            tuple(int(expert_id) for expert_id in staged_ids),
+        )
+
+    def _publish_method_row_owner(
+        self, method, row_owner: Sequence[int]
+    ) -> None:
+        """Commit a row-ordered resident set to the GEC/decode mapping."""
+
+        row_owner_tensor = torch.tensor(row_owner, dtype=torch.int64)
+        mask, logical, reverse = update_gpu_expert_mappings(
+            row_owner_tensor, self.num_experts
+        )
+        method.gpu_experts_mask = mask
+        method.logical_to_gpu_index = logical
+        method.gpu_index_to_logical = reverse
+        method._resident_row_owner = row_owner_tensor
+        if getattr(method, 'gpu_experts_mask_cuda', None) is not None:
+            method.gpu_experts_mask_cuda.copy_(mask)
+            method.logical_to_gpu_index_cuda.copy_(logical)
+        if method.tp_rank == 0:
+            update_kt_wrapper_masks(method.wrapper, mask)
+
+    def _refresh_original_layer_rows(
+        self,
+        method,
+        layer: torch.nn.Module,
+        slot: _Mxfp4PrefillSlot,
+        row_owner: List[int],
+        pairs: Sequence[Tuple[int, int]],
+    ) -> None:
+        """Mirror metadata-only promotions into the decode/fallback image.
+
+        The compact bank keeps the staged bytes in place.  The original layer
+        still owns the GEC/decode copy, so only the promoted expert's raw and
+        prepared row are copied into the victim's stable row there.
+        """
+
+        prepared = getattr(layer, "_v4_marlin_weights", None)
+        canonical = getattr(layer, "_kt_mxfp4_raw_weights", None)
+        up_first = bool(
+            getattr(layer, "_kt_mxfp4_raw_w13_up_first", False)
+        )
+        copies = []
+        for victim_id, promoted_id in pairs:
+            victim_row = row_owner.index(victim_id)
+            source_row = int(slot.logical_to_row[promoted_id])
+            if source_row < 0:
+                raise RuntimeError(
+                    f"promoted expert {promoted_id} has no bank row"
+                )
+            copies.append((victim_row, source_row, up_first))
+
+        if not getattr(slot, "prepared_only", False):
+            for victim_row, source_row, swap_w13 in copies:
+                for name in _Mxfp4PrefillSlot.RAW_NAMES:
+                    source = getattr(slot, name)[source_row]
+                    destination = getattr(layer, name).data[victim_row]
+                    if swap_w13 and name in (
+                        "w13_weight",
+                        "w13_weight_scale_inv",
+                    ):
+                        split = source.shape[0] // 2
+                        destination[:split].copy_(
+                            source[split:], non_blocking=True
+                        )
+                        destination[split:].copy_(
+                            source[:split], non_blocking=True
+                        )
+                    else:
+                        destination.copy_(source, non_blocking=True)
+                    if canonical is not None and name in canonical:
+                        canonical_tensor = canonical[name]
+                        if canonical_tensor.shape[0] == slot.num_experts:
+                            # A full N-row shadow is indexed by logical expert
+                            # id, not by compact physical row.  Both victim and
+                            # promoted bytes already exist there, so updating
+                            # ``victim_row`` would corrupt an unrelated expert.
+                            continue
+                        if victim_row >= canonical_tensor.shape[0]:
+                            raise RuntimeError(
+                                f"compact canonical row {victim_row} is out of "
+                                f"range for {name} "
+                                f"({canonical_tensor.shape[0]} rows)"
+                            )
+                        canonical_row = canonical_tensor[victim_row]
+                        if canonical_row.data_ptr() != destination.data_ptr():
+                            # A compact canonical snapshot is row-ordered like
+                            # the resident image.  Keeping it stale would make
+                            # the next D2D resident load restore the evicted
+                            # expert.
+                            canonical_row.copy_(
+                                destination, non_blocking=True
+                            )
+            if prepared is not None:
+                for name in ("w13", "w13_scale", "w2", "w2_scale"):
+                    getattr(prepared, name)[victim_row].copy_(
+                        getattr(slot.marlin_prepared, name)[source_row],
+                        non_blocking=True,
+                    )
+        else:
+            if prepared is None:
+                raise RuntimeError(
+                    "prepared-only MXFP4 promotion requires the resident "
+                    "Marlin image"
+                )
+            for victim_row, source_row, _ in copies:
+                for name in ("w13", "w13_scale", "w2", "w2_scale"):
+                    getattr(prepared, name)[victim_row].copy_(
+                        getattr(slot.marlin_prepared, name)[source_row],
+                        non_blocking=True,
+                    )
+
+    def _apply_boundary_promotions(self) -> None:
+        """Consume the completed chunk's staged hits at a forward/chunk boundary."""
+
+        if not self._staging_hit_counts:
+            return
+        if self.planner is None or not self.row_pools:
+            self._staging_hit_counts.clear()
+            return
+
+        promoted = 0
+        queued = 0
+        for layer_idx in sorted(self.registry):
+            hits = self._staging_hit_counts.get(layer_idx)
+            if not hits:
+                continue
+            # A pending promotion already replaced the resident set that this
+            # layer will use next.  Do not queue a second swap against the
+            # pre-promotion snapshot.
+            if layer_idx in self._pending_boundary_promotions:
+                continue
+            state = self._layer_staging_state.get(layer_idx)
+            if state is None:
+                continue
+            bank_index, resident_snapshot, staged_snapshot = state
+            resident_ids = list(resident_snapshot)
+            staged_ids = list(staged_snapshot)
+            if not resident_ids or not staged_ids:
+                continue
+            scores = self.planner.history.scores(layer_idx).tolist()
+            pairs = select_boundary_promotions(
+                resident_ids,
+                staged_ids,
+                hits,
+                protected_ids=self.shared_ids,
+                scores={index: value for index, value in enumerate(scores)},
+            )
+            if not pairs:
+                continue
+            method, layer = self.registry[layer_idx]
+            row_owner = self._method_row_owner(method)
+            if len(row_owner) != len(resident_ids) or set(row_owner) != set(
+                resident_ids
+            ):
+                raise RuntimeError(
+                    f"layer {layer_idx} resident row owner does not match its "
+                    "last committed staging layout"
+                )
+            for victim_id, promoted_id in pairs:
+                if victim_id not in row_owner:
+                    raise RuntimeError(
+                        f"promotion victim {victim_id} is not resident in layer "
+                        f"{layer_idx}"
+                    )
+            slot = self.slots[bank_index]
+            if slot.loaded_layer_idx != layer_idx:
+                # The bank was reused for another layer after this snapshot.
+                # Keep the boundary decision, but commit it before the next
+                # load of this layer.  Updating the GEC mapping now would make
+                # decode read bytes that have already been overwritten.
+                self._pending_boundary_promotions[layer_idx] = list(pairs)
+                queued += len(pairs)
+                continue
+
+            # This layer still owns the bank bytes, so the swap is metadata
+            # only.  Mirror the promoted expert into the stable GEC/decode
+            # rows, then extend the consumed fence so the bank cannot be
+            # reused until those reads have finished.
+            self._refresh_original_layer_rows(
+                method, layer, slot, row_owner, pairs
+            )
+            main_stream = torch.cuda.current_stream(self.device)
+            slot.consumed_event.record(main_stream)
+            slot.has_consumed_event = True
+            slot.reuse_guard = "consumed"
+
+            new_resident_ids = list(resident_ids)
+            for victim_id, promoted_id in pairs:
+                victim_index = row_owner.index(victim_id)
+                row_owner[victim_index] = promoted_id
+                resident_index = new_resident_ids.index(victim_id)
+                new_resident_ids[resident_index] = promoted_id
+            self._publish_method_row_owner(method, row_owner)
+
+            pool = slot.row_pool
+            if pool is not None:
+                mapping = pool.mapping(layer_idx)
+                roles = pool.row_roles(layer_idx)
+                for victim_id, promoted_id in pairs:
+                    victim_row = mapping[victim_id]
+                    promoted_row = mapping[promoted_id]
+                    if (
+                        victim_row >= 0
+                        and promoted_row >= 0
+                        and roles[victim_row] == "resident"
+                        and roles[promoted_row] == "staging"
+                    ):
+                        pool.promote(layer_idx, victim_id, promoted_id)
+                slot.logical_to_row = pool.mapping(layer_idx)
+                slot.logical_to_row_cuda = None
+            promoted_ids = {promoted_id for _, promoted_id in pairs}
+            new_staged_ids = [
+                expert_id
+                for expert_id in staged_ids
+                if expert_id not in promoted_ids
+            ]
+            victims = {victim_id for victim_id, _ in pairs}
+            slot.resident_ids = list(new_resident_ids)
+            slot.staged_ids = list(new_staged_ids)
+            slot.effective_ids = [
+                expert_id
+                for expert_id in slot.effective_ids
+                if expert_id not in victims
+            ]
+            slot.partial = len(slot.effective_ids) < slot.num_experts
+            slot.effective_mask_cuda = None
+            self._remember_layer_staging(
+                layer_idx, slot, new_resident_ids, new_staged_ids
+            )
+            promoted += len(pairs)
+        self._staging_hit_counts.clear()
+        if (promoted or queued) and self.telemetry is not None:
+            logger.debug(
+                "KT prefill staging: boundary promoted %d rows, queued %d "
+                "for the next layer load",
+                promoted,
+                queued,
+            )
+
     def _per_expert_raw_bytes(self) -> int:
         cached = getattr(self, "_raw_bytes_per_expert", None)
         if cached is not None:
@@ -2728,7 +3543,9 @@ class _Mxfp4LayerwisePrefillManager:
         for name in _Mxfp4PrefillSlot.RAW_NAMES:
             tensor = getattr(self.slots[0], name)
             total += (
-                tensor.numel() * tensor.element_size() // max(1, self.num_experts)
+                tensor.numel()
+                * tensor.element_size()
+                // max(1, self.slots[0].raw_rows)
             )
         self._raw_bytes_per_expert = total
         return total
@@ -2769,6 +3586,7 @@ class _Mxfp4LayerwisePrefillManager:
             gpu_expert_count=metrics.get("gpu_expert_count", 0.0),
             cpu_route_count=cpu_routes,
             copy_bytes=metrics.get("copy_bytes"),
+            drain_count=metrics.get("drain_count"),
             copy_ms=metrics.get("copy_ms"),
             postprocess_ms=metrics.get("postprocess_ms"),
             bank_reuse_wait_ms=metrics.get("bank_reuse_wait_ms"),
@@ -2818,10 +3636,15 @@ class _Mxfp4LayerwisePrefillManager:
         self._pending_demand.clear()
         self._layer_metrics.clear()
         self._layer_staged.clear()
+        self._staging_hit_counts.clear()
+        self._layer_staging_state.clear()
+        self._pending_boundary_promotions.clear()
         self.epoch += 1
         self.last_layer_position = None
         self.current_slot_index = None
         self.round_active = False
+        self.prefetch_epoch = None
+        self.early_prefetch_only = True
         for slot in self.slots:
             slot.invalidate()
 
@@ -2841,6 +3664,10 @@ class _Mxfp4LayerwisePrefillManager:
         ):
             self.epoch += 1
             self.round_active = True
+            self.early_prefetch_only = True
+            # The previous round's successor prefetch belongs to the expired
+            # epoch; this round re-issues it from its first layer.
+            self.prefetch_epoch = None
             # Round wrap: telemetry state that the previous round never
             # consumed belongs to an expired epoch.  Its demand entry (if any)
             # is skipped by the epoch check in the flush, and clearing the
@@ -2894,11 +3721,12 @@ class _Mxfp4LayerwisePrefillManager:
             or get_tensor_model_parallel_world_size() == 1
         ):
             return local_success
-        status = getattr(self, "host_write_status", None)
-        if status is None:
-            status = torch.ones((1,), dtype=torch.int32, device="cpu")
-            self.host_write_status = status
-        status.fill_(int(local_success))
+        # Always size the reduce to the TP group: the preallocated scalar is
+        # sized from the world size at init, which differs when this rank is a
+        # member of a TP group smaller than the process group.
+        status = torch.tensor(
+            [int(local_success)], dtype=torch.int32, device="cpu"
+        )
         dist.all_reduce(
             status,
             op=dist.ReduceOp.MIN,
@@ -2970,8 +3798,8 @@ class _Mxfp4LayerwisePrefillManager:
             return [ptr + offsets[name] for ptr in pointers[name]]
 
         # Submission only.  The drain is deliberately not part of this helper:
-        # the layerwise loop queues a whole host-write batch and pays a single
-        # ``sync_write_weight_scale_to_buffer`` for it (doc section 20 item 8),
+        # the layerwise loop queues a whole host-write generation and publishes
+        # it with ``_publish_host_write`` instead (doc section 20 item 8),
         # which is what takes the per-expert Python/KT round trip off the
         # critical path.
         method.wrapper.submit_write_weight_scale_to_buffer(
@@ -2983,24 +3811,168 @@ class _Mxfp4LayerwisePrefillManager:
             rank_pointers("w2_weight_scale_inv"),
         )
 
+    def _publish_host_write(self, host_slots) -> None:
+        """Record copy-stream gates for this rank's submitted host writes.
+
+        Only TP0 writes the host slots.  The gates order TP0's copy stream
+        behind the writes, and ``_publish_host_write_phase`` later fans that
+        ordering out to every rank.  This method deliberately enters no
+        collective: TP0 is its only caller, so a broadcast here would put TP0
+        in a different collective from the peers at the same layer boundary.
+        """
+
+        if not host_slots:
+            return
+        with torch.cuda.stream(self.transfer_stream):
+            for host_slot in host_slots:
+                event = self.host_write_gates[host_slot]
+                if event is None:
+                    event = torch.cuda.Event()
+                event.record(self.transfer_stream)
+                self.host_write_gates[host_slot] = event
+
+    @property
+    def _host_write_all_ranks(self) -> List[torch.cuda.Event]:
+        """Counter-advancing entry point; use only for a layer with no H2D phase."""
+
+        return self._publish_host_write_phase()
+
+    def _publish_host_write_phase(self) -> List[torch.cuda.Event]:
+        """Per-host-slot events this rank's copy stream has ordered behind.
+
+        The host slots are written by TP0 only, yet every rank DMAs the same
+        shared-memory slot.  Every rank therefore calls this method exactly
+        once per loaded layer, after the write-phase commit and before its
+        H2D copies.  TP0 records a marker after its local write gates; a
+        one-byte broadcast on the Gloo CPU group (not NCCL, which could be
+        de-queued out of order against the per-phase device reductions)
+        aligns the writer and the peers at the same layer boundary.
+
+        Fresh events are allocated on every call.  Reusing an event across
+        layers can re-arm it before a slow rank has enqueued its wait, which
+        silently drops the fence.  A local marker failure is raised only after
+        the collective so a failed rank cannot strand its peers in broadcast.
+        """
+
+        self._host_write_published += 1
+        size = len(self.host_write_gates)
+        all_ranks = [torch.cuda.Event() for _ in range(size)]
+        marker = torch.cuda.Event()
+        local_error = None
+        try:
+            with torch.cuda.stream(self.transfer_stream):
+                for gate in self.host_write_gates:
+                    # Event.wait(stream), not stream.wait_event(event): the copy
+                    # stream must run only after TP0's writer recorded the gate.
+                    if gate is not None:
+                        gate.wait(self.transfer_stream)
+                marker.record(self.transfer_stream)
+        except Exception as exc:
+            local_error = exc
+
+        if dist.is_initialized() and get_tensor_model_parallel_world_size() > 1:
+            funnel = torch.ones(1, dtype=torch.uint8, device="cpu")
+            dist.broadcast(
+                funnel,
+                src=get_tp_group().first_rank,
+                group=get_tp_group().cpu_group,
+            )
+
+        if local_error is not None:
+            raise local_error
+
+        with torch.cuda.stream(self.transfer_stream):
+            self.transfer_stream.wait_event(marker)
+            for event in all_ranks:
+                event.record(self.transfer_stream)
+        return all_ranks
+
     def _postprocess_slot(self, slot: _Mxfp4PrefillSlot) -> None:
         from sglang.srt.layers.quantization.v4_marlin_moe import (
+            V4MarlinPreparedWeights,
             prepare_v4_mxfp4_marlin,
         )
 
         with torch.cuda.stream(self.postprocess_stream):
             self.postprocess_stream.wait_event(slot.raw_ready_event)
             try:
-                # Repack and scale-swizzle into stable caller-owned storage.  The
-                # kernel is current-stream ordered and publishes no events; the
-                # layerwise scheduler owns the raw/ready/consumed lifecycle.
-                prepare_v4_mxfp4_marlin(
-                    slot.w13_weight,
-                    slot.w13_weight_scale_inv,
-                    slot.w2_weight,
-                    slot.w2_weight_scale_inv,
-                    out=slot.marlin_prepared,
-                )
+                if slot.prepared_only:
+                    count = len(slot.pending_raw_ids)
+                    if count:
+                        if (
+                            count > slot.raw_rows
+                            or count != len(slot.pending_prepared_rows)
+                        ):
+                            raise RuntimeError(
+                                "prepared-only MXFP4 postprocess row count is "
+                                "out of range"
+                            )
+                        # The H2D generation occupies raw scratch rows
+                        # 0..count-1.  Repack each contiguous destination run
+                        # directly into the unified prepared pool.  There is no
+                        # second prepared bank: like FreeToken, the resident
+                        # GPU image is only the layout consumed by the kernel.
+                        target_rows = tuple(
+                            int(row) for row in slot.pending_prepared_rows
+                        )
+                        if any(
+                            row < 0
+                            or row >= slot.marlin_prepared.num_experts
+                            for row in target_rows
+                        ):
+                            raise RuntimeError(
+                                "prepared-only MXFP4 postprocess destination "
+                                "row is out of range"
+                            )
+                        for run_start, run_len in contiguous_copy_runs(
+                            target_rows, range(count)
+                        ):
+                            destination_row = target_rows[run_start]
+                            run_view = V4MarlinPreparedWeights(
+                                w13=slot.marlin_prepared.w13[
+                                    destination_row : destination_row + run_len
+                                ],
+                                w13_scale=slot.marlin_prepared.w13_scale[
+                                    destination_row : destination_row + run_len
+                                ],
+                                w2=slot.marlin_prepared.w2[
+                                    destination_row : destination_row + run_len
+                                ],
+                                w2_scale=slot.marlin_prepared.w2_scale[
+                                    destination_row : destination_row + run_len
+                                ],
+                                hidden_size=slot.marlin_prepared.hidden_size,
+                                intermediate_size=slot.marlin_prepared.intermediate_size,
+                                num_experts=run_len,
+                            )
+                            source_start = run_start
+                            source_end = run_start + run_len
+                            prepare_v4_mxfp4_marlin(
+                                slot.raw_staging["w13_weight"][
+                                    source_start:source_end
+                                ],
+                                slot.raw_staging["w13_weight_scale_inv"][
+                                    source_start:source_end
+                                ],
+                                slot.raw_staging["w2_weight"][
+                                    source_start:source_end
+                                ],
+                                slot.raw_staging["w2_weight_scale_inv"][
+                                    source_start:source_end
+                                ],
+                                out=run_view,
+                            )
+                else:
+                    # Repack and scale-swizzle into stable caller-owned storage.
+                    # The kernel is current-stream ordered and publishes no
+                    # events; the scheduler owns the raw/ready/consumed lifecycle.
+                    prepare_v4_mxfp4_marlin(
+                        slot.w13_weight,
+                        slot.w13_weight_scale_inv,
+                        slot.w2_weight,
+                        slot.w2_weight_scale_inv,
+                        out=slot.marlin_prepared,
+                    )
             finally:
                 # Even an exceptional conversion attempt must publish a fence
                 # before this slot can be overwritten on a retry.
@@ -3048,12 +4020,28 @@ class _Mxfp4LayerwisePrefillManager:
         slot.state = "LOADING"
         slot.layer_idx = layer_idx
         slot.epoch = self.epoch
+        pool = slot.row_pool
+        previous_mapping = (
+            list(slot.logical_to_row)
+            if slot.loaded_layer_idx == layer_idx
+            else [-1] * slot.num_experts
+        )
+        if pool is not None and slot.loaded_layer_idx != layer_idx:
+            # This bank is about to hold a different layer.  Per-layer
+            # ownership from an earlier pass is stale for the physical rows.
+            pool.clear()
 
+        pending_pairs: List[Tuple[int, int]] = list(
+            self._pending_boundary_promotions.get(layer_idx, ())
+        )
+        old_row_owner: List[int] = []
+        new_row_owner: List[int] = []
+        resident_host_ids: List[int] = []
         saved_affinity = None
         try:
             setup_error = None
             try:
-                weight_infos = [
+                raw_weight_infos = [
                     (
                         name,
                         self.context.cpu_buffers[name],
@@ -3061,13 +4049,119 @@ class _Mxfp4LayerwisePrefillManager:
                     )
                     for name in _Mxfp4PrefillSlot.RAW_NAMES
                 ]
-                gpu_expert_ids = []
-                cpu_expert_ids = []
-                for expert_id in range(slot.num_experts):
-                    if method.gpu_experts_mask[expert_id].item():
-                        gpu_expert_ids.append(expert_id)
-                    else:
-                        cpu_expert_ids.append(expert_id)
+                raw_source = getattr(
+                    original_layer, "_kt_mxfp4_raw_weights", None
+                )
+                raw_w13_up_first = bool(
+                    getattr(
+                        original_layer,
+                        "_kt_mxfp4_raw_w13_up_first",
+                        False,
+                    )
+                )
+                if slot.prepared_only:
+                    prepared_source = getattr(
+                        original_layer, "_v4_marlin_weights", None
+                    )
+                    h2d_weight_infos = raw_weight_infos
+                    d2d_weight_infos = (
+                        [
+                            (
+                                name,
+                                getattr(prepared_source, name),
+                                getattr(slot.marlin_prepared, name),
+                            )
+                            for name in ("w13", "w13_scale", "w2", "w2_scale")
+                        ]
+                        if prepared_source is not None
+                        else []
+                    )
+                    d2d_w13_up_first = False
+                else:
+                    h2d_weight_infos = [
+                        (
+                            name,
+                            cpu_buffer,
+                            destination,
+                        )
+                        for name, cpu_buffer, destination in raw_weight_infos
+                    ]
+                    d2d_weight_infos = [
+                        (
+                            name,
+                            (
+                                raw_source[name]
+                                if raw_source is not None
+                                else getattr(original_layer, name)
+                            ),
+                            destination,
+                        )
+                        for name, _, destination in raw_weight_infos
+                    ]
+                    d2d_w13_up_first = raw_w13_up_first
+                old_row_owner = self._method_row_owner(method)
+                try:
+                    new_row_owner = apply_row_owner_promotions(
+                        old_row_owner,
+                        pending_pairs,
+                        num_experts=slot.num_experts,
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"invalid pending promotion for layer {layer_idx}: {exc}"
+                    ) from exc
+                if any(expert_id < 0 for expert_id in new_row_owner):
+                    raise RuntimeError(
+                        f"layer {layer_idx} has an empty resident row after "
+                        "pending promotions"
+                    )
+                if len(set(new_row_owner)) != len(new_row_owner):
+                    raise RuntimeError(
+                        f"layer {layer_idx} has duplicate resident experts after "
+                        "pending promotions"
+                    )
+
+                if pending_pairs:
+                    # Commit the boundary decision through the ordinary load
+                    # path.  The promoted expert is a resident from now on,
+                    # but its bytes still arrive from pinned host memory
+                    # because the original compact image does not own them yet.
+                    gpu_expert_ids = list(new_row_owner)
+                    resident_set = set(gpu_expert_ids)
+                    cpu_expert_ids = [
+                        expert_id
+                        for expert_id in range(slot.num_experts)
+                        if expert_id not in resident_set
+                    ]
+                else:
+                    gpu_expert_ids = []
+                    cpu_expert_ids = []
+                    for expert_id in range(slot.num_experts):
+                        if method.gpu_experts_mask[expert_id].item():
+                            gpu_expert_ids.append(expert_id)
+                        else:
+                            cpu_expert_ids.append(expert_id)
+
+                source_is_full = False
+                if raw_source:
+                    source_is_full = (
+                        next(iter(raw_source.values())).shape[0]
+                        == slot.num_experts
+                    )
+                canonical_ids = (
+                    set(range(slot.num_experts))
+                    if source_is_full
+                    else set(old_row_owner)
+                )
+                resident_host_ids = _mxfp4_resident_host_ids(
+                    prepared_only=slot.prepared_only,
+                    prepared_source=(
+                        prepared_source if slot.prepared_only else None
+                    ),
+                    gpu_expert_ids=gpu_expert_ids,
+                    pending_pairs=pending_pairs,
+                    canonical_ids=canonical_ids,
+                )
 
                 # Prefetch candidates strictly come from the target layer
                 # (section 8.1).  ``gpu_expert_ids`` is this layer's resident
@@ -3079,8 +4173,31 @@ class _Mxfp4LayerwisePrefillManager:
                     staged_expert_ids = self.planner.select(
                         layer_idx, gpu_expert_ids
                     )
+                    # One layer owns exactly one S-slot host generation.
+                    # Reserve that generation for the one-time promoted rows
+                    # and trim the optional staged window to fit.
+                    try:
+                        staged_expert_ids = fit_staged_window(
+                            staged_expert_ids,
+                            len(resident_host_ids),
+                            int(self.staging_window or 0),
+                        )
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            f"pending promotions for layer {layer_idx} do not fit "
+                            f"the staging window: {exc}"
+                        ) from exc
                 else:
                     staged_expert_ids = cpu_expert_ids
+
+                if pool is not None:
+                    logical_to_row = pool.configure(
+                        layer_idx, gpu_expert_ids, staged_expert_ids
+                    )
+                else:
+                    logical_to_row = list(range(slot.num_experts))
+                slot.resident_ids = list(gpu_expert_ids)
+                slot.staged_ids = list(staged_expert_ids)
 
                 if hasattr(os, "sched_getaffinity"):
                     saved_affinity = os.sched_getaffinity(0)
@@ -3105,43 +4222,95 @@ class _Mxfp4LayerwisePrefillManager:
                         self.transfer_stream.wait_event(slot.ready_event)
                     elif reuse_guard == "raw":
                         self.transfer_stream.wait_event(slot.raw_ready_event)
+                    resident_copy_rows: List[Tuple[int, int]] = []
                     for expert_id in gpu_expert_ids:
-                        gpu_index = method.logical_to_gpu_index[expert_id].item()
-                        for name, _, destination in weight_infos:
-                            raw_source = getattr(
-                                original_layer, "_kt_mxfp4_raw_weights", None
+                        if expert_id in resident_host_ids:
+                            # The original compact image does not own this
+                            # newly promoted expert yet.  Its bytes are filled
+                            # by the host-write/H2D batch below.
+                            continue
+                        destination_row = int(logical_to_row[expert_id])
+                        if destination_row < 0:
+                            raise RuntimeError(
+                                f"resident expert {expert_id} has no compact row "
+                                f"for layer {layer_idx}"
                             )
-                            source = (
-                                raw_source[name]
-                                if raw_source is not None
-                                else getattr(original_layer, name)
+                        # A row that still owns this expert in this bank has
+                        # valid bytes from the previous pass.  This is the
+                        # no-copy half of a boundary promotion.
+                        if (
+                            slot.loaded_layer_idx == layer_idx
+                            and previous_mapping[expert_id] == destination_row
+                        ):
+                            continue
+                        resident_copy_rows.append((expert_id, destination_row))
+
+                    # Resident rows are prepared rows in prepared-only mode and
+                    # raw rows in the legacy mode.  One multi-bank gather
+                    # replaces the nested per-expert/per-tensor submissions.
+                    fast_d2d_done = False
+                    if resident_copy_rows:
+                        if not d2d_weight_infos:
+                            raise RuntimeError(
+                                "prepared-only MXFP4 staging has resident rows "
+                                "but no prepared Marlin source image"
                             )
-                            source_expert = source[gpu_index]
-                            destination_expert = destination[expert_id]
-                            if (
-                                getattr(
-                                    original_layer,
-                                    "_kt_mxfp4_raw_w13_up_first",
-                                    False,
+                        row_copy_plan = build_row_copy_plan(
+                            [
+                                (
+                                    name,
+                                    source,
+                                    destination,
                                 )
-                                and name
-                                in ("w13_weight", "w13_weight_scale_inv")
-                            ):
-                                # FlashInfer loads W13 as [up; gate], whereas
-                                # the KT/Marlin prepared image and CPU writer
-                                # use [gate; up].  Normalize only while copying
-                                # into the full-expert shadow.
-                                split = source_expert.shape[0] // 2
-                                destination_expert[:split].copy_(
-                                    source_expert[split:], non_blocking=True
-                                )
-                                destination_expert[split:].copy_(
-                                    source_expert[:split], non_blocking=True
-                                )
-                            else:
-                                destination_expert.copy_(
-                                    source_expert, non_blocking=True
-                                )
+                                for name, source, destination in d2d_weight_infos
+                            ],
+                            resident_copy_rows,
+                            num_experts=slot.num_experts,
+                            old_row_owner=old_row_owner,
+                            w13_up_first=d2d_w13_up_first,
+                        )
+                        if row_copy_plan is not None:
+                            fast_d2d_done = try_multi_row_copy(
+                                row_copy_plan.banks,
+                                row_copy_plan.source_rows,
+                                row_copy_plan.destination_rows,
+                                self.device,
+                            )
+
+                    if not fast_d2d_done:
+                        for expert_id, destination_row in resident_copy_rows:
+                            for name, source, destination in d2d_weight_infos:
+                                if source.shape[0] == slot.num_experts:
+                                    source_index = expert_id
+                                else:
+                                    try:
+                                        source_index = old_row_owner.index(expert_id)
+                                    except ValueError:
+                                        raise RuntimeError(
+                                            f"resident expert {expert_id} has no "
+                                            "canonical source row"
+                                        )
+                                source_expert = source[source_index]
+                                destination_expert = destination[destination_row]
+                                if d2d_w13_up_first and name in (
+                                    "w13_weight",
+                                    "w13_weight_scale_inv",
+                                ):
+                                    # FlashInfer loads W13 as [up; gate], whereas
+                                    # the KT/Marlin prepared image and CPU writer
+                                    # use [gate; up].  Normalize only while copying
+                                    # into the full-expert shadow.
+                                    split = source_expert.shape[0] // 2
+                                    destination_expert[:split].copy_(
+                                        source_expert[split:], non_blocking=True
+                                    )
+                                    destination_expert[split:].copy_(
+                                        source_expert[:split], non_blocking=True
+                                    )
+                                else:
+                                    destination_expert.copy_(
+                                        source_expert, non_blocking=True
+                                    )
             except Exception as exc:
                 gpu_copy_error = exc
             self._commit_tp_runtime_phase(
@@ -3153,107 +4322,199 @@ class _Mxfp4LayerwisePrefillManager:
             # Section 15.2 ``bank reuse wait``: how long the host write had to
             # wait for the previous generation's H2D to release its host slot.
             reuse_wait_ms = 0.0
-            # Doc section 20 item 8: the pinned host ring is sized by
-            # ``--kt-layer-h2d-batch-size``, so one batch owns a whole
-            # generation of host slots.  Per batch the layer therefore pays
-            # exactly one ``sync_write_weight_scale_to_buffer``, one
-            # host-slot-free TP fence and one write TP fence instead of one of
-            # each per expert.
-            for batch_ids in host_write_batches(
-                staged_expert_ids, self.host_write_batch
-            ):
-                # Rolling double buffer: batch b writes generation b % 2 while
-                # batch b-1's H2D drains the other one.
-                batch_slots = host_generation_slots(
-                    self._host_generation, self.host_write_batch, len(batch_ids)
+            # Section 15.2 drain count: one drain per host-write pass, so this is
+            # 1 for every (re)loaded layer.  Warm slot-reuse paths skip the pass
+            # entirely, so the recorded value is drains-per-load and its window
+            # mean reads as the reload ratio.
+            drain_count = 0
+            # Doc section 20 item 8: the pinned host ring holds two generations
+            # of the whole staging window, so one pass owns a complete
+            # generation and the KT writer is fed the whole staged set once.
+            # The writer drains once per generation, outside the per-expert
+            # loop, before publishing the generation to the peers.
+            batch_slots: List[int] = []
+            batch_ids: List[int] = []
+            batch_rows: List[int] = []
+            transport_ids = list(staged_expert_ids) + list(
+                resident_host_ids
+            )
+            if transport_ids:
+                drain_count = 1
+                # One generation per layer: the single pass writes the
+                # generation the previous layer's H2D is not reading.
+                batch_ids = list(transport_ids)
+                batch_rows = (
+                    list(range(len(batch_ids)))
+                    if slot.prepared_only
+                    else [int(logical_to_row[e]) for e in batch_ids]
+                )
+                batch_slots = host_generation_range(
+                    self._host_generation, self.host_slots, len(batch_ids)
                 )
                 self._host_generation ^= 1
 
-                # Rank 0 writes every rank's SHM.  Every rank must therefore
-                # finish its own DMA before that host slot can be overwritten.
-                # A prior H2D enqueue failure is sticky until this common
-                # control point, which lets every rank leave the hot loop in
-                # the same collective order instead of stranding a peer.
-                host_free_error = pending_h2d_error
-                pending_h2d_error = None
-                reuse_wait_start = time.perf_counter()
-                for host_slot in batch_slots:
-                    if not self.host_slot_was_used[host_slot]:
-                        continue
-                    try:
-                        self.host_slot_free_events[host_slot].synchronize()
-                    except Exception as exc:
-                        if host_free_error is None:
-                            host_free_error = exc
-                reuse_wait_ms += (time.perf_counter() - reuse_wait_start) * 1000.0
-                self._commit_tp_device_runtime_phase(
-                    host_free_error,
-                    f"host-slot reuse before expert {batch_ids[0]}",
+            # Rank 0 writes every rank's SHM.  Every rank must therefore
+            # finish its own DMA before that host slot can be overwritten.
+            # A prior H2D enqueue failure is sticky until this common
+            # control point, which lets every rank leave the hot loop in
+            # the same collective order instead of stranding a peer.
+            host_free_error = pending_h2d_error
+            pending_h2d_error = None
+            # The host write follows the previous generation's release on the
+            # DMA stream in both modes, so nothing here waits on the host.
+            # The device consensus below stays: the writer may only start once
+            # every rank's earlier H2D has been enqueued (the copy stream
+            # ordered it) and every rank reached this point in the same order,
+            # because every rank waits TP0's published gate before H2D.
+            for host_slot in batch_slots:
+                self.transfer_stream.wait_event(
+                    self.host_slot_free_events[host_slot]
                 )
+            self._commit_tp_device_runtime_phase(
+                host_free_error,
+                f"host-slot reuse for layer {layer_idx}",
+            )
 
-                write_error = None
-                if method.tp_rank == 0:
-                    try:
-                        if method.wrapper is None:
-                            raise RuntimeError(
-                                "MXFP4 TP0 has no KT wrapper for host weight "
-                                "transport"
-                            )
-                        for offset, expert_id in enumerate(batch_ids):
-                            self._submit_host_write(
-                                method, expert_id, batch_slots[offset]
-                            )
-                        # One drain for the whole batch.  The KT task queue
-                        # already holds every expert of the batch, so its worker
-                        # thread starts the next write without waiting for a new
-                        # Python submit, and this host thread pays a single
-                        # ``cpu_infer.sync()`` instead of one per expert.
-                        method.wrapper.sync_write_weight_scale_to_buffer()
-                    except Exception as exc:
-                        write_error = exc
-
-                # The device reduction is both the producer-ready fence and
-                # an error broadcast.  TP0 therefore cannot strand peer ranks
-                # in a later phase if its KT writer fails, and no rank starts
-                # the H2D of a batch whose host slots are not fully written.
-                self._commit_tp_device_runtime_phase(
-                    write_error,
-                    f"host write for experts {batch_ids[0]}..{batch_ids[-1]}",
-                )
-
-                host_free_recorded = False
+            write_error = None
+            if method.tp_rank == 0:
                 try:
-                    with torch.cuda.stream(self.transfer_stream):
-                        try:
-                            for offset, expert_id in enumerate(batch_ids):
-                                for _, cpu_buffer, destination in weight_infos:
-                                    destination[expert_id].copy_(
-                                        cpu_buffer[batch_slots[offset]],
-                                        non_blocking=True,
-                                    )
-                        finally:
-                            # Once any DMA may have been enqueued, a peer's
-                            # failure must not make this rank forget the local
-                            # host-slot fences before the consensus raises.
-                            for host_slot in batch_slots:
-                                self.host_slot_was_used[host_slot] = True
-                            for host_slot in batch_slots:
-                                self.host_slot_free_events[host_slot].record(
-                                    self.transfer_stream
-                                )
-                            host_free_recorded = True
+                    if method.wrapper is None:
+                        raise RuntimeError(
+                            "MXFP4 TP0 has no KT wrapper for host weight "
+                            "transport"
+                        )
+                    for offset, expert_id in enumerate(batch_ids):
+                        self._submit_host_write(
+                            method, expert_id, batch_slots[offset]
+                        )
+                    # CPUInfer write tasks are asynchronous.  Drain this
+                    # layer's generation once on the writer before publishing
+                    # it; the copy-stream gate alone cannot observe CPU
+                    # worker completion.  The drain stays outside the
+                    # per-expert loop and outside every non-writer rank.
+                    if batch_ids:
+                        method.wrapper.sync_write_weight_scale_to_buffer()
+                    # Record the local copy-stream gates.  The cross-rank
+                    # broadcast happens below, after the write-phase commit,
+                    # on every rank in the same collective order.
+                    self._publish_host_write(batch_slots)
                 except Exception as exc:
-                    pending_h2d_error = exc
-                    if not host_free_recorded:
-                        try:
-                            # Event publication itself failed.  A local-stream
-                            # sync is the exception-only safe fallback before
-                            # this rank reports failure to its peers.
-                            self.transfer_stream.synchronize()
-                            for host_slot in batch_slots:
-                                self.host_slot_was_used[host_slot] = False
-                        except Exception:
-                            pass
+                    write_error = exc
+
+            self._commit_tp_runtime_phase(
+                write_error,
+                f"host write for layer {layer_idx}",
+            )
+
+            # Every rank publishes at this point, after the write-phase
+            # commit.  TP0 previously published inside its writer block,
+            # which made it enter the Gloo broadcast while the peers were
+            # still in this all-reduce.  A publish failure stays sticky and
+            # reaches the raw-ready commit below with the other rank errors.
+            publish_error = None
+            published_events = None
+            try:
+                published_events = self._publish_host_write_phase()
+            except Exception as exc:
+                publish_error = exc
+
+            host_free_recorded = False
+            copy_submits = 0
+            copy_pairs = 0
+            try:
+                with torch.cuda.stream(self.transfer_stream):
+                    try:
+                        if publish_error is not None:
+                            raise publish_error
+                        if batch_slots and published_events is not None:
+                            for gate in published_events:
+                                self.transfer_stream.wait_event(gate)
+                        # Physical rows and host slots both step by one inside
+                        # a run, so a contiguous run is one strided copy over
+                        # an ``(n, chunk)`` view pair instead of ``n``
+                        # per-expert submissions.  A sparse selection degrades
+                        # to single-expert runs (doc section 15.3).
+                        runs = list(
+                            contiguous_copy_runs(batch_rows, batch_slots)
+                        )
+                        # One cudaMemcpyBatchAsync covers every independent
+                        # run/bank span in this generation.  The per-run loop
+                        # remains the compatibility path when the runtime or a
+                        # bank layout cannot use the batch API.
+                        batch_copies: List[BatchCopy] = []
+                        run_pairs_total = 0
+                        for run_start, run_len in runs:
+                            first_row = batch_rows[run_start]
+                            first_slot = batch_slots[run_start]
+                            run_pairs_total += run_len
+                            for _, cpu_buffer, destination in h2d_weight_infos:
+                                row_bytes = row_nbytes(destination)
+                                if row_bytes is None:
+                                    batch_copies.clear()
+                                    break
+                                batch_copies.append(
+                                    BatchCopy(
+                                        source=cpu_buffer,
+                                        source_row=first_slot,
+                                        destination=destination,
+                                        destination_row=first_row,
+                                        row_bytes=row_bytes,
+                                        rows=run_len,
+                                    )
+                                )
+                            if not batch_copies:
+                                break
+                        batch_done = bool(batch_copies) and try_batch_memcpy(
+                            batch_copies, self.transfer_stream
+                        )
+                        if batch_done:
+                            # ``copy_submits`` tracks runtime submissions, so
+                            # the whole generation counts as one here.
+                            copy_submits += 1
+                            copy_pairs += run_pairs_total
+                        else:
+                            for run_start, run_len in runs:
+                                first_row = batch_rows[run_start]
+                                first_slot = batch_slots[run_start]
+                                last_row = first_row + run_len
+                                last_slot = first_slot + run_len
+                                for _, cpu_buffer, destination in h2d_weight_infos:
+                                    # Both sides step by one across the run, so
+                                    # the span is ``(n, chunk)``; ``-1`` keeps
+                                    # the per-expert stride and only merges when
+                                    # both sides are dense.
+                                    src = cpu_buffer[
+                                        first_slot:last_slot
+                                    ].reshape(run_len, -1)
+                                    dst = destination[first_row:last_row].reshape(
+                                        run_len, -1
+                                    )
+                                    dst.copy_(src, non_blocking=True)
+                                    copy_submits += 1
+                                copy_pairs += run_len
+                    finally:
+                        # Once any DMA may have been enqueued, a peer's
+                        # failure must not make this rank forget the local
+                        # host-slot fences before the consensus raises.
+                        for host_slot in batch_slots:
+                            self.host_slot_was_used[host_slot] = True
+                        for host_slot in batch_slots:
+                            self.host_slot_free_events[host_slot].record(
+                                self.transfer_stream
+                            )
+                        host_free_recorded = True
+            except Exception as exc:
+                pending_h2d_error = exc
+                if not host_free_recorded:
+                    try:
+                        # Event publication itself failed.  A local-stream
+                        # sync is the exception-only safe fallback before
+                        # this rank reports failure to its peers.
+                        self.transfer_stream.synchronize()
+                        for host_slot in batch_slots:
+                            self.host_slot_was_used[host_slot] = False
+                    except Exception:
+                        pass
 
             # H2D launch errors are reported at the next pre-write consensus.
             # The final batch has no successor, so combine its sticky status
@@ -3276,6 +4537,16 @@ class _Mxfp4LayerwisePrefillManager:
             )
             copy_ms = (time.perf_counter() - transfer_start) * 1000.0
 
+            if slot.prepared_only:
+                if len(batch_ids) > slot.raw_rows:
+                    raise RuntimeError(
+                        "prepared-only MXFP4 transport exceeds the raw H2D "
+                        f"scratch: {len(batch_ids)} > {slot.raw_rows}"
+                    )
+                slot.pending_raw_ids = list(batch_ids)
+                slot.pending_prepared_rows = [
+                    int(logical_to_row[expert_id]) for expert_id in batch_ids
+                ]
             postprocess_start = time.perf_counter()
             postprocess_error = None
             try:
@@ -3286,7 +4557,34 @@ class _Mxfp4LayerwisePrefillManager:
                 postprocess_error, f"postprocess for layer {layer_idx}"
             )
             postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
+            slot.logical_to_row = list(logical_to_row)
+            slot.logical_to_row_cuda = None
+            slot.pending_raw_ids = []
+            slot.pending_prepared_rows = []
+            if pending_pairs:
+                # The promoted rows were just transported from host memory.
+                # Mirror them into the stable GEC/decode image while the
+                # postprocess stream still owns their ready fence, then make
+                # the caller stream observe that one-time refresh.
+                refresh_event = torch.cuda.Event()
+                with torch.cuda.stream(self.postprocess_stream):
+                    self._refresh_original_layer_rows(
+                        method, layer, slot, old_row_owner, pending_pairs
+                    )
+                    # Re-publish the slot's normal ready fence after the
+                    # decode/fallback refresh.  Consumers and future bank
+                    # reuse already wait on ready_event, so extending it here
+                    # covers the refresh without adding a second public event.
+                    slot.ready_event.record(self.postprocess_stream)
+                    slot.ready_ts.record(self.postprocess_stream)
+                    refresh_event.record(self.postprocess_stream)
+                torch.cuda.current_stream(self.device).wait_event(
+                    refresh_event
+                )
+                self._publish_method_row_owner(method, new_row_owner)
+                self._pending_boundary_promotions.pop(layer_idx, None)
             slot.state = "READY"
+            slot.loaded_layer_idx = layer_idx
             slot.resident_ids = list(gpu_expert_ids)
             slot.staged_ids = list(staged_expert_ids)
             slot.effective_ids, slot.partial = effective_experts(
@@ -3295,15 +4593,21 @@ class _Mxfp4LayerwisePrefillManager:
             slot.candidate_count = len(cpu_expert_ids)
             slot.effective_mask_cuda = None
             slot.cpu_routes_scalar = None
+            self._remember_layer_staging(
+                layer_idx, slot, gpu_expert_ids, staged_expert_ids
+            )
             if self.telemetry is not None:
                 self._layer_staged[layer_idx] = tuple(staged_expert_ids)
                 self._layer_metrics.setdefault(layer_idx, {}).update(
                     candidate_count=float(len(cpu_expert_ids)),
                     resident_count=float(len(gpu_expert_ids)),
                     copy_bytes=float(
-                        self._per_expert_raw_bytes() * len(staged_expert_ids)
+                        self._per_expert_raw_bytes() * len(batch_ids)
                     ),
+                    drain_count=float(drain_count),
                     copy_ms=copy_ms,
+                    copy_submits=float(copy_submits),
+                    copy_pairs=float(copy_pairs),
                     postprocess_ms=postprocess_ms,
                     bank_reuse_wait_ms=reuse_wait_ms,
                 )
@@ -3363,15 +4667,72 @@ class _Mxfp4LayerwisePrefillManager:
         if ready is not None:
             return ready, True
 
-        if self.current_slot_index is None:
-            slot = self.slots[0]
-        else:
-            slot = self.slots[1 - self.current_slot_index]
+        order = self.layer_order
+        position = bisect.bisect_left(order, layer_idx)
+        # FreeToken uses ``layer_id % 2`` ping-pong.  Pinning the assignment
+        # to layer position (instead of "the slot not used last") keeps a
+        # layer in the same bank across forwards, so resident rows and a
+        # boundary-promoted staging row stay physically valid there.
+        slot = self.slots[position % 2]
         self._load_slot(slot, layer_idx, method, layer)
         return slot, False
 
-    def _prefetch_successor(self, current: _Mxfp4PrefillSlot) -> None:
-        successor_idx = self.successor_layer_idx(current.layer_idx)
+    def _late_prefetch_target(
+        self, order: List[int], layer_idx: int
+    ) -> Optional[Tuple[int, object, torch.nn.Module]]:
+        # Early prefetch covers the successor.  A late load is still needed
+        # when the switch degraded to the late placement mid-round (a partial
+        # layer, or the switch turned on after this round began), and on the
+        # round's first layer.
+        positions = {idx: pos for pos, idx in enumerate(order)}
+        if layer_idx not in positions:
+            return None
+        pos = positions[layer_idx]
+        if self.early_prefetch_only:
+            wanted = order[pos + 1] if pos + 1 < len(order) else None
+        elif pos == 0 or self.prefetch_epoch != self.epoch:
+            wanted = self.successor_layer_idx(layer_idx)
+        else:
+            return None
+        if wanted is None:
+            return None
+        entry = self.registry.get(wanted)
+        if entry is None:
+            raise RuntimeError(
+                f"MXFP4 successor layer {wanted} disappeared from registry"
+            )
+        next_method, next_layer = entry
+        return wanted, next_method, next_layer
+
+    def _prefetch_early(
+        self, layer_idx: int, slot: _Mxfp4PrefillSlot
+    ) -> None:
+        """Enqueue the successor before this layer's compute is issued.
+
+        FreeToken enqueues ``prefetch(L + 1)`` ahead of ``wait(L)`` + GEMM(L);
+        issuing it from the top of ``apply`` (after attention of L has been
+        enqueued) lets H2D(L + 1) overlap attention(L) as well as GEMM(L),
+        instead of only beginning after GEMM(L) was launched.
+        """
+        if slot.partial:
+            # The partial path issues its own prefetch from
+            # ``_apply_effective_set``; a second load of the same successor
+            # would collide on the other slot.
+            self.early_prefetch_only = False
+            return
+        successor_idx = self.successor_layer_idx(layer_idx)
+        if successor_idx is None:
+            return
+        self.prefetch_epoch = self.epoch
+        self._prefetch_successor(slot, successor_idx)
+
+    def _prefetch_successor(
+        self,
+        current: _Mxfp4PrefillSlot,
+        successor_idx: Optional[int] = None,
+    ) -> None:
+        if successor_idx is None:
+            successor_idx = self.successor_layer_idx(current.layer_idx)
         if successor_idx is None:
             return
         entry = self.registry.get(successor_idx)
@@ -3394,8 +4755,14 @@ class _Mxfp4LayerwisePrefillManager:
         # Fold the previous layer's asynchronously copied demand histogram
         # into its history before this layer's prefetch decision reads it.
         self._flush_router_demand()
+        # Resident ownership is mutable only at a forward/chunk boundary.  The
+        # first observation arms the tracker; a changed pass id marks the point
+        # where every layer of the previous chunk has completed.
+        if self._forward_boundary.observe(published_forward_id()):
+            self._apply_boundary_promotions()
         if self.planner is not None:
             self.planner.note_layer_visit(layer_idx)
+        order = self.layer_order
         slot, prefetch_hit = self._acquire(layer_idx, method, layer)
         if slot.layer_idx != layer_idx or slot.epoch != self.epoch:
             raise RuntimeError(
@@ -3403,6 +4770,9 @@ class _Mxfp4LayerwisePrefillManager:
                 f"wanted layer={layer_idx}/epoch={self.epoch}, got "
                 f"layer={slot.layer_idx}/epoch={slot.epoch}"
             )
+        # FreeToken ordering: the successor transfer is enqueued before this
+        # layer's compute, so it overlaps attention(L), not only GEMM(L).
+        self._prefetch_early(layer_idx, slot)
 
         main_stream = None
         result = None
@@ -3437,9 +4807,29 @@ class _Mxfp4LayerwisePrefillManager:
                 )
             else:
                 compute_start = time.perf_counter()
-                result = self.context.gpu_method.apply(
-                    self.context.gpu_layer, dispatch_output
+                topk_output = materialize_kt_topk_output(
+                    dispatch_output.topk_output,
+                    method.kt_config.layer_idx,
                 )
+                logical_topk_ids = topk_output.topk_ids
+                gpu_topk_ids = mask_and_remap_expert_ids(
+                    logical_topk_ids,
+                    self._effective_mask_for_slot(
+                        slot, logical_topk_ids.device
+                    ),
+                    self._logical_to_row_for_slot(
+                        slot, logical_topk_ids.device
+                    ),
+                )
+                gpu_dispatch = dispatch_output._replace(
+                    topk_output=topk_output._replace(
+                        topk_ids=gpu_topk_ids
+                    )
+                )
+                result = self.context.gpu_method.apply(
+                    self.context.gpu_layer, gpu_dispatch
+                )
+                partial_topk_ids = logical_topk_ids
                 compute_ms = (time.perf_counter() - compute_start) * 1000.0
         except Exception as exc:
             compute_error = exc
@@ -3533,13 +4923,16 @@ class _Mxfp4LayerwisePrefillManager:
                 dynamic_error, f"dynamic expert update for layer {layer_idx}"
             )
 
-        # GPU compute is now enqueued.  Host KT writes and successor transfer
-        # scheduling can overlap it without requiring an async kt-kernel API.
-        # The partial path already submitted the successor inside
-        # ``_apply_effective_set`` so the prefetch also overlaps the CPU
-        # fallback (section 14.1 ordering).
-        if not slot.partial:
-            self._prefetch_successor(slot)
+        # GPU compute is now enqueued.  The partial path already submitted the
+        # successor inside ``_apply_effective_set`` so the prefetch also
+        # overlaps the CPU fallback (section 14.1 ordering).  A layer reaches
+        # here with its successor still unloaded only on the round's first
+        # layer, or after a partial layer moved the round to the late
+        # placement; ``_late_prefetch_target`` covers exactly those.
+        late = self._late_prefetch_target(order, layer_idx)
+        if late is not None:
+            successor_idx, next_method, next_layer = late
+            self._prefetch_successor(slot, successor_idx)
         if method.tp_rank == 0:
             logger.debug(
                 "KT MXFP4 layerwise prefill: layer=%d epoch=%d slot=%d %s "
@@ -3574,6 +4967,19 @@ class _Mxfp4LayerwisePrefillManager:
                 ] = True
             slot.effective_mask_cuda = mask
         return mask
+
+    def _logical_to_row_for_slot(
+        self, slot: _Mxfp4PrefillSlot, device
+    ) -> torch.Tensor:
+        """Device mapping from logical expert id to this bank's physical row."""
+
+        mapping = slot.logical_to_row_cuda
+        if mapping is None or mapping.device != device:
+            mapping = torch.tensor(
+                slot.logical_to_row, dtype=torch.int32, device=device
+            )
+            slot.logical_to_row_cuda = mapping
+        return mapping
 
     def _apply_effective_set(
         self,
@@ -3614,7 +5020,11 @@ class _Mxfp4LayerwisePrefillManager:
         effective_mask = self._effective_mask_for_slot(slot, topk_ids.device)
 
         cpu_topk_ids = mask_gpu_expert_ids_for_cpu(topk_ids, effective_mask)
-        gpu_topk_ids = mask_topk_ids_for_expert_group(topk_ids, effective_mask)
+        gpu_topk_ids = mask_and_remap_expert_ids(
+            topk_ids,
+            effective_mask,
+            self._logical_to_row_for_slot(slot, topk_ids.device),
+        )
         # Keep the route count on the device: reading it back here would add a
         # scalar sync to the layer hot path (section 14.5).  It is folded into
         # the telemetry at the next layer boundary instead.
@@ -3676,7 +5086,7 @@ class _Mxfp4LayerwisePrefillManager:
 
 
 def _mxfp4_pipeline_signature(method, layer: torch.nn.Module) -> tuple:
-    device = next(layer.parameters()).device
+    device = _kt_layer_cuda_device(layer)
     return (
         str(device),
         method.kt_config.weight_path,
@@ -3769,7 +5179,9 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
     # uses the prepared Marlin backend on Ada and Blackwell consumer GPUs.
     if os.environ.get("SGLANG_V4_USE_TRITON_KERNELS") in ("0", "1"):
         return False
-    device = next(layer.parameters()).device
+    device = _kt_layer_cuda_device(layer)
+    if device.type != "cuda":
+        return False
     return torch.cuda.get_device_capability(device) in ((8, 9), (12, 0))
 
 
@@ -3857,7 +5269,41 @@ def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         )
-        total_bytes += 2 * (raw_slot_bytes + prepared_slot_bytes)
+        _, window, physical_rows = _mxfp4_staging_layout(
+            registry,
+            num_experts,
+            getattr(method.kt_config, "kt_layer_h2d_slots", None),
+        )
+        if window is None:
+            # slot 0 aliases the full shadow in the legacy path.
+            total_bytes += 2 * (raw_slot_bytes + prepared_slot_bytes)
+        else:
+            # The temporary full-N context remains the allocation source and
+            # therefore counts toward the peak even when prepared-only moves
+            # it to CPU immediately after the banks are built.
+            compact_prepared_bytes = get_v4_mxfp4_marlin_storage_nbytes(
+                num_experts=physical_rows,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            if _mxfp4_prepared_only_requested(method.kt_config):
+                raw_scratch_bytes = _mxfp4_raw_slot_storage_nbytes(
+                    num_experts=window,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                )
+                total_bytes += raw_slot_bytes + 2 * (
+                    compact_prepared_bytes + raw_scratch_bytes
+                )
+            else:
+                compact_raw_bytes = _mxfp4_raw_slot_storage_nbytes(
+                    num_experts=physical_rows,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                )
+                total_bytes += raw_slot_bytes + 2 * (
+                    compact_raw_bytes + compact_prepared_bytes
+                )
 
     return total_bytes
 
@@ -3918,33 +5364,123 @@ def _try_mxfp4_initialization(factory):
         return None, ("fatal", f"{type(exc).__name__}: {exc}")
 
 
-def _allocate_mxfp4_slot_storage(context: SharedFullContext):
+def _mxfp4_staging_layout(
+    registry: Dict[int, tuple],
+    num_experts: int,
+    staging_window: Optional[int],
+) -> Tuple[int, Optional[int], int]:
+    """Return ``(R_max, S, physical_rows)`` for one model-level bank pair."""
+
+    window = clamp_staging_window(staging_window, num_experts)
+    if window is None:
+        return 0, None, int(num_experts)
+    resident_counts = [
+        int(method.gpu_experts_mask.sum().item())
+        for method, _ in registry.values()
+    ]
+    resident_capacity = max(resident_counts, default=0)
+    return resident_capacity, window, resident_capacity + window
+
+
+def _empty_mxfp4_rows(source: torch.Tensor, rows: int) -> torch.Tensor:
+    return torch.empty(
+        (int(rows), *source.shape[1:]),
+        dtype=source.dtype,
+        device=source.device,
+    )
+
+
+def _allocate_mxfp4_slot_storage(
+    context: SharedFullContext,
+    signature: Optional[tuple] = None,
+    staging_window: Optional[int] = None,
+    prepared_only: bool = False,
+):
     from sglang.srt.layers.quantization.v4_marlin_moe import (
         allocate_v4_mxfp4_marlin,
     )
 
-    slot0_raw = {
+    source = {
         name: getattr(context.gpu_layer, name).data
         for name in _Mxfp4PrefillSlot.RAW_NAMES
     }
+    num_experts = source["w13_weight"].shape[0]
+    registry = _MXFP4_PREFILL_LAYER_REGISTRY.get(signature, {})
+    resident_capacity, window, physical_rows = _mxfp4_staging_layout(
+        registry, num_experts, staging_window
+    )
+    if prepared_only and window is None:
+        raise ValueError("prepared-only slot storage requires an active staging window")
+    if window is None:
+        # Historical full-layer path: slot 0 aliases the shared shadow so the
+        # extra lazy allocation remains exactly one full layer.
+        slot0_raw = source
+        raw_rows = num_experts
+    else:
+        # Prepared-only banks need raw storage only for the experts that cross
+        # PCIe on a layer load.  Resident rows are copied between prepared
+        # banks, so the raw scratch width is the staging window, not R + S.
+        raw_rows = window if prepared_only else physical_rows
+        slot0_raw = {
+            name: _empty_mxfp4_rows(tensor, raw_rows)
+            for name, tensor in source.items()
+        }
     slot1_raw = {
-        name: torch.empty_like(getattr(context.gpu_layer, name).data)
-        for name in _Mxfp4PrefillSlot.RAW_NAMES
+        name: _empty_mxfp4_rows(tensor, raw_rows)
+        for name, tensor in source.items()
     }
-    num_experts = slot0_raw["w13_weight"].shape[0]
-    hidden_size = slot0_raw["w13_weight"].shape[2] * 2
-    intermediate_size = slot0_raw["w2_weight"].shape[2] * 2
-    device = slot0_raw["w13_weight"].device
+    hidden_size = source["w13_weight"].shape[2] * 2
+    intermediate_size = source["w2_weight"].shape[2] * 2
+    device = source["w13_weight"].device
     slot_marlin_prepared = tuple(
         allocate_v4_mxfp4_marlin(
-            num_experts=num_experts,
+            num_experts=physical_rows,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             device=device,
         )
         for _ in range(2)
     )
-    return slot1_raw, slot_marlin_prepared
+    return (
+        slot0_raw,
+        slot1_raw,
+        slot_marlin_prepared,
+        resident_capacity,
+        window,
+        physical_rows,
+        bool(prepared_only),
+    )
+
+
+def _layerwise_host_ring_depth(kt_config) -> int:
+    """Pinned host-ring depth for the layerwise prefill pipeline (section 7.5).
+
+    ``--kt-layer-h2d-slots`` doubles as the selection flag and the staging
+    window ``S``, so the ring is ``2 * S`` slots and each layer owns exactly one
+    generation.  With the feature unselected the pipeline keeps the historical
+    two-slot pair and the pinned footprint does not change at all.
+
+    The ring is the only large pinned allocation on this path, so log it at
+    startup: ``2 * S * per_expert_raw_bytes`` grows linearly with a window the
+    operator chooses, and a large ``S`` must be a visible decision rather than a
+    silent allocation.
+    """
+
+    window = getattr(kt_config, "kt_layer_h2d_slots", None)
+    try:
+        window = int(window) if window is not None else None
+    except (TypeError, ValueError):
+        window = None
+    if window is None or window <= 0:
+        return 2
+    ring = host_ring_depth(window)
+    logger.info(
+        "[kt-prefetch] host ring depth=%d for staging window S=%d "
+        "(pinned host slots per rank, two generations)",
+        ring,
+        window,
+    )
+    return ring
 
 
 def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None:
@@ -3968,22 +5504,13 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
             global_num_experts=method.global_num_experts,
             moe_runner_config=method.moe_runner_config,
             defer_cpu_buffers=True,
-            # The pinned host ring is what lets the layerwise loop queue a whole
-            # host-write batch before draining it, and the two rolling
-            # generations are what keep the host write of batch b+1 overlapping
-            # the H2D of batch b (doc sections 7.5 and 20 item 8).
-            # ``--kt-layer-h2d-batch-size`` is the documented H2D batch
-            # granularity, so it sizes one generation exactly like the GEC
-            # staging context does.  An unset flag starts from the documented
-            # prefill default of 8 experts per drain (about 168MB of pinned
-            # SHM per rank on DeepSeek-V4.1-Flash at TP=2), which keeps the
-            # per-layer drain and TP-fence count at ceil(S / 8) instead of the
-            # old two-slot pair's one round trip per expert.  Explicit
-            # ``--kt-layer-h2d-batch-size 1`` still degenerates to that pair,
-            # because ``SharedFullContext`` floors the ring depth at two.
-            cpu_buffer_depth=host_ring_depth(
-                int(getattr(method.kt_config, "kt_layer_h2d_batch_size", 8) or 8)
-            ),
+            # The pinned host ring is the FreeToken prefill shape (doc section
+            # 7.5): one generation per layer parity, ``2 * S`` slots, so a layer
+            # queues its whole staged set and drains it in a single pass.  The
+            # staging window ``--kt-layer-h2d-slots`` sizes it; leaving that
+            # positive flag unset leaves the feature off and the historical
+            # two-slot pair in place.
+            cpu_buffer_depth=_layerwise_host_ring_depth(method.kt_config),
         )
     )
 
@@ -4006,7 +5533,14 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
         raise RuntimeError("MXFP4 layerwise prefill built a non-MXFP4 full context")
 
     slot_storage, slot_failure = _try_mxfp4_initialization(
-        lambda: _allocate_mxfp4_slot_storage(context)
+        lambda: _allocate_mxfp4_slot_storage(
+            context,
+            signature=signature,
+            staging_window=getattr(
+                method.kt_config, "kt_layer_h2d_slots", None
+            ),
+            prepared_only=_mxfp4_prepared_only_requested(method.kt_config),
+        )
     )
 
     if not _all_tp_ranks_succeeded(slot_failure is None):
@@ -4026,15 +5560,27 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
             "full-layer raw/prepared allocation failed on at least one TP rank",
         )
         return
-    slot1_raw, slot_marlin_prepared = slot_storage
+    (
+        slot0_raw,
+        slot1_raw,
+        slot_marlin_prepared,
+        resident_capacity,
+        staging_window,
+        physical_rows,
+        prepared_only,
+    ) = slot_storage
 
     manager, manager_failure = _try_mxfp4_initialization(
         lambda: _Mxfp4LayerwisePrefillManager(
             context,
             signature,
+            slot0_raw,
             slot1_raw,
             slot_marlin_prepared,
-            getattr(method.kt_config, "kt_layer_h2d_slots", None),
+            resident_capacity,
+            physical_rows,
+            staging_window,
+            prepared_only,
         )
     )
     if not _all_tp_ranks_succeeded(manager_failure is None):
@@ -4059,6 +5605,22 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
         return
 
     context.initialize_cpu_buffers()
+    released_context_raw = 0
+    if prepared_only:
+        # The full-N context exists only to allocate the compatible slot and
+        # CPU-ring shapes.  Once both compact banks exist, keeping its raw GPU
+        # image would be a third copy of the same expert bytes.  FreeToken's
+        # slot cache likewise keeps only the kernel-ready image on device.
+        try:
+            released_context_raw = _move_mxfp4_raw_layer_bytes_to_cpu(
+                context.gpu_layer
+            )
+        except Exception:
+            logger.warning(
+                "KT MXFP4 could not release the full-context raw GPU image; "
+                "the prepared-only banks remain correct but use more VRAM",
+                exc_info=True,
+            )
     _MXFP4_LAYERWISE_MANAGERS[signature] = manager
     if _SHARED_FULL_CONTEXT is None:
         _SHARED_FULL_CONTEXT = context
@@ -4078,16 +5640,37 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
                 slot.marlin_prepared.w2_scale,
             )
         )
-        logger.info(
-            "KT MXFP4 layerwise prefill lazily initialized two raw + two Marlin "
-            "prepared full-layer slots on %s (raw=%.2f GiB, "
-            "prepared=%.2f GiB, total=%.2f GiB, staging_window=%s)",
-            manager.device,
-            raw_bytes / 1024**3,
-            prepared_bytes / 1024**3,
-            (raw_bytes + prepared_bytes) / 1024**3,
-            manager.staging_window if manager.staging_window is not None else "full",
-        )
+        if prepared_only:
+            logger.info(
+                "KT MXFP4 layerwise prefill lazily initialized prepared-only "
+                "slots on %s (prepared_pool=%.2f GiB for %d rows/bank, "
+                "raw_h2d_scratch=%.2f GiB for %s rows/bank, total=%.2f GiB, "
+                "resident_capacity=%d, staging_window=%s, "
+                "full_context_raw_released=%.2f GiB)",
+                manager.device,
+                prepared_bytes / 1024**3,
+                manager.physical_rows,
+                raw_bytes / 1024**3,
+                manager.staging_window,
+                (raw_bytes + prepared_bytes) / 1024**3,
+                manager.resident_capacity,
+                manager.staging_window,
+                released_context_raw / 1024**3,
+            )
+        else:
+            logger.info(
+                "KT MXFP4 layerwise prefill lazily initialized %d-row raw + "
+                "Marlin prepared slots on %s (raw=%.2f GiB, "
+                "prepared=%.2f GiB, total=%.2f GiB, staging_window=%s, "
+                "resident_capacity=%d)",
+                manager.physical_rows,
+                manager.device,
+                raw_bytes / 1024**3,
+                prepared_bytes / 1024**3,
+                (raw_bytes + prepared_bytes) / 1024**3,
+                manager.staging_window if manager.staging_window is not None else "full",
+                manager.resident_capacity,
+            )
 
 
 def _get_or_initialize_mxfp4_layerwise_manager(
@@ -4179,6 +5762,7 @@ def generate_uniform_masks(
     num_gpu_experts: int,
     first_k_dense_replace: int,
     moe_layer_freq: int,
+    num_fused_shared_experts: int = 0,
 ) -> torch.Tensor:
     """Generate masks with equal GPU experts per MoE layer.
 
@@ -4188,6 +5772,8 @@ def generate_uniform_masks(
         num_gpu_experts: Total number of GPU experts to allocate
         first_k_dense_replace: Layer index where MoE layers start
         moe_layer_freq: Frequency of MoE layers
+        num_fused_shared_experts: Trailing fused shared experts to reserve
+            before any routed expert.  They are selected first in every layer.
 
     Returns:
         Boolean mask tensor of shape [num_layers, num_experts]
@@ -4204,15 +5790,22 @@ def generate_uniform_masks(
     if num_moe_layers == 0:
         return masks
 
-    # Distribute GPU experts evenly
-    experts_per_layer = num_gpu_experts // num_moe_layers
-    remainder = num_gpu_experts % num_moe_layers
+    # Distribute GPU experts evenly.  The helper is shared with the compact
+    # staging layout so the startup resident capacity and the physical bank
+    # geometry cannot drift apart.
+    per_layer = uniform_resident_counts(
+        num_moe_layers, num_gpu_experts, num_experts
+    )
+    shared_ids = fused_shared_expert_ids(
+        num_experts, num_fused_shared_experts
+    )
 
     for idx, layer_idx in enumerate(moe_layers):
-        # First 'remainder' layers get one extra expert
-        num_for_this_layer = experts_per_layer + (1 if idx < remainder else 0)
-        num_for_this_layer = min(num_for_this_layer, num_experts)
-        masks[layer_idx, :num_for_this_layer] = True
+        resident_ids = shared_first_resident_ids(
+            num_experts, per_layer[idx], shared_ids
+        )
+        if resident_ids:
+            masks[layer_idx, resident_ids] = True
 
     # Set non-MoE layers to all True
     for layer_idx in range(num_layers):
@@ -4220,6 +5813,57 @@ def generate_uniform_masks(
             masks[layer_idx, :] = True
 
     return masks
+
+
+def _config_fused_shared_expert_count(hf_config) -> int:
+    """Fused shared experts declared by the config, subject to the active gate.
+
+    ``n_shared_experts`` may still be present when shared-expert fusion was
+    disabled for this model build.  In that case the shared experts do not
+    occupy routed expert ids and must not shift the resident selection.
+    """
+
+    for name in ("num_fused_shared_experts", "n_shared_experts"):
+        value = getattr(hf_config, name, None)
+        if value is not None:
+            break
+    else:
+        value = None
+    if not value:
+        return 0
+    try:
+        from sglang.srt.layers.moe.utils import (
+            is_shared_experts_fusion_disabled,
+        )
+
+        if is_shared_experts_fusion_disabled():
+            return 0
+    except AssertionError:
+        raise
+    except Exception:
+        # Mask construction runs during model build.  A host that cannot
+        # resolve the gate keeps the historical behaviour instead of guessing
+        # that an extra trailing id is shared.
+        return 0
+    return max(0, int(value))
+
+
+def _layer_fused_shared_expert_count(layer: torch.nn.Module) -> int:
+    """Read the fused-shared count baked into a constructed MoE layer."""
+
+    candidates = (
+        layer,
+        getattr(layer, "experts", None),
+        getattr(layer, "moe_runner_config", None),
+        getattr(layer, "quant_method", None),
+    )
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = getattr(candidate, "num_fused_shared_experts", None)
+        if value is not None:
+            return max(0, int(value))
+    return 0
 
 
 def generate_frequency_masks(
@@ -4459,26 +6103,27 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
 
     # Get GPU expert placement strategy
     strategy = server_args.kt_expert_placement_strategy
+    num_fused_shared_experts = _config_fused_shared_expert_count(hf_config)
 
-    # GEC owns a global Logical-Expert budget. Its physical startup rows are
-    # therefore allocated layer-major: fill the first eligible MoE layer up
-    # to ``num_experts``, then continue with the next layer. This preserves
-    # the global slot meaning and avoids silently changing it into a per-layer
-    # average when a model has many experts per layer.
+    # GEC owns a global Logical-Expert budget.  Streaming needs a resident
+    # floor on every MoE layer, so the budget is spread uniformly instead of
+    # filling early layers first.  Fused shared experts are reserved before
+    # routed ids in every layer; the remainder follows ascending routed order.
     tp_rank = get_tensor_model_parallel_rank()
 
     if server_args.kt_expert_gpu_slots is not None:
         if tp_rank == 0:
             logger.info(
-                "Using sequential layer-major placement for kt_expert_gpu_slots=%d",
+                "Using uniform shared-first placement for kt_expert_gpu_slots=%d",
                 num_gpu_experts,
             )
-            masks = generate_global_slot_masks(
+            masks = generate_uniform_masks(
                 num_layers,
                 num_experts,
                 num_gpu_experts,
                 first_k_dense_replace,
                 moe_layer_freq,
+                num_fused_shared_experts,
             )
         else:
             masks = torch.zeros(
@@ -4561,7 +6206,8 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             logger.info("Using uniform strategy for GPU expert placement")
             masks = generate_uniform_masks(
                 num_layers, num_experts, num_gpu_experts,
-                first_k_dense_replace, moe_layer_freq
+                first_k_dense_replace, moe_layer_freq,
+                num_fused_shared_experts,
             )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
@@ -4692,7 +6338,6 @@ def create_kt_config_from_server_args(
                     max_running_requests=getattr(
                         get_schedule(), "max_running_requests", 0
                     ),
-                    kt_layer_h2d_batch_size=get_exec().moe.kt_layer_h2d_batch_size,
                 ),
                 gec_module,
             )
@@ -4713,7 +6358,6 @@ def create_kt_config_from_server_args(
         expert_lora_path=get_exec().moe.kt_expert_lora_path,
         kt_expert_gpu_slots=get_exec().moe.kt_expert_gpu_slots,
         kt_layer_h2d_slots=get_exec().moe.kt_layer_h2d_slots,
-        kt_layer_h2d_batch_size=get_exec().moe.kt_layer_h2d_batch_size,
         kt_gec_coordinator=gec_coordinator,
         kt_num_gpu_layers=num_gpu_layers,
         kt_tp_size=tp_size,
@@ -4763,8 +6407,8 @@ def mask_gpu_expert_ids_for_cpu(
     """
     valid = (topk_ids >= 0) & (topk_ids < gpu_experts_mask.numel())
     safe_ids = torch.where(valid, topk_ids, 0)
-    is_gpu_expert = valid & gpu_experts_mask[safe_ids]
-    return topk_ids.masked_fill(is_gpu_expert, -1)
+    keep_for_cpu = valid & ~gpu_experts_mask[safe_ids]
+    return topk_ids.masked_fill(~keep_for_cpu, -1)
 
 
 def mask_topk_ids_for_expert_group(
@@ -5129,6 +6773,158 @@ def copy_experts_weights_mxfp4(
                 f"source={tuple(src_weight.shape)} destination={tuple(dst_weight.shape)}"
             )
         weight_pairs.append((src_weight, dst_weight))
+
+    if _mxfp4_raw_weights_on_cpu(dst_layer):
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            V4MarlinPreparedWeights,
+            prepare_v4_mxfp4_marlin,
+        )
+
+        resident = getattr(dst_layer, "_v4_marlin_weights", None)
+        device = _kt_layer_cuda_device(dst_layer)
+        if resident is None or device.type != "cuda":
+            raise RuntimeError(
+                "prepared-only MXFP4 update requires the resident Marlin image"
+            )
+        selected_cpu = selected_experts.detach().cpu().tolist()
+        destination_rows = (
+            dst_rows.detach().cpu().tolist()
+            if dst_rows is not None
+            else list(range(len(selected_cpu)))
+        )
+        if len(destination_rows) != len(selected_cpu):
+            raise ValueError(
+                "selected_experts and dst_rows must have equal length"
+            )
+        if any(
+            row < 0 or row >= resident.num_experts for row in destination_rows
+        ):
+            raise ValueError("MXFP4 resident destination row is out of range")
+
+        global_num_experts = getattr(
+            getattr(dst_layer, "quant_method", None),
+            "global_num_experts",
+            None,
+        )
+        source_row_counts = {
+            int(source[name].shape[0]) for name in raw_names
+        }
+        if len(source_row_counts) != 1:
+            raise RuntimeError(
+                "MXFP4 prepared-only source tensors disagree on row count: "
+                f"{sorted(source_row_counts)}"
+            )
+        source_row_count = source_row_counts.pop()
+        logical_expert_count = (
+            int(global_num_experts)
+            if global_num_experts is not None
+            else int(getattr(src_layer, "num_experts", source_row_count))
+        )
+        if source_row_count != logical_expert_count:
+            raise RuntimeError(
+                "prepared-only MXFP4 update expects a full logical raw source "
+                f"({logical_expert_count} rows), got {source_row_count}; "
+                "pass the resident compact image through the CPU H2D path"
+            )
+
+        row_count = len(selected_cpu)
+        scratch_capacity = _mxfp4_scratch_capacity(dst_layer, row_count)
+        # The source context's shadow layer is model-scoped, so this scratch
+        # is shared by every destination layer instead of being multiplied by
+        # the number of MoE layers.
+        raw_scratch = _get_mxfp4_raw_scratch(
+            src_layer, device, scratch_capacity
+        )
+        canonical = getattr(dst_layer, "_kt_mxfp4_raw_weights", None)
+        for batch_start in range(0, row_count, scratch_capacity):
+            batch_end = min(batch_start + scratch_capacity, row_count)
+            batch_experts = selected_cpu[batch_start:batch_end]
+            batch_rows = destination_rows[batch_start:batch_end]
+            batch_count = batch_end - batch_start
+            selected_cpu_index = torch.tensor(
+                batch_experts, dtype=torch.long, device="cpu"
+            )
+            for name in raw_names:
+                src_weight = source[name]
+                if src_weight.device.type == "cuda":
+                    source_rows = torch.tensor(
+                        batch_experts,
+                        dtype=torch.long,
+                        device=src_weight.device,
+                    )
+                    torch.index_select(
+                        src_weight,
+                        0,
+                        source_rows,
+                        out=raw_scratch[name][:batch_count],
+                    )
+                else:
+                    selected_source = src_weight.index_select(
+                        0, selected_cpu_index
+                    )
+                    raw_scratch[name][:batch_count].copy_(
+                        selected_source, non_blocking=True
+                    )
+
+            for run_start, run_len in contiguous_copy_runs(
+                batch_rows, range(batch_count)
+            ):
+                destination_row = int(batch_rows[run_start])
+                run_prepared = V4MarlinPreparedWeights(
+                    w13=resident.w13[
+                        destination_row : destination_row + run_len
+                    ],
+                    w13_scale=resident.w13_scale[
+                        destination_row : destination_row + run_len
+                    ],
+                    w2=resident.w2[
+                        destination_row : destination_row + run_len
+                    ],
+                    w2_scale=resident.w2_scale[
+                        destination_row : destination_row + run_len
+                    ],
+                    hidden_size=resident.hidden_size,
+                    intermediate_size=resident.intermediate_size,
+                    num_experts=run_len,
+                )
+                source_end = run_start + run_len
+                prepare_v4_mxfp4_marlin(
+                    raw_scratch["w13_weight"][run_start:source_end],
+                    raw_scratch["w13_weight_scale_inv"][run_start:source_end],
+                    raw_scratch["w2_weight"][run_start:source_end],
+                    raw_scratch["w2_weight_scale_inv"][run_start:source_end],
+                    out=run_prepared,
+                )
+
+            if canonical is not None:
+                # Keep the CPU canonical row image consistent for a later GEC
+                # resize, which rebuilds the prepared pool by logical expert.
+                for name in raw_names:
+                    target = canonical.get(name)
+                    if target is None:
+                        continue
+                    if target.shape[0] == logical_expert_count:
+                        canonical_rows = batch_experts
+                    elif target.shape[0] == resident.num_experts:
+                        canonical_rows = batch_rows
+                    else:
+                        continue
+                    if source[name].device.type == "cuda":
+                        selected_source = raw_scratch[name][:batch_count].to(
+                            device="cpu"
+                        )
+                    else:
+                        selected_source = source[name].index_select(
+                            0, selected_cpu_index
+                        )
+                    target.index_copy_(
+                        0,
+                        torch.tensor(canonical_rows, dtype=torch.long),
+                        selected_source,
+                    )
+        dst_layer._v4_marlin_path = True
+        return
+
     _gather_scatter_expert_rows(
         weight_pairs,
         src_ids=selected_experts,
@@ -5283,20 +7079,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _dynamic_update_requested = (
             kt_config.kt_enable_dynamic_expert_update or _gec_requested
         )
-        if (kt_config.method or "").upper() == "MXFP4" and _dynamic_update_requested:
+        _gpu_expert_count = int(kt_config.gpu_experts_mask.sum().item())
+        _prepared_only_staging_requested = (
+            _mxfp4_prepared_only_requested(kt_config)
+            and _gpu_expert_count > 0
+        )
+        if (kt_config.method or "").upper() == "MXFP4" and (
+            _dynamic_update_requested or _prepared_only_staging_requested
+        ):
             if not torch.cuda.is_available():
                 raise ValueError(
-                    "MXFP4 dynamic expert update requires a CUDA GPU; "
-                    "pure CPU/NEON execution cannot update GPU expert placement."
+                    "MXFP4 dynamic expert update and prepared-only staging "
+                    "require a CUDA GPU; pure CPU/NEON execution cannot run "
+                    "the prepared Marlin resident image."
                 )
             if (
-                int(kt_config.gpu_experts_mask.sum().item()) <= 0
+                _gpu_expert_count <= 0
                 and getattr(kt_config, "kt_gec_coordinator", None) is None
             ):
                 raise ValueError(
-                    "MXFP4 dynamic expert update requires at least one GPU expert; "
-                    "set --kt-num-gpu-experts or --kt-expert-gpu-slots to a "
-                    "positive value."
+                    "MXFP4 dynamic expert update requires at least one GPU "
+                    "expert; set --kt-num-gpu-experts or --kt-expert-gpu-slots "
+                    "to a positive value."
                 )
             if (
                 kt_config.kt_enable_dynamic_expert_update
@@ -5461,6 +7265,79 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._uses_compact_gpu_expert_rows = True
         method._kt_compact_expert_rows = True
 
+    def _resize_prepared_only_mxfp4_rows(
+        self,
+        layer: torch.nn.Module,
+        new_capacity: int,
+        keep_owner: List[int],
+        old_owner: List[int],
+        old_prepared,
+        old_canonical: Optional[Dict[str, torch.Tensor]],
+        device: torch.device,
+    ) -> None:
+        """Resize a prepared-only layer without retaining a resident raw bank."""
+
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            allocate_v4_mxfp4_marlin,
+        )
+
+        old_index = {expert_id: row for row, expert_id in enumerate(old_owner)}
+        new_prepared = None
+        if new_capacity > 0 and old_prepared is not None:
+            new_prepared = allocate_v4_mxfp4_marlin(
+                num_experts=new_capacity,
+                hidden_size=old_prepared.hidden_size,
+                intermediate_size=old_prepared.intermediate_size,
+                device=device,
+            )
+            source_rows = []
+            destination_rows = []
+            for destination_row, expert_id in enumerate(keep_owner):
+                source_row = old_index.get(int(expert_id))
+                if source_row is None:
+                    continue
+                source_rows.append(source_row)
+                destination_rows.append(destination_row)
+            if source_rows:
+                source_index = torch.tensor(
+                    source_rows, dtype=torch.int64, device=device
+                )
+                destination_index = torch.tensor(
+                    destination_rows, dtype=torch.int64, device=device
+                )
+                for name in ("w13", "w13_scale", "w2", "w2_scale"):
+                    getattr(new_prepared, name).index_copy_(
+                        0,
+                        destination_index,
+                        getattr(old_prepared, name).index_select(
+                            0, source_index
+                        ),
+                    )
+
+        canonical = old_canonical or {}
+        new_canonical = {}
+        for name in _MXFP4_RAW_WEIGHT_NAMES:
+            tensor = getattr(layer, name)
+            new_cpu = torch.empty(
+                tuple(tensor.shape), dtype=tensor.dtype, device="cpu"
+            )
+            source = canonical.get(name)
+            if source is not None:
+                if source.shape[0] == self.global_num_experts:
+                    for destination_row, expert_id in enumerate(keep_owner):
+                        new_cpu[destination_row].copy_(source[int(expert_id)])
+                elif source.shape[0] == len(old_owner):
+                    for destination_row, expert_id in enumerate(keep_owner):
+                        source_row = old_index.get(int(expert_id))
+                        if source_row is not None:
+                            new_cpu[destination_row].copy_(source[source_row])
+            tensor.data = new_cpu
+            new_canonical[name] = tensor.detach()
+
+        layer._v4_marlin_weights = new_prepared
+        layer._kt_mxfp4_raw_weights = new_canonical
+        layer._kt_mxfp4_raw_weights_on_cpu = True
+
     def _resize_gpu_expert_rows(
         self, layer: torch.nn.Module, new_capacity: int, keep_owner: List[int]
     ) -> None:
@@ -5483,6 +7360,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 keep_owner, dtype=torch.int64, device="cpu"
             )
             return
+
+        prepared_only = _mxfp4_prepared_only_layer(layer)
+        old_prepared = getattr(layer, "_v4_marlin_weights", None)
+        old_canonical = getattr(layer, "_kt_mxfp4_raw_weights", None)
+        resize_device = _kt_layer_cuda_device(layer)
 
         old_weights = {}
         for name in (
@@ -5514,14 +7396,27 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **getattr(self, "_kt_extra_weight_attrs", {}),
         )
 
+        if prepared_only:
+            self._resize_prepared_only_mxfp4_rows(
+                layer,
+                new_capacity,
+                keep_owner,
+                old_owner,
+                old_prepared,
+                old_canonical,
+                resize_device,
+            )
+
         old_index = {expert_id: row for row, expert_id in enumerate(old_owner)}
-        if keep_owner:
+        if keep_owner and not prepared_only:
             source_rows = [old_index[item] for item in keep_owner if item in old_index]
             destination_rows = [
                 index for index, item in enumerate(keep_owner) if item in old_index
             ]
             if source_rows:
-                src = torch.tensor(source_rows, dtype=torch.int64, device=next(layer.parameters()).device)
+                src = torch.tensor(
+                    source_rows, dtype=torch.int64, device=resize_device
+                )
                 dst = torch.tensor(destination_rows, dtype=torch.int64, device=src.device)
                 resize_stream = None
                 if self._gec_cuda_pipeline is not None:
@@ -5537,7 +7432,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                             )
                         resize_event = torch.cuda.Event(enable_timing=False)
                         resize_event.record(resize_stream)
-                    torch.cuda.current_stream(layer.w13_weight.device).wait_event(
+                    torch.cuda.current_stream(resize_device).wait_event(
                         resize_event
                     )
                 else:
@@ -5648,7 +7543,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._enable_compact_gpu_expert_rows(getattr(layer, "scheme", None))
 
         # Move mask and mapping tables to GPU for inference
-        target_device = next(layer.parameters()).device
+        target_device = _kt_layer_cuda_device(layer)
         if self._gec_enabled and torch.cuda.is_available():
             from sglang.srt.layers.moe.kt_gec import GecCudaPipeline
 
@@ -5818,6 +7713,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and hasattr(self.gpu_method, "process_weights_after_loading")
         ):
             self.gpu_method.process_weights_after_loading(layer)
+            if _mxfp4_prepared_only_requested(self.kt_config):
+                released = _move_mxfp4_raw_weights_to_cpu(layer)
+                if released and self.tp_rank == 0:
+                    logger.info(
+                        "KT MXFP4 layer %d resident raw image moved to CPU "
+                        "after Marlin preparation (%.2f GiB device memory freed); "
+                        "the GPU slot keeps only the prepared image",
+                        self.kt_config.layer_idx,
+                        released / 1024**3,
+                    )
 
         # 2. Load CPU weights using KT wrapper
         if self.tp_rank == 0 and self.wrapper is not None:
@@ -7054,27 +8959,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             resident_rows=int(row_owner.numel()),
         )
 
-        # kt-layer-h2d-batch-size chunks the H2D copies: a batch is
-        # min(available, batch_size) and never waits to be filled (doc
-        # section 5.4). GEC streaming consumes each batch as soon as its H2D
-        # event is ready; with batch_size=1 this is one Expert H2D -> one GPU
-        # GEMM. MXFP4 GEC repacks only the newly admitted rows, so it uses the
-        # same bounded batches as the other native formats.
+        # Every newly admitted expert of this round shares one H2D/GPU group,
+        # which is the low-launch-overhead path (doc section 5.4). GEC
+        # streaming consumes the group as soon as its H2D event is ready.
+        # MXFP4 GEC repacks only the newly admitted rows, so it uses the same
+        # group as the other native formats.
         pending_h2d_ids = []
         _batched_copy_ok = not getattr(ctx, "_is_mxfp4_quant", False) or (
             self._gec_enabled
         )
         if _batched_copy_ok:
-            configured_batch = getattr(self.kt_config, "kt_layer_h2d_batch_size", None)
-            # An unset batch size preserves the low-launch-overhead path: all
-            # newly admitted experts in this round share one H2D/GPU group.
-            # Explicit ``--kt-layer-h2d-batch-size=1`` opts into the
-            # one-Expert-at-a-time latency mode.
-            copy_batch = (
-                len(arrived)
-                if configured_batch is None
-                else max(1, int(configured_batch))
-            )
+            copy_batch = len(arrived)
             arrived_cuda = arrived.to(device)
             freed_rows_cuda = freed_rows.to(device)
             gec_pipeline = None
@@ -7368,14 +9263,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _SHARED_GEC_CPU_CONTEXT = SharedFullContext(
                 layer=layer,
                 init_args=self._full_init_args,
-                # GEC uses the context only for per-expert CPU staging. Keep
-                # its GPU-side shape bounded by this layer's resident rows;
-                # legacy full-GPU paths use _build_full_context separately.
+                # GEC uses the context only for per-expert CPU staging, never
+                # for the layerwise host ring, so the historical two-slot pair
+                # is the right depth here. Keep its GPU-side shape bounded by
+                # this layer's resident rows; legacy full-GPU paths use
+                # _build_full_context separately.
                 global_num_experts=max(1, self.num_gpu_experts),
                 moe_runner_config=self.moe_runner_config,
-                cpu_buffer_depth=max(
-                    2, int(getattr(self.kt_config, "kt_layer_h2d_batch_size", 2) or 2)
-                ),
+                cpu_buffer_depth=2,
             )
         return _SHARED_GEC_CPU_CONTEXT
 
@@ -7425,7 +9320,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         finally:
             ctx.restore_temporary_weights()
             temp_stream = (
-                torch.cuda.current_stream(layer.w13_weight.device)
+                torch.cuda.current_stream(_kt_layer_cuda_device(layer))
                 if torch.cuda.is_available()
                 else None
             )

@@ -24,9 +24,6 @@ Parameter mapping (all counted in Logical Experts, per the doc):
 - ``--kt-layer-h2d-slots``: per-layer per-round admission budget, i.e. how
   many experts may be swapped into the cache in one update round. Defaults to
   the layer capacity (unbounded, legacy-like) when unset.
-- ``--kt-layer-h2d-batch-size``: maximum experts per H2D copy batch. A batch
-  is ``min(available, batch_size)`` and never waits to be filled. Defaults to
-  a single batch when unset.
 """
 
 from __future__ import annotations
@@ -371,7 +368,6 @@ class GlobalGecCoordinator:
         h2d_buffer_pool_depth: int = 1,
         tp_size: int = 1,
         max_running_requests: int = 0,
-        h2d_batch_size: int = 1,
     ) -> None:
         if capacity < 1:
             raise ValueError("global GEC capacity must be >= 1")
@@ -379,10 +375,9 @@ class GlobalGecCoordinator:
         config.num_gpu_layers = max(0, int(num_gpu_layers))
         config.expert_gpu_slots = int(capacity)
         config.layer_h2d_slots = int(capacity)
-        config.layer_h2d_batch_size = max(1, int(h2d_batch_size))
-        # Each concurrently running request may own one current H2D batch;
-        # batch size determines the number of Logical slots in that batch,
-        # not the number of reusable request slots.
+        # Each concurrently running request may own one current H2D batch,
+        # so the pool depth is derived from the request count, not from a
+        # batch size.
         derived_depth = max(0, int(max_running_requests))
         config.h2d_buffer_pool_depth = max(
             1, int(h2d_buffer_pool_depth), derived_depth
@@ -391,7 +386,6 @@ class GlobalGecCoordinator:
         self._gec = gec_module
         self.capacity = int(capacity)
         self.tp_size = max(1, int(tp_size))
-        self.h2d_batch_size = config.layer_h2d_batch_size
         self.buffer_pool_depth = config.h2d_buffer_pool_depth
         self._cache = gec_module.GlobalExpertCache(
             config, gec_module.Topology(self.tp_size, 1, self.tp_size)
@@ -448,11 +442,16 @@ class GlobalGecCoordinator:
             donors = [
                 (idx, state)
                 for idx, state in self._layers.items()
-                if idx != int(layer_idx) and state.capacity > 0
+                if idx != int(layer_idx)
+                and state.capacity > 0
+                and state.planner is not None
             ]
             donors.sort(
                 key=lambda item: (
-                    self._layer_heat(item[1]),
+                    # ``None`` (never routed) sorts last so an unobserved layer
+                    # is not mistaken for the coldest one (see _layer_heat).
+                    self._layer_heat(item[1]) is None,
+                    self._layer_heat(item[1]) or 0,
                     item[0],
                 )
             )
@@ -460,10 +459,6 @@ class GlobalGecCoordinator:
                 if needed <= 0:
                     break
                 reducible = min(donor.capacity, needed)
-                if donor.planner is None:
-                    donor.capacity -= reducible
-                    needed -= reducible
-                    continue
                 keep_ids = donor.planner._resident_ids()
                 keep_ids.sort(
                     key=lambda item: (
@@ -490,11 +485,27 @@ class GlobalGecCoordinator:
                 donor.planner.capacity = new_capacity
                 needed -= removed
             borrowed = required - target.capacity - max(0, needed)
+            shortfall = max(0, needed)
             target.capacity += max(0, borrowed)
             if target.resize is not None and target.planner is not None:
                 target.resize(
                     target.capacity,
                     [item.expert_id for item in target.planner._resident_ids()],
+                )
+            # Starvation is silent otherwise: a donor whose cache entries are
+            # LOADING, refcounted or holding an inflight dependency yields no
+            # rows, and the target quietly keeps a smaller capacity than the
+            # scheduler asked for.  Surface it rather than let it look like a
+            # sizing decision.
+            if shortfall > 0:
+                logger.warning(
+                    "[kt-gec] layer %d borrowed %d of %d wanted rows; %d "
+                    "unavailable (donors busy); capacity=%d",
+                    int(layer_idx),
+                    max(0, borrowed),
+                    required - (target.capacity - max(0, borrowed)),
+                    shortfall,
+                    target.capacity,
                 )
             return target.capacity
 
@@ -579,9 +590,24 @@ class GlobalGecCoordinator:
                     state.planner.sync_residents(residents)
 
     @staticmethod
-    def _layer_heat(state: _LayerState) -> int:
+    def _layer_heat(state: _LayerState) -> Optional[int]:
+        """Donor rank: lowest heat is evicted first.
+
+        A planner that has never admitted a routed expert reports
+        ``_latest_counts`` as all zeros, which is indistinguishable from a layer
+        that was routed and only missed.  Ranking that as the coldest donor
+        makes ``ensure_capacity`` reclaim the startup rows of a layer the moment
+        it is asked for space -- including rows that were just prefilled and
+        never used, which is pure wasted H2D.  Such a donor is held back
+        (``None`` sorts last) so at least one routed round is observed before
+        its rows are recycled.  ``_routed_rounds`` rather than ``_rounds``: the
+        startup prefill shares the round tail but selects by expert-id order,
+        not by demand.
+        """
         if state.planner is None:
-            return 0
+            return None
+        if state.planner._routed_rounds == 0:
+            return None
         return sum(state.planner._latest_counts)
 
     def layer_capacity(self, layer_idx: int) -> Optional[int]:
@@ -625,9 +651,6 @@ def get_or_create_gec_coordinator(scope, kt_config, gec_module) -> GlobalGecCoor
             tp_size=int(getattr(kt_config, "kt_tp_size", 1) or 1),
             max_running_requests=int(
                 getattr(kt_config, "max_running_requests", 0) or 0
-            ),
-            h2d_batch_size=int(
-                getattr(kt_config, "kt_layer_h2d_batch_size", 1) or 1
             ),
         )
         _GEC_COORDINATOR_SCOPE = scope_id
@@ -725,8 +748,6 @@ class GecResidencyPlanner:
             coordinator.capacity if coordinator is not None else self.capacity
         )
         config.layer_h2d_slots = self.budget
-        if coordinator is not None:
-            config.layer_h2d_batch_size = coordinator.h2d_batch_size
         config.validate()
         self._cache = (
             coordinator.cache
@@ -737,6 +758,12 @@ class GecResidencyPlanner:
         self._telemetry = gec_module.TelemetryCollector()
         self._prefilled = False
         self._rounds = 0
+        # Rounds that went through steady-state admission.  Startup prefill
+        # also bumps ``_rounds`` (it shares the tail of ``_plan_locked``), but
+        # it fills rows by expert-id order rather than by demand, so it is not
+        # evidence that the layer is in use.  ``_layer_heat`` keys off this
+        # counter for exactly that reason.
+        self._routed_rounds = 0
         self._leases: List[GecExecutionLease] = []
         self._transfer_leases: List[GecTransferLease] = []
         self._inflight = gec_module.InflightRegistry()
@@ -898,6 +925,7 @@ class GecResidencyPlanner:
             for eid in decision.h2d_selected:
                 if self._admit_and_mark_ready(eid.expert_id, now_us):
                     cache.record_use(eid, now_us)
+            self._routed_rounds += 1
 
         self._rounds += 1
         self.record_router_dependency(
@@ -1301,11 +1329,10 @@ def build_gec_planner(kt_config, num_experts: int, num_gpu_experts: int, tp_rank
             max(1, planner.capacity // 4),
         )
     logger.info(
-        "[kt-gec] layer %d: capacity=%d budget=%d batch=%s (global slots=%d, shared=%s)",
+        "[kt-gec] layer %d: capacity=%d budget=%d (global slots=%d, shared=%s)",
         kt_config.layer_idx,
         planner.capacity,
         planner.budget,
-        kt_config.kt_layer_h2d_batch_size,
         kt_config.kt_expert_gpu_slots,
         coordinator is not None,
     )

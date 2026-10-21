@@ -165,15 +165,7 @@ def validate_kt_args(server_args: Any) -> None:
     if cfg.kt_layer_h2d_slots is not None and cfg.kt_layer_h2d_slots < 0:
         raise ValueError("--kt-layer-h2d-slots must be non-negative.")
     if (
-        cfg.kt_layer_h2d_batch_size is not None
-        and cfg.kt_layer_h2d_batch_size < 1
-    ):
-        raise ValueError("--kt-layer-h2d-batch-size must be at least 1.")
-    if (
-        (
-            cfg.kt_layer_h2d_slots is not None
-            or cfg.kt_layer_h2d_batch_size is not None
-        )
+        cfg.kt_layer_h2d_slots is not None
         and cfg.kt_expert_gpu_slots is None
         and not (
             cfg.kt_gpu_prefill_token_threshold
@@ -181,7 +173,7 @@ def validate_kt_args(server_args: Any) -> None:
         )
     ):
         raise ValueError(
-            "--kt-layer-h2d-slots/--kt-layer-h2d-batch-size require "
+            "--kt-layer-h2d-slots requires "
             "--kt-expert-gpu-slots (GEC admission budget) or a positive "
             "--kt-gpu-prefill-token-threshold (cross-layer prefill staging)."
         )

@@ -907,11 +907,7 @@ class ExecMoe(msgspec.Struct):
     ] = None
     kt_layer_h2d_slots: A[
         Optional[int],
-        "[ktransformers parameter] Per-layer staging window, counted in Logical Experts: the GEC per-round H2D admission budget when --kt-expert-gpu-slots is set, and the cross-layer prefill prefetch window when --kt-gpu-prefill-token-threshold is positive.",
-    ] = None
-    kt_layer_h2d_batch_size: A[
-        Optional[int],
-        "[ktransformers parameter] Maximum Logical Experts per GEC H2D batch; a batch is min(available, batch_size) and never waits to be filled. The layerwise prefill path also sizes one rolling host-ring generation with it (2 * k slots) and starts from 8 experts per batch when unset.",
+        "[ktransformers parameter] Per-layer host staging window, counted in Logical Experts. When > 0 it selects the MXFP4 layerwise prefill staging: each layer stages at most this many experts and the pinned host ring holds two generations (2 * slots). Under --kt-expert-gpu-slots it is also the GEC per-round H2D admission budget.",
     ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],

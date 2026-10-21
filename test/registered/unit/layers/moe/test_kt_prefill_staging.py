@@ -117,68 +117,130 @@ class TestEffectiveSet(unittest.TestCase):
         self.assertFalse(partial)
 
 
-class TestHostWriteBatching(unittest.TestCase):
-    """Host-write batches roll through the pinned ring (doc section 20 item 8).
+class TestHostRing(unittest.TestCase):
+    """One whole staged set per layer rolls through the pinned ring.
 
-    The layerwise manager submits one batch, pays a single KT writer drain plus
-    one TP fence for it, and then hands the *other* generation of host slots to
-    the next batch, so the write of batch ``b + 1`` overlaps the H2D of batch
-    ``b``.  Every batch therefore has to fit one generation of the ring the
-    caller sized from ``--kt-layer-h2d-batch-size``.
+    Doc section 20 item 8: the layerwise manager submits the layer's whole
+    staging window as a single pass, pays one KT writer drain plus one TP fence
+    for it, and then hands the *other* generation of host slots to the next
+    layer, so the write of ``L + 1`` overlaps the H2D of ``L`` while the H2D of
+    ``L + 1`` overlaps the write of ``L``.  A generation is therefore the
+    staging window ``S`` itself (``--kt-layer-h2d-slots``) and the ring is
+    ``2 * S`` slots, the FreeToken prefill shape.
     """
 
-    def test_window_splits_into_batch_sized_groups(self):
-        batches = staging.host_write_batches(list(range(128)), 8)
-        self.assertEqual(len(batches), 16)
-        self.assertTrue(all(len(batch) == 8 for batch in batches))
-        self.assertEqual([item for batch in batches for item in batch], list(range(128)))
-
-    def test_trailing_batch_carries_the_remainder(self):
-        batches = staging.host_write_batches(list(range(10)), 4)
-        self.assertEqual([len(batch) for batch in batches], [4, 4, 2])
-        self.assertEqual(batches[-1], [8, 9])
-
-    def test_every_batch_fits_the_host_ring(self):
-        for window in (1, 2, 7, 8, 9, 128, 384):
-            for ring in (2, 4, 8, 16):
-                batches = staging.host_write_batches(list(range(window)), ring)
-                self.assertTrue(batches)
-                self.assertTrue(all(0 < len(batch) <= ring for batch in batches))
-
-    def test_non_positive_batch_size_still_drains_deterministically(self):
-        for ring in (0, -3, None):
-            batches = staging.host_write_batches([1, 2, 3], ring)
-            self.assertEqual(batches, [[1], [2], [3]])
-
-    def test_empty_window_produces_no_batches(self):
-        self.assertEqual(staging.host_write_batches([], 8), [])
-
     def test_ring_always_holds_two_generations(self):
-        for batch in (1, 2, 8, 16):
-            self.assertEqual(staging.host_ring_depth(batch), 2 * batch)
+        for window in (1, 2, 8, 16, 64, 384):
+            self.assertEqual(staging.host_ring_depth(window), 2 * window)
         for degenerate in (0, -4, None):
             self.assertEqual(staging.host_ring_depth(degenerate), 2)
 
-    def test_consecutive_batches_alternate_generations(self):
-        ring = staging.host_ring_depth(8)
-        first = staging.host_generation_slots(0, 8, 8)
-        second = staging.host_generation_slots(1, 8, 8)
+    def test_generation_holds_the_whole_staging_window(self):
+        for window in (1, 2, 8, 64, 384):
+            ring = staging.host_ring_depth(window)
+            for generation in (0, 1, 2, 3):
+                slots = staging.host_generation_range(generation, ring, window)
+                self.assertEqual(len(slots), window)
+                start = (generation % 2) * window
+                self.assertEqual(slots, list(range(start, start + window)))
+                self.assertTrue(all(slot < ring for slot in slots))
+
+    def test_consecutive_generations_do_not_alias(self):
+        window = 8
+        ring = staging.host_ring_depth(window)
+        first = staging.host_generation_range(0, ring, window)
+        second = staging.host_generation_range(1, ring, window)
         self.assertEqual(first, list(range(0, 8)))
         self.assertEqual(second, list(range(8, 16)))
         self.assertEqual(set(first) & set(second), set())
-        self.assertTrue(all(slot < ring for slot in first + second))
 
-    def test_short_batch_stays_inside_its_generation(self):
+    def test_short_staging_set_stays_inside_its_generation(self):
+        ring = staging.host_ring_depth(8)
         for generation in (0, 1, 2, 3):
             for count in (1, 3, 7, 8):
-                slots = staging.host_generation_slots(generation, 8, count)
+                slots = staging.host_generation_range(generation, ring, count)
                 expected = (generation % 2) * 8
                 self.assertEqual(slots, list(range(expected, expected + count)))
 
-    def test_degenerate_batch_size_rolls_on_a_pair(self):
+    def test_oversized_staging_set_is_rejected(self):
+        """A generation cannot hold more than the window, so refuse to index past it."""
+
+        window = 8
+        ring = staging.host_ring_depth(window)
+        with self.assertRaises(ValueError):
+            staging.host_generation_range(0, ring, window + 1)
+
+    def test_degenerate_window_rolls_on_a_pair(self):
         self.assertEqual(staging.host_ring_depth(1), 2)
-        self.assertEqual(staging.host_generation_slots(0, 1, 1), [0])
-        self.assertEqual(staging.host_generation_slots(1, 1, 1), [1])
+        self.assertEqual(staging.host_generation_range(0, 2, 1), [0])
+        self.assertEqual(staging.host_generation_range(1, 2, 1), [1])
+
+
+class TestContiguousStageRuns(unittest.TestCase):
+    """The per-expert H2D loop collapses to stride-level runs.
+
+    Doc section 15.3: consecutive ``(expert, host slot)`` pairs that both step
+    by one address the same bytes as a single strided copy, so the loop may
+    issue one ``copy_`` over an ``(n, chunk)`` view instead of ``n`` per-expert
+    submissions.  The *selection* is never widened or reordered: only exactly
+    adjacent pairs merge, and anything sparse degrades to single-expert runs,
+    which is the historical loop's behaviour.
+    """
+
+    def test_dense_run_merges_into_one_slice(self):
+        runs = staging.contiguous_stage_runs([5, 6, 7, 8, 20, 21], [0, 1, 2, 3, 8, 9])
+        self.assertEqual(runs, [(0, 4), (4, 2)])
+
+    def test_runs_always_partition_the_selection(self):
+        """Merging must not drop, duplicate or reorder a single pair."""
+
+        for ids, slots in (
+            ([5, 6, 7, 8, 20, 21], [0, 1, 2, 3, 8, 9]),
+            ([1, 5, 9], [0, 1, 2]),
+            ([0, 1, 2, 3, 4, 5], [10, 11, 12, 13, 14, 15]),
+            ([7], [3]),
+        ):
+            runs = staging.contiguous_stage_runs(ids, slots)
+            covered = []
+            for start, length in runs:
+                self.assertGreaterEqual(length, 1)
+                covered.extend(range(start, start + length))
+            self.assertEqual(covered, list(range(len(ids))))
+
+    def test_sparse_selection_degrades_to_singletons(self):
+        runs = staging.contiguous_stage_runs([1, 5, 9], [0, 1, 2])
+        self.assertEqual(runs, [(0, 1), (1, 1), (2, 1)])
+
+    def test_descending_experts_never_merge(self):
+        runs = staging.contiguous_stage_runs([3, 2, 1], [0, 1, 2])
+        self.assertEqual(runs, [(0, 1), (1, 1), (2, 1)])
+
+    def test_a_single_non_adjacent_side_breaks_the_run(self):
+        """Stride merging requires BOTH sides to step by one."""
+
+        self.assertEqual(
+            staging.contiguous_stage_runs([5, 6, 7], [0, 1, 5]),
+            [(0, 2), (2, 1)],
+        )
+        self.assertEqual(
+            staging.contiguous_stage_runs([5, 6, 9], [0, 1, 2]),
+            [(0, 2), (2, 1)],
+        )
+
+    def test_empty_and_mismatched_inputs_are_safe(self):
+        self.assertEqual(staging.contiguous_stage_runs([], []), [])
+        # The shorter side bounds the walk; nothing past it is touched.
+        self.assertEqual(staging.contiguous_stage_runs([1, 2, 3], [0, 1]), [(0, 2)])
+        self.assertEqual(staging.contiguous_stage_runs([1, 2], [0, 1, 2]), [(0, 2)])
+
+    def test_selection_collapses_when_slots_follow_the_generation(self):
+        """The hot path: a contiguous expert run over a generation's slots."""
+
+        window = 64
+        ring = staging.host_ring_depth(window)
+        slots = staging.host_generation_range(0, ring, window)
+        runs = staging.contiguous_stage_runs(list(range(0, window)), slots)
+        self.assertEqual(runs, [(0, window)])
 
 
 class TestStagingEntryConditions(unittest.TestCase):
@@ -380,12 +442,188 @@ class TestForwardModeGate(unittest.TestCase):
         self.assertFalse(staging.is_prefill_like_mode(object()))
 
     def test_publication_round_trips(self):
-        staging.publish_forward_mode(None)
+        staging.publish_forward_mode(None, forward_id=1)
         self.assertIsNone(staging.published_forward_mode())
+        self.assertEqual(staging.published_forward_id(), 1)
         mode = _Mode(target_verify=True)
-        staging.publish_forward_mode(mode)
+        staging.publish_forward_mode(mode, forward_id=2)
         self.assertIs(staging.published_forward_mode(), mode)
-        staging.publish_forward_mode(None)
+        self.assertEqual(staging.published_forward_id(), 2)
+        staging.publish_forward_mode(None, forward_id=3)
+        self.assertEqual(staging.published_forward_id(), 3)
+
+
+class TestUniformResidency(unittest.TestCase):
+    """Global GEC budget is spread over every MoE layer, shared ids first."""
+
+    def test_budget_is_split_evenly_with_remainder_on_early_layers(self):
+        self.assertEqual(
+            staging.uniform_resident_counts(4, 10, 8), [3, 3, 2, 2]
+        )
+
+    def test_each_layer_is_clamped_to_its_expert_count(self):
+        self.assertEqual(
+            staging.uniform_resident_counts(2, 100, 8), [8, 8]
+        )
+
+    def test_zero_dimensions_are_safe(self):
+        self.assertEqual(staging.uniform_resident_counts(0, 8, 4), [])
+        self.assertEqual(staging.uniform_resident_counts(3, 8, 0), [0, 0, 0])
+
+    def test_fused_shared_experts_are_the_trailing_ids(self):
+        self.assertEqual(staging.fused_shared_expert_ids(8, 2), [6, 7])
+        self.assertEqual(staging.fused_shared_expert_ids(8, 20), list(range(8)))
+
+    def test_shared_ids_are_selected_before_routed_ids(self):
+        self.assertEqual(
+            staging.shared_first_resident_ids(8, 4, [6, 7]), [6, 7, 0, 1]
+        )
+        self.assertEqual(
+            staging.shared_first_resident_ids(8, 1, [6, 7]), [6]
+        )
+        self.assertEqual(
+            staging.shared_first_resident_ids(8, 8, [6, 7]), list(range(8))
+        )
+
+    def test_compact_destinations_drive_copy_run_collapsing(self):
+        self.assertEqual(
+            staging.contiguous_copy_runs([5, 6, 7, 2], [0, 1, 2, 3]),
+            [(0, 3), (3, 1)],
+        )
+
+
+class TestForwardBoundary(unittest.TestCase):
+    """A new pass/chunk id is the only resident-ownership update point."""
+
+    def test_first_observation_never_reports_a_boundary(self):
+        tracker = staging.ForwardBoundaryTracker()
+        self.assertFalse(tracker.observe(None))
+        self.assertFalse(tracker.observe(7))
+        self.assertFalse(tracker.observe(7))
+        self.assertTrue(tracker.observe(8))
+        self.assertFalse(tracker.observe(8))
+        self.assertEqual(tracker.forward_id, 8)
+
+
+class TestBoundaryPromotion(unittest.TestCase):
+    """Staged winners replace the coldest unprotected resident rows."""
+
+    def test_winners_and_victims_are_deterministic(self):
+        pairs = staging.select_boundary_promotions(
+            resident_ids=[0, 1, 2],
+            staged_ids=[3, 4],
+            hit_counts={3: 2, 4: 9},
+            scores={0: 0.0, 1: 4.0, 2: 0.0, 3: 1.0, 4: 0.0},
+        )
+        self.assertEqual(pairs, [(0, 4), (2, 3)])
+
+    def test_staged_experts_without_hits_are_not_promoted(self):
+        self.assertEqual(
+            staging.select_boundary_promotions(
+                [0, 1], [2, 3], {2: 0, 3: 0}
+            ),
+            [],
+        )
+
+    def test_protected_experts_are_never_evicted_but_may_promote(self):
+        pairs = staging.select_boundary_promotions(
+            [0, 1],
+            [4],
+            {4: 3},
+            protected_ids=[0, 4],
+            scores={0: 0.0, 1: 1.0, 4: 2.0},
+        )
+        self.assertEqual(pairs, [(1, 4)])
+
+
+class TestPendingPromotionCommit(unittest.TestCase):
+    """A deferred promotion keeps row identity and shares the host window."""
+
+    def test_row_owner_promotions_replace_victims_in_place(self):
+        self.assertEqual(
+            staging.apply_row_owner_promotions(
+                [4, 5, 6], [(5, 9), (4, 8)], num_experts=10
+            ),
+            [8, 9, 6],
+        )
+
+    def test_row_owner_promotions_reject_duplicate_winners(self):
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            staging.apply_row_owner_promotions(
+                [1, 2, 3], [(1, 4), (2, 4)], num_experts=8
+            )
+
+    def test_row_owner_promotions_reject_a_missing_victim(self):
+        with self.assertRaisesRegex(ValueError, "not resident"):
+            staging.apply_row_owner_promotions(
+                [1, 2], [(7, 4)], num_experts=8
+            )
+
+    def test_promoted_rows_are_reserved_before_the_staged_window(self):
+        self.assertEqual(
+            staging.fit_staged_window([3, 4, 5, 6], 2, 4), [3, 4]
+        )
+        self.assertEqual(staging.fit_staged_window([3, 4], 0, 2), [3, 4])
+
+    def test_promotions_wider_than_the_host_generation_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            staging.fit_staged_window([3], 3, 2)
+
+
+class TestStagingRowPool(unittest.TestCase):
+    """Resident and staging share one physical row pool per bank."""
+
+    def test_physical_geometry_is_resident_plus_staging(self):
+        pool = staging.StagingRowPool(
+            8, resident_capacity=2, staging_capacity=2, protected_ids=[7]
+        )
+        self.assertEqual(pool.physical_rows, 4)
+        mapping = pool.configure(3, [6, 7], [0, 1])
+        self.assertEqual(sorted(row for row in mapping if row >= 0), [0, 1, 2, 3])
+
+    def test_promotion_swaps_roles_without_reassigning_rows(self):
+        pool = staging.StagingRowPool(
+            8, resident_capacity=2, staging_capacity=2, protected_ids=[7]
+        )
+        before = pool.configure(3, [6, 7], [0, 1])
+        promoted_row = before[0]
+        victim_row = before[6]
+        pool.promote(3, victim_id=6, promoted_id=0)
+        after = pool.mapping(3)
+        self.assertEqual(after[0], promoted_row)
+        self.assertEqual(after[6], -1)
+        roles = pool.row_roles(3)
+        self.assertEqual(roles[promoted_row], "resident")
+        self.assertEqual(roles[victim_row], "free")
+
+    def test_configure_preserves_a_role_transition_in_place(self):
+        pool = staging.StagingRowPool(
+            8, resident_capacity=2, staging_capacity=2
+        )
+        before = pool.configure(1, [6, 7], [0, 1])
+        pool.promote(1, victim_id=6, promoted_id=0)
+        after = pool.configure(1, [7, 0], [1, 2])
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[7], before[7])
+        self.assertNotEqual(after[1], -1)
+        self.assertNotEqual(after[2], -1)
+
+    def test_protected_rows_cannot_be_evicted(self):
+        pool = staging.StagingRowPool(
+            8, resident_capacity=2, staging_capacity=1, protected_ids=[7]
+        )
+        pool.configure(2, [6, 7], [0])
+        with self.assertRaises(ValueError):
+            pool.promote(2, victim_id=7, promoted_id=0)
+
+    def test_clear_discards_stale_bank_ownership(self):
+        pool = staging.StagingRowPool(
+            8, resident_capacity=2, staging_capacity=1
+        )
+        pool.configure(1, [6, 7], [0])
+        pool.clear()
+        self.assertEqual(pool.mapping(1), [-1] * 8)
+        self.assertEqual(pool.row_roles(1), ["free"] * 3)
 
 
 class TestTelemetry(unittest.TestCase):
@@ -431,6 +669,34 @@ class TestTelemetry(unittest.TestCase):
         summary = telemetry.take_summary()
         self.assertEqual(summary["cpu_route_count"], 20)
         self.assertIn("cpu_routes=20", staging.format_round_summary(summary))
+
+    def test_copy_submissions_are_summed_and_rendered(self):
+        """Section 15.3: the counters make the run merge visible in a round.
+
+        ``copy_submits`` counts real ``copy_`` calls, ``copy_pairs`` the pairs
+        moved, so a collapsed window shows ``copy_pairs > copy_submits``.
+        """
+
+        telemetry = staging.StagingTelemetry(interval=2)
+        telemetry.record_layer(copy_submits=40, copy_pairs=256, compute_ms=1.0)
+        telemetry.record_layer(copy_submits=40, copy_pairs=256, compute_ms=1.0)
+        summary = telemetry.take_summary()
+        self.assertEqual(summary["copy_submits"], 80)
+        self.assertEqual(summary["copy_pairs"], 512)
+        text = staging.format_round_summary(summary)
+        self.assertIn("copy_submits=80", text)
+        self.assertIn("copy_pairs=512", text)
+
+    def test_uncollapsed_loop_reads_one_submit_per_pair(self):
+        """A fully sparse selection must render the merge factor as 1.0."""
+
+        telemetry = staging.StagingTelemetry(interval=1)
+        telemetry.record_layer(copy_submits=12, copy_pairs=12, compute_ms=1.0)
+        summary = telemetry.take_summary()
+        self.assertEqual(
+            summary["copy_pairs"] / summary["copy_submits"],
+            1.0,
+        )
 
     def test_host_route_counts_join_the_next_summary_window(self):
         telemetry = staging.StagingTelemetry(interval=2)
