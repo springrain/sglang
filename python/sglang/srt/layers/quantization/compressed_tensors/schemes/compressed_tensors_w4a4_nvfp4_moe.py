@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -28,6 +29,26 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+
+
+class _CompactExpertPlacement:
+    # Present a single EP group because compact expert ids already address the
+    # resident rows directly. All other layer fields stay available to the
+    # runner through the proxy.
+
+    def __init__(self, layer: torch.nn.Module):
+        self._layer = layer
+
+    def __getattr__(self, name):
+        return getattr(self._layer, name)
+
+    @property
+    def moe_ep_size(self) -> int:
+        return 1
+
+    @property
+    def moe_ep_rank(self) -> int:
+        return 0
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
@@ -302,6 +323,11 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        runner_config = moe_runner_config
+        if getattr(self, "_kt_compact_expert_rows", False):
+            runner_config = replace(
+                moe_runner_config, layer=_CompactExpertPlacement(layer)
+            )
         if self.use_flashinfer_trtllm:
             import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401 – triggers @register_fused_func
 
@@ -313,13 +339,11 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 if getattr(self, "_kt_compact_expert_rows", False)
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
-            self.runner = MoeRunner(runner_backend, moe_runner_config)
+            self.runner = MoeRunner(runner_backend, runner_config)
         else:
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401 – triggers @register_fused_func
 
-            self.runner = MoeRunner(
-                MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
-            )
+            self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_CUTLASS, runner_config)
 
     def apply_weights(
         self,
@@ -375,15 +399,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
 
-            if getattr(self, "_kt_compact_expert_rows", False):
-                # Compact ids address this method's resident rows directly;
-                # they are no longer partitioned in the layer's logical EP
-                # range.
-                moe_ep_size = 1
-                moe_ep_rank = 0
-            else:
-                moe_ep_size = layer.moe_ep_size
-                moe_ep_rank = layer.moe_ep_rank
             swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
@@ -398,13 +413,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                     layer.w2_weight_scale,
                     layer.g2_alphas,
                 ],
-                moe_ep_size=moe_ep_size,
-                moe_ep_rank=moe_ep_rank,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                moe_tp_size=layer.moe_tp_size,
-                moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
             )
             return self.runner.run(dispatch_output, quant_info)
