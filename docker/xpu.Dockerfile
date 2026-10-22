@@ -76,7 +76,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /sgl-workspace
 
-RUN pip install --no-cache-dir torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
+RUN pip install --no-cache-dir torch==2.14.0+xpu torchvision==0.29.1+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
 
 # SG_LANG_KERNEL_SOURCE=source points the sglang-kernel-xpu dependency at the kernel repo.
