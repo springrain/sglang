@@ -197,9 +197,9 @@ class Mxfp4MarlinMoEMethod:
             )
             layer._v4_marlin_path = True
             layer._dsv4_mxfp4_backend = "kt_marlin"
-            # Keep the raw attributes alive.  KTEP uses them as the resident
-            # expert source while the layerwise manager transports CPU experts
-            # into its alternate slot.
+            # KTEP consumes these attributes while building the image.  In
+            # prepared-only mode the wrapper releases them immediately after
+            # this method returns; forward uses only _v4_marlin_weights.
             return
 
         # Let the FP8 base method handle ROCm normalization, etc.  The KT
@@ -273,7 +273,10 @@ class Mxfp4MarlinMoEMethod:
                 routed_scale = getattr(runner_config, "routed_scaling_factor", None)
                 if routed_scale is None:
                     routed_scale = 1.0
-            target_hidden_size = layer.w13_weight.shape[2] * 2
+            # Prepared-only KT layers release the checkpoint-native parameters
+            # after building this image, so the prepared descriptor is the
+            # authoritative source for the padded hidden size.
+            target_hidden_size = layer._v4_marlin_weights.hidden_size
             if hidden_states.shape[-1] > target_hidden_size:
                 raise ValueError(
                     "KT MXFP4 hidden size exceeds the padded weight size: "

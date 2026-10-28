@@ -189,9 +189,9 @@ class KTConfig:
     max_running_requests: int = 0
 
 
-_MXFP4_PREPARED_ONLY_ENV = "SGLANG_KT_MXFP4_PREPARED_ONLY"
 _MXFP4_RAW_SCRATCH_ATTR = "_kt_mxfp4_raw_h2d_scratch"
-_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_MXFP4_RAW_SPEC_ATTR = "_kt_mxfp4_raw_spec"
+_MXFP4_RAW_RELEASED_ATTR = "_kt_mxfp4_raw_released"
 _MXFP4_RAW_WEIGHT_NAMES = (
     "w13_weight",
     "w13_weight_scale_inv",
@@ -265,10 +265,61 @@ def _mxfp4_raw_weights_on_cpu(layer: torch.nn.Module) -> bool:
     )
 
 
+def _mxfp4_raw_metadata(
+    layer: torch.nn.Module,
+) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype]]:
+    """Return shape/dtype metadata for the checkpoint-native MXFP4 tensors.
+
+    Prepared-only layers may release the four raw parameters after building the
+    Marlin image.  The native KT CPU expert store remains the byte source, so a
+    lightweight spec is sufficient for scratch allocation, reservations and
+    resizes without retaining another CPU copy in Python.
+    """
+
+    stored = getattr(layer, _MXFP4_RAW_SPEC_ATTR, None)
+    canonical = getattr(layer, "_kt_mxfp4_raw_weights", None)
+    metadata: Dict[str, Tuple[Tuple[int, ...], torch.dtype]] = {}
+    for name in _MXFP4_RAW_WEIGHT_NAMES:
+        tensor = getattr(layer, name, None)
+        shape = getattr(tensor, "shape", None)
+        dtype = getattr(tensor, "dtype", None)
+        if shape is not None and dtype is not None:
+            metadata[name] = (tuple(int(dim) for dim in shape), dtype)
+            continue
+
+        entry = stored.get(name) if isinstance(stored, dict) else None
+        if entry is not None:
+            entry_shape, entry_dtype = entry
+            metadata[name] = (
+                tuple(int(dim) for dim in entry_shape),
+                entry_dtype,
+            )
+            continue
+
+        canonical_tensor = (
+            canonical.get(name) if isinstance(canonical, dict) else None
+        )
+        canonical_shape = getattr(canonical_tensor, "shape", None)
+        canonical_dtype = getattr(canonical_tensor, "dtype", None)
+        if canonical_shape is not None and canonical_dtype is not None:
+            metadata[name] = (
+                tuple(int(dim) for dim in canonical_shape),
+                canonical_dtype,
+            )
+    return metadata
+
+
+def _mxfp4_has_raw_metadata(layer: torch.nn.Module) -> bool:
+    return len(_mxfp4_raw_metadata(layer)) == len(_MXFP4_RAW_WEIGHT_NAMES)
+
+
 def _mxfp4_prepared_only_layer(layer: torch.nn.Module) -> bool:
     return (
         getattr(layer, "_v4_marlin_weights", None) is not None
-        and _mxfp4_raw_weights_on_cpu(layer)
+        and (
+            bool(getattr(layer, _MXFP4_RAW_RELEASED_ATTR, False))
+            or _mxfp4_raw_weights_on_cpu(layer)
+        )
     )
 
 
@@ -319,10 +370,19 @@ def _get_mxfp4_raw_scratch(
     ):
         return scratch["raw"]
 
+    metadata = _mxfp4_raw_metadata(layer)
+    missing = [
+        name for name in _MXFP4_RAW_WEIGHT_NAMES if name not in metadata
+    ]
+    if missing:
+        raise RuntimeError(
+            "MXFP4 raw scratch requires shape/dtype metadata for "
+            f"{missing}; the layer has neither raw tensors nor a released spec"
+        )
     raw = {
         name: torch.empty(
-            (capacity, *getattr(layer, name).shape[1:]),
-            dtype=getattr(layer, name).dtype,
+            (capacity, *metadata[name][0][1:]),
+            dtype=metadata[name][1],
             device=device,
         )
         for name in _MXFP4_RAW_WEIGHT_NAMES
@@ -362,14 +422,15 @@ def _mxfp4_prepared_only_requested(config: KTConfig) -> bool:
     FreeToken's slot cache stores the exact layout consumed by its expert
     kernel.  KT's Marlin path needs a short-lived raw image for the CPU writer
     and the repack kernels, but resident rows do not need a second permanent
-    raw copy.  Prepared-only mode is therefore tied to the positive staging
-    window and can be disabled for A/B diagnostics.
+    raw copy.  GEC rewrites resident rows through the same prepared image, so
+    either GEC or a positive staging window enables prepared-only mode.
     """
 
-    if os.environ.get(_MXFP4_PREPARED_ONLY_ENV, "1").strip().lower() in (
-        _FALSE_ENV_VALUES
-    ):
-        return False
+    try:
+        if int(getattr(config, "kt_expert_gpu_slots", 0) or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
     window = getattr(config, "kt_layer_h2d_slots", None)
     try:
         return window is not None and int(window) > 0
@@ -377,44 +438,56 @@ def _mxfp4_prepared_only_requested(config: KTConfig) -> bool:
         return False
 
 
-def _move_mxfp4_raw_layer_bytes_to_cpu(layer: torch.nn.Module) -> int:
-    """Move one MXFP4 layer's checkpoint-native tensors to CPU."""
+def _drop_mxfp4_raw_parameters(
+    layer: torch.nn.Module,
+    extra_refs: Sequence[dict] = (),
+    *,
+    require_prepared: bool = True,
+) -> int:
+    """Drop raw MXFP4 parameters without copying their bytes to the host.
 
-    moved_bytes = 0
-    for name in _Mxfp4PrefillSlot.RAW_NAMES:
-        tensor = getattr(layer, name, None)
-        if tensor is None or tensor.device.type == "cpu":
-            continue
-        moved_bytes += tensor.numel() * tensor.element_size()
-        tensor.data = tensor.data.to(device="cpu", non_blocking=False)
-    canonical = getattr(layer, "_kt_mxfp4_raw_weights", None)
-    if canonical is not None:
-        layer._kt_mxfp4_raw_weights = {
-            name: getattr(layer, name).detach()
-            for name in _Mxfp4PrefillSlot.RAW_NAMES
-            if hasattr(layer, name)
-        }
-    if all(
-        getattr(layer, name, None) is not None
-        and getattr(layer, name).device.type == "cpu"
-        for name in _Mxfp4PrefillSlot.RAW_NAMES
-    ):
-        layer._kt_mxfp4_raw_weights_on_cpu = True
-    return moved_bytes
-
-
-def _move_mxfp4_raw_weights_to_cpu(layer: torch.nn.Module) -> int:
-    """Drop the resident raw GPU image after Marlin preparation.
-
-    The returned bytes are the approximate device memory released.  A CPU
-    canonical copy is retained because the existing GEC/full-fallback APIs may
-    still ask for the checkpoint-native tensors; the streaming hot path only
-    reads the prepared image.
+    ``extra_refs`` lets a ``SharedFullContext`` discard the references held by
+    its pre-load parameter snapshot as well.  Otherwise deleting the module
+    attributes alone would leave those tensors alive on the GPU.  The temporary
+    full-context layer is released before it has a prepared image, so callers
+    may explicitly opt out of the prepared-image check.
     """
 
-    if getattr(layer, "_v4_marlin_weights", None) is None:
+    if require_prepared and getattr(layer, "_v4_marlin_weights", None) is None:
         return 0
-    return _move_mxfp4_raw_layer_bytes_to_cpu(layer)
+
+    metadata = _mxfp4_raw_metadata(layer)
+    if len(metadata) != len(_MXFP4_RAW_WEIGHT_NAMES):
+        return 0
+
+    released_bytes = 0
+    for name in _MXFP4_RAW_WEIGHT_NAMES:
+        tensor = getattr(layer, name, None)
+        if tensor is not None and getattr(tensor.device, "type", None) != "cpu":
+            released_bytes += tensor.numel() * tensor.element_size()
+        for refs in extra_refs:
+            if isinstance(refs, dict):
+                refs.pop(name, None)
+        try:
+            delattr(layer, name)
+        except AttributeError:
+            pass
+        parameters = getattr(layer, "_parameters", None)
+        if isinstance(parameters, dict):
+            parameters.pop(name, None)
+        buffers = getattr(layer, "_buffers", None)
+        if isinstance(buffers, dict):
+            buffers.pop(name, None)
+
+    # The only canonical raw copy needed by this implementation lives in the KT
+    # native CPU store.  Keeping this Python dict would duplicate every expert
+    # on the host and is never consulted by the prepared update path.
+    if hasattr(layer, "_kt_mxfp4_raw_weights"):
+        delattr(layer, "_kt_mxfp4_raw_weights")
+    layer._kt_mxfp4_raw_spec = dict(metadata)
+    layer._kt_mxfp4_raw_released = True
+    layer._kt_mxfp4_raw_weights_on_cpu = False
+    return released_bytes
 
 
 def _should_pack_all_experts_on_load(config: KTConfig) -> bool:
@@ -2329,15 +2402,17 @@ class SharedFullContext:
             return False
         mxfp4 = getattr(self, "_is_mxfp4_quant", False)
         if mxfp4:
-            if not all(
-                hasattr(destination_layer, name)
-                for name in _Mxfp4PrefillSlot.RAW_NAMES
-            ) or getattr(destination_layer, "_v4_marlin_weights", None) is None:
+            if getattr(destination_layer, "_v4_marlin_weights", None) is None:
                 return False
             if _mxfp4_prepared_only_layer(destination_layer):
                 return self._copy_selected_cpu_mxfp4_prepared_only(
                     wrapper, expert_ids, destination_layer, destination_rows
                 )
+            if not all(
+                hasattr(destination_layer, name)
+                for name in _Mxfp4PrefillSlot.RAW_NAMES
+            ):
+                return False
         for name in names:
             target = getattr(destination_layer, name, None)
             source = self.cpu_buffers[name][0]
@@ -2484,10 +2559,10 @@ class SharedFullContext:
     ) -> bool:
         """Repack selected CPU rows straight into the resident Marlin image.
 
-        The checkpoint-native destination tensors are CPU-only in prepared-only
-        mode.  Keep a bounded raw scratch bank on the GPU, copy the pinned host
-        rows there, and let ``prepare_v4_mxfp4_marlin`` write the kernel-ready
-        rows directly into the resident prepared pool.
+        Prepared-only mode releases the checkpoint-native destination tensors
+        entirely.  Keep a bounded raw scratch bank on the GPU, copy the pinned
+        host rows there, and let ``prepare_v4_mxfp4_marlin`` write the
+        kernel-ready rows directly into the resident prepared pool.
         """
 
         if not expert_ids:
@@ -3003,7 +3078,12 @@ class _Mxfp4LayerwisePrefillManager:
         self.context = context
         self.signature = signature
         self.device = _kt_layer_cuda_device(context.gpu_layer)
-        self.num_experts = int(context.gpu_layer.w13_weight.shape[0])
+        raw_metadata = _mxfp4_raw_metadata(context.gpu_layer)
+        if "w13_weight" not in raw_metadata:
+            raise RuntimeError(
+                "MXFP4 layerwise manager requires w13 raw shape metadata"
+            )
+        self.num_experts = int(raw_metadata["w13_weight"][0][0])
         self.staging_window = clamp_staging_window(
             staging_window, self.num_experts
         )
@@ -5151,20 +5231,19 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
     # generic MXFP4 quantization method in current SGLang uses
     # ``w13_weight_scale``/``w2_weight_scale`` and a different runner; it must
     # remain on its native backend instead of entering this `_inv`-tensor path.
-    if not all(hasattr(layer, name) for name in _Mxfp4PrefillSlot.RAW_NAMES):
+    raw_metadata = _mxfp4_raw_metadata(layer)
+    if len(raw_metadata) != len(_Mxfp4PrefillSlot.RAW_NAMES):
         return False
     # The shadow Marlin method pads hidden/intermediate dimensions to
     # 256/128 respectively.  The layerwise copier intentionally performs
     # whole-expert copies, so only the already-aligned DSV4 layout is safe.
-    w13 = getattr(layer, "w13_weight", None)
-    w2 = getattr(layer, "w2_weight", None)
+    w13 = raw_metadata["w13_weight"][0]
+    w2 = raw_metadata["w2_weight"][0]
     if (
-        w13 is None
-        or w2 is None
-        or w13.ndim != 3
-        or w2.ndim != 3
-        or w13.shape[2] * 2 % 256 != 0
-        or w2.shape[2] * 2 % 128 != 0
+        len(w13) != 3
+        or len(w2) != 3
+        or w13[2] * 2 % 256 != 0
+        or w2[2] * 2 % 128 != 0
     ):
         return False
     runner_config = getattr(method, "moe_runner_config", None)
@@ -5186,11 +5265,9 @@ def _mxfp4_pipeline_backend_supported(method, layer: torch.nn.Module) -> bool:
 
 
 def _mxfp4_pipeline_runtime_supported(method, layer: torch.nn.Module) -> bool:
-    raw_source = getattr(layer, "_kt_mxfp4_raw_weights", None)
     return (
         _mxfp4_pipeline_backend_supported(method, layer)
-        and raw_source is not None
-        and all(name in raw_source for name in _Mxfp4PrefillSlot.RAW_NAMES)
+        and _mxfp4_has_raw_metadata(layer)
     )
 
 
@@ -5246,14 +5323,16 @@ def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
             continue
 
         num_experts = getattr(method, "global_num_experts", None)
-        raw_source = getattr(layer, "_kt_mxfp4_raw_weights", None)
-        if raw_source is None or num_experts is None:
+        raw_metadata = _mxfp4_raw_metadata(layer)
+        if num_experts is None or len(raw_metadata) != len(
+            _Mxfp4PrefillSlot.RAW_NAMES
+        ):
             continue
         # Use the tensors created by the active quant method.  MXFP4 Marlin
         # rounds hidden/intermediate dimensions during create_weights; using
         # the unpadded model config here could under-reserve the lazy slots.
-        hidden_size = raw_source["w13_weight"].shape[2] * 2
-        intermediate_size = raw_source["w2_weight"].shape[2] * 2
+        hidden_size = raw_metadata["w13_weight"][0][2] * 2
+        intermediate_size = raw_metadata["w2_weight"][0][2] * 2
 
         from sglang.srt.layers.quantization.v4_marlin_moe import (
             get_v4_mxfp4_marlin_storage_nbytes,
@@ -5279,8 +5358,8 @@ def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
             total_bytes += 2 * (raw_slot_bytes + prepared_slot_bytes)
         else:
             # The temporary full-N context remains the allocation source and
-            # therefore counts toward the peak even when prepared-only moves
-            # it to CPU immediately after the banks are built.
+            # therefore counts toward the peak even when prepared-only drops
+            # its raw rows immediately after the banks are built.
             compact_prepared_bytes = get_v4_mxfp4_marlin_storage_nbytes(
                 num_experts=physical_rows,
                 hidden_size=hidden_size,
@@ -5382,14 +5461,6 @@ def _mxfp4_staging_layout(
     return resident_capacity, window, resident_capacity + window
 
 
-def _empty_mxfp4_rows(source: torch.Tensor, rows: int) -> torch.Tensor:
-    return torch.empty(
-        (int(rows), *source.shape[1:]),
-        dtype=source.dtype,
-        device=source.device,
-    )
-
-
 def _allocate_mxfp4_slot_storage(
     context: SharedFullContext,
     signature: Optional[tuple] = None,
@@ -5400,11 +5471,13 @@ def _allocate_mxfp4_slot_storage(
         allocate_v4_mxfp4_marlin,
     )
 
-    source = {
-        name: getattr(context.gpu_layer, name).data
-        for name in _Mxfp4PrefillSlot.RAW_NAMES
-    }
-    num_experts = source["w13_weight"].shape[0]
+    raw_metadata = _mxfp4_raw_metadata(context.gpu_layer)
+    if len(raw_metadata) != len(_Mxfp4PrefillSlot.RAW_NAMES):
+        raise RuntimeError(
+            "MXFP4 slot allocation requires shape/dtype metadata for all raw "
+            "weight tensors"
+        )
+    num_experts = raw_metadata["w13_weight"][0][0]
     registry = _MXFP4_PREFILL_LAYER_REGISTRY.get(signature, {})
     resident_capacity, window, physical_rows = _mxfp4_staging_layout(
         registry, num_experts, staging_window
@@ -5414,7 +5487,10 @@ def _allocate_mxfp4_slot_storage(
     if window is None:
         # Historical full-layer path: slot 0 aliases the shared shadow so the
         # extra lazy allocation remains exactly one full layer.
-        slot0_raw = source
+        slot0_raw = {
+            name: getattr(context.gpu_layer, name).data
+            for name in _Mxfp4PrefillSlot.RAW_NAMES
+        }
         raw_rows = num_experts
     else:
         # Prepared-only banks need raw storage only for the experts that cross
@@ -5422,16 +5498,24 @@ def _allocate_mxfp4_slot_storage(
         # banks, so the raw scratch width is the staging window, not R + S.
         raw_rows = window if prepared_only else physical_rows
         slot0_raw = {
-            name: _empty_mxfp4_rows(tensor, raw_rows)
-            for name, tensor in source.items()
+            name: torch.empty(
+                (raw_rows, *shape[1:]),
+                dtype=dtype,
+                device=_kt_layer_cuda_device(context.gpu_layer),
+            )
+            for name, (shape, dtype) in raw_metadata.items()
         }
     slot1_raw = {
-        name: _empty_mxfp4_rows(tensor, raw_rows)
-        for name, tensor in source.items()
+        name: torch.empty(
+            (raw_rows, *shape[1:]),
+            dtype=dtype,
+            device=_kt_layer_cuda_device(context.gpu_layer),
+        )
+        for name, (shape, dtype) in raw_metadata.items()
     }
-    hidden_size = source["w13_weight"].shape[2] * 2
-    intermediate_size = source["w2_weight"].shape[2] * 2
-    device = source["w13_weight"].device
+    hidden_size = raw_metadata["w13_weight"][0][2] * 2
+    intermediate_size = raw_metadata["w2_weight"][0][2] * 2
+    device = _kt_layer_cuda_device(context.gpu_layer)
     slot_marlin_prepared = tuple(
         allocate_v4_mxfp4_marlin(
             num_experts=physical_rows,
@@ -5608,12 +5692,15 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
     released_context_raw = 0
     if prepared_only:
         # The full-N context exists only to allocate the compatible slot and
-        # CPU-ring shapes.  Once both compact banks exist, keeping its raw GPU
-        # image would be a third copy of the same expert bytes.  FreeToken's
-        # slot cache likewise keeps only the kernel-ready image on device.
+        # CPU-ring shapes.  Once both compact banks exist, its raw GPU image is
+        # a third copy of the same expert bytes.  Drop it without a D2H copy;
+        # the KT native CPU store remains authoritative.  The context's saved
+        # parameter references must be dropped too or the tensors stay alive.
         try:
-            released_context_raw = _move_mxfp4_raw_layer_bytes_to_cpu(
-                context.gpu_layer
+            released_context_raw = _drop_mxfp4_raw_parameters(
+                context.gpu_layer,
+                extra_refs=(context.original_params, context.original_buffers),
+                require_prepared=False,
             )
         except Exception:
             logger.warning(
@@ -6752,40 +6839,50 @@ def copy_experts_weights_mxfp4(
         "w2_weight",
         "w2_weight_scale_inv",
     )
-    source = raw_source or {
-        name: getattr(src_layer, name).data for name in raw_names
-    }
-    if not all(name in source for name in raw_names) or not all(
-        hasattr(dst_layer, name) for name in raw_names
-    ):
+    prepared_only = _mxfp4_prepared_only_layer(dst_layer)
+    if raw_source is None:
+        canonical = getattr(src_layer, "_kt_mxfp4_raw_weights", None)
+        if canonical is not None:
+            source = canonical
+        else:
+            source = {
+                name: getattr(src_layer, name).data
+                for name in raw_names
+                if hasattr(src_layer, name)
+            }
+    else:
+        source = raw_source
+    if not all(name in source for name in raw_names):
         raise RuntimeError(
             "MXFP4 dynamic update requires canonical w13/w2 packed weights "
             "and _scale_inv tensors."
         )
 
-    weight_pairs = []
-    for name in raw_names:
-        src_weight = source[name]
-        dst_weight = getattr(dst_layer, name).data
-        if src_weight.ndim != dst_weight.ndim or src_weight.shape[1:] != dst_weight.shape[1:]:
-            raise RuntimeError(
-                f"MXFP4 dynamic update shape mismatch for {name}: "
-                f"source={tuple(src_weight.shape)} destination={tuple(dst_weight.shape)}"
-            )
-        weight_pairs.append((src_weight, dst_weight))
-
-    if _mxfp4_raw_weights_on_cpu(dst_layer):
+    if prepared_only:
         from sglang.srt.layers.quantization.v4_marlin_moe import (
             V4MarlinPreparedWeights,
             prepare_v4_mxfp4_marlin,
         )
 
         resident = getattr(dst_layer, "_v4_marlin_weights", None)
+        destination_metadata = _mxfp4_raw_metadata(dst_layer)
         device = _kt_layer_cuda_device(dst_layer)
-        if resident is None or device.type != "cuda":
+        if (
+            resident is None
+            or len(destination_metadata) != len(raw_names)
+            or device.type != "cuda"
+        ):
             raise RuntimeError(
                 "prepared-only MXFP4 update requires the resident Marlin image"
             )
+        for name in raw_names:
+            src_shape = tuple(source[name].shape)
+            expected_shape = destination_metadata[name][0]
+            if len(src_shape) != len(expected_shape) or src_shape[1:] != expected_shape[1:]:
+                raise RuntimeError(
+                    f"MXFP4 dynamic update shape mismatch for {name}: "
+                    f"source={src_shape} destination={expected_shape}"
+                )
         selected_cpu = selected_experts.detach().cpu().tolist()
         destination_rows = (
             dst_rows.detach().cpu().tolist()
@@ -6924,6 +7021,22 @@ def copy_experts_weights_mxfp4(
                     )
         dst_layer._v4_marlin_path = True
         return
+
+    if not all(hasattr(dst_layer, name) for name in raw_names):
+        raise RuntimeError(
+            "MXFP4 dynamic update requires resident raw destination tensors "
+            "when prepared-only mode is disabled."
+        )
+    weight_pairs = []
+    for name in raw_names:
+        src_weight = source[name]
+        dst_weight = getattr(dst_layer, name).data
+        if src_weight.ndim != dst_weight.ndim or src_weight.shape[1:] != dst_weight.shape[1:]:
+            raise RuntimeError(
+                f"MXFP4 dynamic update shape mismatch for {name}: "
+                f"source={tuple(src_weight.shape)} destination={tuple(dst_weight.shape)}"
+            )
+        weight_pairs.append((src_weight, dst_weight))
 
     _gather_scatter_expert_rows(
         weight_pairs,
@@ -7272,7 +7385,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         keep_owner: List[int],
         old_owner: List[int],
         old_prepared,
-        old_canonical: Optional[Dict[str, torch.Tensor]],
         device: torch.device,
     ) -> None:
         """Resize a prepared-only layer without retaining a resident raw bank."""
@@ -7314,29 +7426,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         ),
                     )
 
-        canonical = old_canonical or {}
-        new_canonical = {}
-        for name in _MXFP4_RAW_WEIGHT_NAMES:
-            tensor = getattr(layer, name)
-            new_cpu = torch.empty(
-                tuple(tensor.shape), dtype=tensor.dtype, device="cpu"
-            )
-            source = canonical.get(name)
-            if source is not None:
-                if source.shape[0] == self.global_num_experts:
-                    for destination_row, expert_id in enumerate(keep_owner):
-                        new_cpu[destination_row].copy_(source[int(expert_id)])
-                elif source.shape[0] == len(old_owner):
-                    for destination_row, expert_id in enumerate(keep_owner):
-                        source_row = old_index.get(int(expert_id))
-                        if source_row is not None:
-                            new_cpu[destination_row].copy_(source[source_row])
-            tensor.data = new_cpu
-            new_canonical[name] = tensor.detach()
-
         layer._v4_marlin_weights = new_prepared
-        layer._kt_mxfp4_raw_weights = new_canonical
-        layer._kt_mxfp4_raw_weights_on_cpu = True
+        # create_weights() above materialized temporary GPU rows for the new
+        # capacity.  Their contents are either copied from the old prepared
+        # image or filled by the current CPU H2D batch, so keep only
+        # shape/dtype metadata and return the raw rows immediately.
+        _drop_mxfp4_raw_parameters(layer)
 
     def _resize_gpu_expert_rows(
         self, layer: torch.nn.Module, new_capacity: int, keep_owner: List[int]
@@ -7363,7 +7458,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         prepared_only = _mxfp4_prepared_only_layer(layer)
         old_prepared = getattr(layer, "_v4_marlin_weights", None)
-        old_canonical = getattr(layer, "_kt_mxfp4_raw_weights", None)
         resize_device = _kt_layer_cuda_device(layer)
 
         old_weights = {}
@@ -7403,7 +7497,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 keep_owner,
                 old_owner,
                 old_prepared,
-                old_canonical,
                 resize_device,
             )
 
@@ -7666,6 +7759,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # while the layerwise full-expert shadow consumes this canonical source
         # and prepares its own Marlin slots.  This mirrors the old KT split
         # between the resident partial image and the full prefill shadow.
+        prepared_only = _mxfp4_prepared_only_requested(self.kt_config)
         if _mxfp4_pipeline_backend_supported(self, layer):
             raw_names = _Mxfp4PrefillSlot.RAW_NAMES
             missing = [name for name in raw_names if not hasattr(layer, name)]
@@ -7695,14 +7789,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     "full resident raw-weight image. Use a supported backend "
                     f"({supported}) or set --kt-gpu-prefill-token-threshold 0."
                 )
-            layer._kt_mxfp4_raw_weights = {
-                name: (
-                    getattr(layer, name).detach().clone()
-                    if name.endswith("scale_inv")
-                    else getattr(layer, name).detach()
-                )
-                for name in raw_names
-            }
+            if prepared_only:
+                # Capture only shape/dtype before the GPU backend rewrites or
+                # releases these tensors.  The bytes remain in the KT native
+                # CPU expert store; no Python-side canonical duplicate is
+                # needed for the prepared update paths.
+                layer._kt_mxfp4_raw_spec = dict(_mxfp4_raw_metadata(layer))
+            else:
+                layer._kt_mxfp4_raw_weights = {
+                    name: (
+                        getattr(layer, name).detach().clone()
+                        if name.endswith("scale_inv")
+                        else getattr(layer, name).detach()
+                    )
+                    for name in raw_names
+                }
             layer._kt_mxfp4_raw_w13_up_first = bool(
                 getattr(self.gpu_method, "load_up_proj_weight_first", False)
             )
@@ -7713,13 +7814,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and hasattr(self.gpu_method, "process_weights_after_loading")
         ):
             self.gpu_method.process_weights_after_loading(layer)
-            if _mxfp4_prepared_only_requested(self.kt_config):
-                released = _move_mxfp4_raw_weights_to_cpu(layer)
+            if prepared_only:
+                released = _drop_mxfp4_raw_parameters(layer)
                 if released and self.tp_rank == 0:
                     logger.info(
-                        "KT MXFP4 layer %d resident raw image moved to CPU "
-                        "after Marlin preparation (%.2f GiB device memory freed); "
-                        "the GPU slot keeps only the prepared image",
+                        "KT MXFP4 layer %d resident raw image released after "
+                        "Marlin preparation (%.2f GiB device memory freed); "
+                        "CPU experts stay in the KT native store",
                         self.kt_config.layer_idx,
                         released / 1024**3,
                     )
@@ -8071,6 +8172,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             hasattr(layer, "w13_weight")
             or hasattr(layer, "w13_weight_packed")
             or getattr(layer, "_v4_tk_path", False)
+            or _mxfp4_has_raw_metadata(layer)
         )
         # Do not construct the V4 shadow context for SGLang's generic MXFP4
         # contract (`w13_weight_scale`) or for dimensions that would require
@@ -8089,20 +8191,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     in (None, 0, 0.0)
                 )
             )
-            _v4_raw_contract = all(
-                hasattr(layer, name) for name in _Mxfp4PrefillSlot.RAW_NAMES
+            _v4_raw_metadata = _mxfp4_raw_metadata(layer)
+            _v4_raw_contract = len(_v4_raw_metadata) == len(
+                _Mxfp4PrefillSlot.RAW_NAMES
             )
             _v4_aligned = False
             if _v4_raw_contract:
-                _w13 = getattr(layer, "w13_weight", None)
-                _w2 = getattr(layer, "w2_weight", None)
+                _w13 = _v4_raw_metadata["w13_weight"][0]
+                _w2 = _v4_raw_metadata["w2_weight"][0]
                 _v4_aligned = (
-                    _w13 is not None
-                    and _w2 is not None
-                    and _w13.ndim == 3
-                    and _w2.ndim == 3
-                    and _w13.shape[2] * 2 % 256 == 0
-                    and _w2.shape[2] * 2 % 128 == 0
+                    len(_w13) == 3
+                    and len(_w2) == 3
+                    and _w13[2] * 2 % 256 == 0
+                    and _w2[2] * 2 % 128 == 0
                 )
             _full_gpu_fallback_supported = (
                 _full_gpu_fallback_supported

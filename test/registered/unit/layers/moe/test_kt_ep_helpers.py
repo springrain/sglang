@@ -578,26 +578,26 @@ def test_kt_invalid_runtime_combinations_fail_fast(extra):
         _parse_server_args(extra)
 
 
-def test_mxfp4_prepared_only_requires_a_positive_staging_window(monkeypatch):
-    monkeypatch.delenv(kt_ep._MXFP4_PREPARED_ONLY_ENV, raising=False)
-
+def test_mxfp4_prepared_only_enabled_by_gec_or_positive_staging_window():
     assert not kt_ep._mxfp4_prepared_only_requested(
-        SimpleNamespace(kt_layer_h2d_slots=None)
+        SimpleNamespace(kt_layer_h2d_slots=None, kt_expert_gpu_slots=None)
     )
     assert not kt_ep._mxfp4_prepared_only_requested(
-        SimpleNamespace(kt_layer_h2d_slots=0)
+        SimpleNamespace(kt_layer_h2d_slots=0, kt_expert_gpu_slots=0)
     )
     assert kt_ep._mxfp4_prepared_only_requested(
-        SimpleNamespace(kt_layer_h2d_slots=32)
+        SimpleNamespace(kt_layer_h2d_slots=32, kt_expert_gpu_slots=None)
+    )
+    assert kt_ep._mxfp4_prepared_only_requested(
+        SimpleNamespace(kt_layer_h2d_slots=None, kt_expert_gpu_slots=2048)
+    )
+    assert kt_ep._mxfp4_prepared_only_requested(
+        SimpleNamespace(kt_layer_h2d_slots=0, kt_expert_gpu_slots=2048)
     )
 
-    monkeypatch.setenv(kt_ep._MXFP4_PREPARED_ONLY_ENV, "0")
-    assert not kt_ep._mxfp4_prepared_only_requested(
-        SimpleNamespace(kt_layer_h2d_slots=32)
-    )
 
 
-def test_mxfp4_prepared_only_layer_requires_prepared_and_cpu_raw_images():
+def test_mxfp4_prepared_only_layer_accepts_cpu_or_released_raw_images():
     names = kt_ep._MXFP4_RAW_WEIGHT_NAMES
     layer = SimpleNamespace(
         _v4_marlin_weights=object(),
@@ -607,6 +607,41 @@ def test_mxfp4_prepared_only_layer_requires_prepared_and_cpu_raw_images():
 
     delattr(layer, names[0])
     assert not kt_ep._mxfp4_prepared_only_layer(layer)
+
+
+def test_mxfp4_release_drops_raw_parameters_and_keeps_metadata():
+    names = kt_ep._MXFP4_RAW_WEIGHT_NAMES
+    layer = SimpleNamespace(
+        _v4_marlin_weights=object(),
+        _kt_mxfp4_raw_weights={
+            name: torch.empty(2, 3, 4) for name in names
+        },
+        **{name: torch.empty(2, 3, 4) for name in names},
+    )
+
+    released = kt_ep._drop_mxfp4_raw_parameters(layer)
+
+    # These test tensors are CPU-resident, so no device bytes are reported.
+    assert released == 0
+    assert not hasattr(layer, "_kt_mxfp4_raw_weights")
+    assert all(not hasattr(layer, name) for name in names)
+    assert kt_ep._mxfp4_prepared_only_layer(layer)
+    assert kt_ep._mxfp4_raw_metadata(layer) == {
+        name: ((2, 3, 4), torch.float32) for name in names
+    }
+
+    scratch = kt_ep._get_mxfp4_raw_scratch(layer, torch.device("cpu"), 5)
+    assert scratch["w13_weight"].shape == (5, 3, 4)
+    assert scratch["w13_weight"].dtype == torch.float32
+
+
+def test_mxfp4_release_requires_a_prepared_image():
+    names = kt_ep._MXFP4_RAW_WEIGHT_NAMES
+    layer = SimpleNamespace(**{name: torch.empty(2, 3, 4) for name in names})
+
+    assert kt_ep._drop_mxfp4_raw_parameters(layer) == 0
+    assert all(hasattr(layer, name) for name in names)
+    assert not hasattr(layer, kt_ep._MXFP4_RAW_RELEASED_ATTR)
 
 
 def test_resident_host_ids_prefer_pending_promotions_and_canonical_rows():
