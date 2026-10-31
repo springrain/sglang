@@ -31,7 +31,7 @@ KT_DOWNSTREAM_FIELDS = (
     "kt_gpu_experts_ratio",
     "kt_num_gpu_layers",
     "kt_expert_gpu_slots",
-    "kt_layer_h2d_slots",
+    "kt_expert_cache_policy",
     "kt_gpu_prefill_token_threshold",
     "record_kt_gpu_expert_distribution",
     "kt_enable_dynamic_expert_update",
@@ -71,8 +71,8 @@ class TestKTFieldMigration(unittest.TestCase):
                 "3",
                 "--kt-expert-gpu-slots",
                 "2560",
-                "--kt-layer-h2d-slots",
-                "64",
+                "--kt-expert-cache-policy",
+                "lfu",
                 "--kt-gpu-prefill-token-threshold",
                 "128",
                 "--record-kt-gpu-expert-distribution",
@@ -90,7 +90,7 @@ class TestKTFieldMigration(unittest.TestCase):
         self.assertEqual(args.kt_gpu_experts_ratio, 0.5)
         self.assertEqual(args.kt_num_gpu_layers, 3)
         self.assertEqual(args.kt_expert_gpu_slots, 2560)
-        self.assertEqual(args.kt_layer_h2d_slots, 64)
+        self.assertEqual(args.kt_expert_cache_policy, "lfu")
         self.assertEqual(args.kt_gpu_prefill_token_threshold, 128)
         self.assertTrue(args.record_kt_gpu_expert_distribution)
         self.assertTrue(args.kt_enable_dynamic_expert_update)
@@ -109,7 +109,7 @@ class TestKTFieldMigration(unittest.TestCase):
             "kt_gpu_experts_ratio",
             "kt_num_gpu_layers",
             "kt_expert_gpu_slots",
-            "kt_layer_h2d_slots",
+            "kt_expert_cache_policy",
             "kt_max_deferred_experts_per_token",
             "kt_gpu_prefill_token_threshold",
             "record_kt_gpu_expert_distribution",
@@ -122,6 +122,16 @@ class TestKTFieldMigration(unittest.TestCase):
         self.assertEqual(
             POSITIONAL_FIELD_ORDER[start : start + len(expected)], expected
         )
+
+    def test_expert_cache_policy_defaults_to_lfu(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        self.assertNotIn("--kt-layer-h2d-slots", parser._option_string_actions)
+
+        namespace = parser.parse_args(["--model", "dummy"])
+        args = ServerArgs.from_cli_args(namespace)
+        self.assertEqual(args.kt_expert_cache_policy, "lfu")
+        self.assertEqual(args.kt_expert_placement_strategy, "front-loading")
 
 
 class TestKTDeclarations(unittest.TestCase):
@@ -211,7 +221,10 @@ class TestKTValidation(unittest.TestCase):
             ("ratio must be between 0 and 1", {"kt_gpu_experts_ratio": 1.1}),
             ("num-gpu-layers must be non-negative", {"kt_num_gpu_layers": -1}),
             ("expert-gpu-slots must be non-negative", {"kt_expert_gpu_slots": -1}),
-            ("layer-h2d-slots must be non-negative", {"kt_layer_h2d_slots": -1}),
+            (
+                "must be 'lfu'",
+                {"kt_expert_cache_policy": "lru"},
+            ),
             (
                 "deferred-experts-per-token must be non-negative",
                 {"kt_max_deferred_experts_per_token": -1},
@@ -225,15 +238,6 @@ class TestKTValidation(unittest.TestCase):
                 {"kt_expert_placement_strategy": "invalid"},
             ),
         )
-        gec_dependency_cases = (
-            (
-                "require --kt-expert-gpu-slots",
-                {"kt_layer_h2d_slots": 64},
-            ),
-        )
-        for message, fields in gec_dependency_cases:
-            with self.subTest(fields=fields):
-                self.assert_invalid(message, **fields)
         for message, fields in cases:
             with self.subTest(fields=fields):
                 self.assert_invalid(message, **fields)
@@ -245,17 +249,13 @@ class TestKTValidation(unittest.TestCase):
             ServerArgs(
                 model_path="dummy",
                 kt_expert_gpu_slots=2560,
-                kt_layer_h2d_slots=64,
             )
         )
-        # The staging window is also selectable without the GEC resident pool:
-        # --kt-layer-h2d-slots plus a positive prefill threshold is the joint
-        # gate of the cross-layer prefill staging mode.
+        # The prefill threshold remains independent of the GEC resident pool.
         validate_kt_args(
             ServerArgs(
                 model_path="dummy",
                 kt_num_gpu_layers=3,
-                kt_layer_h2d_slots=256,
                 kt_gpu_prefill_token_threshold=2048,
             )
         )

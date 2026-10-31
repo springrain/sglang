@@ -487,6 +487,22 @@ class NgramEmbeddingInfo:
         )
 
 
+def _request_decode_flags(batch) -> Optional[List[bool]]:
+    """Mark the decode half of a MIXED batch for request-level GEC admission.
+
+    ``extend_seq_lens_cpu`` contains one entry for every request, including the
+    running decode tail.  Those tail tokens must not accumulate as prefill
+    tokens and accidentally cross the request admission threshold later in the
+    request's lifetime.
+    """
+
+    decoding_reqs = getattr(batch, "decoding_reqs", None)
+    if not decoding_reqs:
+        return None
+    decoding_ids = {id(req) for req in decoding_reqs}
+    return [id(req) in decoding_ids for req in batch.reqs]
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -629,6 +645,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # Per-request MIXED-batch split (True for the running decode tail).
+    request_is_decode: Optional[List[bool]] = None
     watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
     watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
@@ -1072,6 +1090,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            request_is_decode=_request_decode_flags(batch),
             watermark_prompt_tail_ids=(
                 watermark_state.prompt_tails(batch)
                 if watermark_state is not None

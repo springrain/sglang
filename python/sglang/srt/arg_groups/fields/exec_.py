@@ -966,19 +966,25 @@ class ExecMoe(msgspec.Struct):
     ] = None
     kt_expert_gpu_slots: A[
         Optional[int],
-        "[ktransformers parameter] Global persistent hot-expert cache capacity, counted in Logical Experts; startup placement is layer-major and runtime rows can migrate across MoE layers based on activation heat.",
+        Arg(
+            help="[ktransformers parameter] Global persistent hot-expert cache capacity, counted in Logical Experts. Startup placement follows --kt-expert-placement-strategy: front-loading (default, fill complete MoE layers in order) or uniform. Runtime rows can migrate across MoE layers based on activation heat.",
+            aliases=["--kt-expert-gpu-slot"],
+        ),
     ] = None
-    kt_layer_h2d_slots: A[
-        Optional[int],
-        "[ktransformers parameter] Per-layer host staging window, counted in Logical Experts. When > 0 it selects the MXFP4 layerwise prefill staging: each layer stages at most this many experts and the pinned host ring holds two generations (2 * slots). Under --kt-expert-gpu-slots it is also the GEC per-round H2D admission budget.",
-    ] = None
+    kt_expert_cache_policy: A[
+        str,
+        Arg(
+            help="[ktransformers parameter] Global expert cache replacement policy. LFU counts router token demand and keeps pinned fused shared experts resident. Defaults to 'lfu'.",
+            choices=["lfu"],
+        ),
+    ] = "lfu"
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
     ] = None
     kt_gpu_prefill_token_threshold: A[
         Optional[int],
-        "[ktransformers parameter] Token threshold above which prefill forwards may migrate expert weights: the legacy layerwise full-GPU prefill path, and jointly with --kt-layer-h2d-slots the cross-layer prefill staging window.",
+        "[ktransformers parameter] Token threshold above which prefill forwards may migrate expert weights through the legacy layerwise full-GPU prefill path and request-level GEC admission.",
     ] = None
     record_kt_gpu_expert_distribution: A[
         bool,
@@ -991,10 +997,10 @@ class ExecMoe(msgspec.Struct):
     kt_expert_placement_strategy: A[
         str,
         Arg(
-            help="[ktransformers parameter] Initial GPU expert placement strategy.",
+            help="[ktransformers parameter] Initial GPU expert placement strategy. Defaults to front-loading; --kt-expert-gpu-slots supports front-loading and uniform.",
             choices=["frequency", "front-loading", "uniform", "random"],
         ),
-    ] = "uniform"
+    ] = "front-loading"
     kt_lora_path: A[
         Optional[str],
         "[ktransformers parameter] Legacy composite KT LoRA adapter path.",

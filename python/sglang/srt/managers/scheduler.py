@@ -3421,6 +3421,12 @@ class Scheduler(
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
+        try:
+            from sglang.srt.layers.moe.kt_gec_request import forget_request_contexts
+
+            forget_request_contexts((req.rid,))
+        except Exception:
+            logger.debug("Failed to clear KT GEC request state for abort", exc_info=True)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -4999,6 +5005,19 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+        finished_rids = tuple(req.rid for req in batch.reqs if req.finished())
+        if finished_rids:
+            try:
+                from sglang.srt.layers.moe.kt_gec_request import (
+                    forget_request_contexts,
+                )
+
+                forget_request_contexts(finished_rids)
+            except Exception:
+                logger.debug(
+                    "Failed to clear KT GEC request state after completion",
+                    exc_info=True,
+                )
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

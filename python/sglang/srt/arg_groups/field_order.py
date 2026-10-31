@@ -423,7 +423,7 @@ POSITIONAL_FIELD_ORDER = (
     "kt_gpu_experts_ratio",
     "kt_num_gpu_layers",
     "kt_expert_gpu_slots",
-    "kt_layer_h2d_slots",
+    "kt_expert_cache_policy",
     "kt_max_deferred_experts_per_token",
     "kt_gpu_prefill_token_threshold",
     "record_kt_gpu_expert_distribution",

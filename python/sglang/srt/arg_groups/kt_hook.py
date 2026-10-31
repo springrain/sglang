@@ -162,20 +162,10 @@ def validate_kt_args(server_args: Any) -> None:
         raise ValueError("--kt-num-gpu-layers must be non-negative.")
     if cfg.kt_expert_gpu_slots is not None and cfg.kt_expert_gpu_slots < 0:
         raise ValueError("--kt-expert-gpu-slots must be non-negative.")
-    if cfg.kt_layer_h2d_slots is not None and cfg.kt_layer_h2d_slots < 0:
-        raise ValueError("--kt-layer-h2d-slots must be non-negative.")
-    if (
-        cfg.kt_layer_h2d_slots is not None
-        and cfg.kt_expert_gpu_slots is None
-        and not (
-            cfg.kt_gpu_prefill_token_threshold
-            and cfg.kt_gpu_prefill_token_threshold > 0
-        )
-    ):
+    if getattr(cfg, "kt_expert_cache_policy", "lfu") != "lfu":
         raise ValueError(
-            "--kt-layer-h2d-slots requires "
-            "--kt-expert-gpu-slots (GEC admission budget) or a positive "
-            "--kt-gpu-prefill-token-threshold (cross-layer prefill staging)."
+            "--kt-expert-cache-policy must be 'lfu'; other replacement "
+            "policies are not implemented."
         )
     if (
         cfg.kt_max_deferred_experts_per_token is not None
@@ -194,6 +184,14 @@ def validate_kt_args(server_args: Any) -> None:
             "--kt-expert-placement-strategy must be one of "
             f"{sorted(placement_strategies)}, got "
             f"{cfg.kt_expert_placement_strategy!r}."
+        )
+    if cfg.kt_expert_gpu_slots is not None and cfg.kt_expert_placement_strategy not in {
+        "uniform",
+        "front-loading",
+    }:
+        raise ValueError(
+            "--kt-expert-gpu-slots supports only 'uniform' and "
+            "'front-loading' placement strategies."
         )
 
     if cfg.kt_weight_path is not None and (

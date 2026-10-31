@@ -289,6 +289,8 @@ def _prefill_cuda_graph_allows_context_parallel(
 # into core startup, so the publisher is memoized on first use instead.
 _KT_FORWARD_MODE_PUBLISHER = None
 _KT_FORWARD_MODE_PUBLISHER_READY = False
+_KT_REQUEST_LAYOUT_PUBLISHER = None
+_KT_REQUEST_LAYOUT_PUBLISHER_READY = False
 
 
 def _publish_kt_forward_mode(forward_mode, forward_id=None) -> None:
@@ -307,6 +309,43 @@ def _publish_kt_forward_mode(forward_mode, forward_id=None) -> None:
         _KT_FORWARD_MODE_PUBLISHER_READY = True
     if _KT_FORWARD_MODE_PUBLISHER is not None:
         _KT_FORWARD_MODE_PUBLISHER(forward_mode, forward_id=forward_id)
+
+
+def _publish_kt_request_layout(forward_batch, forward_id=None) -> None:
+    """Publish request->token ownership for request-level GEC admission."""
+
+    global _KT_REQUEST_LAYOUT_PUBLISHER, _KT_REQUEST_LAYOUT_PUBLISHER_READY
+    if not _KT_REQUEST_LAYOUT_PUBLISHER_READY:
+        try:
+            from sglang.srt.layers.moe.kt_gec_request import (
+                build_request_layout,
+                publish_request_layout,
+            )
+
+            def _publish(forward_batch, forward_id):
+                layout = build_request_layout(
+                    forward_id=forward_id,
+                    forward_mode=getattr(forward_batch, "forward_mode", None),
+                    request_ids=getattr(forward_batch, "rids", None),
+                    num_tokens=forward_batch._forward_num_tokens(),
+                    extend_seq_lens_cpu=getattr(
+                        forward_batch, "extend_seq_lens_cpu", None
+                    ),
+                    extend_prefix_lens_cpu=getattr(
+                        forward_batch, "extend_prefix_lens_cpu", None
+                    ),
+                    request_is_decode=getattr(
+                        forward_batch, "request_is_decode", None
+                    ),
+                )
+                publish_request_layout(layout, forward_id)
+
+            _KT_REQUEST_LAYOUT_PUBLISHER = _publish
+        except Exception:
+            _KT_REQUEST_LAYOUT_PUBLISHER = None
+        _KT_REQUEST_LAYOUT_PUBLISHER_READY = True
+    if _KT_REQUEST_LAYOUT_PUBLISHER is not None:
+        _KT_REQUEST_LAYOUT_PUBLISHER(forward_batch, forward_id)
 
 
 @dataclass
@@ -2244,6 +2283,9 @@ class ModelRunner:
         _publish_kt_forward_mode(
             getattr(forward_batch, "forward_mode", None),
             forward_id=self.forward_pass_id,
+        )
+        _publish_kt_request_layout(
+            forward_batch, forward_id=self.forward_pass_id
         )
         try:
             forward_batch._kt_debug_pass_id = self.forward_pass_id

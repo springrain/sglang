@@ -5,8 +5,8 @@ Implements the admission/eviction half of doc/KT-CPU-PICE-GPU.md on top of the
 existing KT dynamic expert update machinery:
 
 - ``kt_kernel.gec`` (the C++ Global Expert Cache) owns every decision:
-  residency lookup, candidate filter, priority, Top-N admission, LRU eviction
-  with probation protection.
+  residency lookup, candidate filter, priority, Top-N admission, and global
+  LFU eviction.
 - The physical side (weight copies, routing-table updates, TP broadcast) keeps
   using the proven dynamic update path in ``kt_ep_wrapper``.
 
@@ -20,10 +20,11 @@ Parameter mapping (all counted in Logical Experts, per the doc):
   does not require the legacy
   ``--kt-enable-dynamic-expert-update`` /
   ``--kt-gpu-prefill-token-threshold`` pair. The threshold remains an
-  independent legacy full-GPU prefill control.
-- ``--kt-layer-h2d-slots``: per-layer per-round admission budget, i.e. how
-  many experts may be swapped into the cache in one update round. Defaults to
-  the layer capacity (unbounded, legacy-like) when unset.
+  independent legacy full-GPU prefill control; when positive it is also the
+  request-level GEC admission threshold.
+- Per-layer per-round admission budget is internal: a layer may update at most
+  its own physical capacity (or the model-global capacity for a zero-row
+  layer) in one round.
 """
 
 from __future__ import annotations
@@ -35,6 +36,13 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
+
+from sglang.srt.layers.moe.kt_gec_request import (
+    RequestAdmissionTracker,
+    RequestAdmissionWindow,
+    published_forward_id,
+    published_request_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -368,13 +376,14 @@ class GlobalGecCoordinator:
         h2d_buffer_pool_depth: int = 1,
         tp_size: int = 1,
         max_running_requests: int = 0,
+        gpu_prefill_token_threshold: int = 0,
     ) -> None:
         if capacity < 1:
             raise ValueError("global GEC capacity must be >= 1")
         config = gec_module.GecConfig()
         config.num_gpu_layers = max(0, int(num_gpu_layers))
         config.expert_gpu_slots = int(capacity)
-        config.layer_h2d_slots = int(capacity)
+        config.h2d_round_budget = int(capacity)
         # Each concurrently running request may own one current H2D batch,
         # so the pool depth is derived from the request count, not from a
         # batch size.
@@ -393,10 +402,40 @@ class GlobalGecCoordinator:
         self._layers: Dict[int, _LayerState] = {}
         self._lock = threading.RLock()
         self.layout_epoch = 0
+        self.request_admission = RequestAdmissionTracker(
+            gpu_prefill_token_threshold
+        )
+        self._routing_forward_id: Optional[int] = None
+        self._routing_epoch = 0
 
     @property
     def cache(self):
         return self._cache
+
+    def begin_router_round(self, forward_id: Optional[int] = None) -> None:
+        """Open one transient protection window for the whole forward.
+
+        Every MoE layer in a forward sees the same ``forward_id``.  Reusing
+        the epoch keeps a row routed by layer L protected from admission in
+        layer L+1 of that same batch; the next forward releases it.
+        """
+
+        with self._lock:
+            if (
+                forward_id is not None
+                and self._routing_forward_id == int(forward_id)
+                and self._routing_epoch != 0
+            ):
+                return
+            self._routing_epoch = int(self._cache.begin_router_round())
+            self._routing_forward_id = (
+                None if forward_id is None else int(forward_id)
+            )
+
+    def request_window(self) -> RequestAdmissionWindow:
+        return self.request_admission.begin_forward(
+            published_request_layout(), published_forward_id()
+        )
 
     def register_layer(self, layer_idx: int, num_experts: int, capacity: int, budget: int) -> None:
         with self._lock:
@@ -627,7 +666,11 @@ class GlobalGecCoordinator:
             f"GEC global: capacity={self.capacity} residents="
             f"{self._cache.resident_size()} hits={stats.hits} misses={stats.misses} "
             f"hit_rate={stats.hit_rate():.3f} admissions={stats.admissions} "
-            f"evictions={stats.evictions} reh2d={stats.reh2d}"
+            f"evictions={stats.evictions} reh2d={stats.reh2d} "
+            f"lfu_events={stats.lfu_events} "
+            f"lfu_aging_sweeps={stats.lfu_aging_sweeps} "
+            f"router_rounds={stats.router_rounds} "
+            f"qualified_requests={len(self.request_admission.qualified_request_ids)}"
         )
 
 
@@ -651,6 +694,9 @@ def get_or_create_gec_coordinator(scope, kt_config, gec_module) -> GlobalGecCoor
             tp_size=int(getattr(kt_config, "kt_tp_size", 1) or 1),
             max_running_requests=int(
                 getattr(kt_config, "max_running_requests", 0) or 0
+            ),
+            gpu_prefill_token_threshold=int(
+                getattr(kt_config, "gpu_prefill_token_threshold", 0) or 0
             ),
         )
         _GEC_COORDINATOR_SCOPE = scope_id
@@ -714,6 +760,60 @@ def gec_enabled(kt_config) -> bool:
     return slots is not None and slots > 0
 
 
+def count_request_router_demand(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    window: Optional[RequestAdmissionWindow],
+) -> Tuple[List[int], bool]:
+    """Count routed experts from GEC-qualified request rows only.
+
+    The flattened top-k tensor is token-major.  A mixed batch is split with
+    the request spans published by ``ModelRunner``; rows of non-qualified
+    requests and padding are excluded from both LFU accounting and background
+    admission.  When request ownership is unavailable with a positive
+    threshold, this fails closed.
+    """
+
+    counts = torch.zeros(
+        int(num_experts), dtype=torch.int64, device=topk_ids.device
+    )
+    if topk_ids.numel() == 0 or window is None or not window.manage:
+        return counts.tolist(), False
+
+    topk = int(topk_ids.shape[-1]) if topk_ids.dim() > 1 else 1
+    actual_tokens = topk_ids.numel() // max(1, topk)
+    covered = window.covered_tokens
+    if covered is not None and covered > actual_tokens:
+        return counts.tolist(), False
+    selected_tokens = actual_tokens if covered is None else covered
+    flat_ids = topk_ids.reshape(-1)
+
+    if window.select_all:
+        selected_ids = flat_ids[: selected_tokens * topk]
+    else:
+        layout = window.layout
+        if layout is None:
+            return counts.tolist(), False
+        pieces = []
+        for request_index in window.selected_request_indices():
+            start, end = layout.token_span(request_index)
+            end = min(end, selected_tokens)
+            if start >= end:
+                continue
+            pieces.append(flat_ids[start * topk : end * topk])
+        if not pieces:
+            return counts.tolist(), False
+        selected_ids = (
+            pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+        )
+
+    valid_mask = (selected_ids >= 0) & (selected_ids < int(num_experts))
+    valid_ids = selected_ids[valid_mask]
+    if valid_ids.numel() > 0:
+        counts.index_add_(0, valid_ids, torch.ones_like(valid_ids))
+    return counts.tolist(), True
+
+
 class GecResidencyPlanner:
     """Layer view over the model-scoped GEC admission/eviction planner.
 
@@ -731,6 +831,7 @@ class GecResidencyPlanner:
         budget: int,
         gec_module,
         coordinator: Optional[GlobalGecCoordinator] = None,
+        gpu_prefill_token_threshold: int = 0,
     ) -> None:
         if capacity < 0 or (capacity == 0 and coordinator is None):
             raise ValueError("GEC capacity must be >= 1")
@@ -747,7 +848,7 @@ class GecResidencyPlanner:
         config.expert_gpu_slots = (
             coordinator.capacity if coordinator is not None else self.capacity
         )
-        config.layer_h2d_slots = self.budget
+        config.h2d_round_budget = self.budget
         config.validate()
         self._cache = (
             coordinator.cache
@@ -776,6 +877,14 @@ class GecResidencyPlanner:
             coordinator.buffer_pool_depth if coordinator is not None else 1
         )
         self._latest_counts: List[int] = [0] * num_experts
+        self._pinned_expert_ids: set[int] = set()
+        self.request_admission = (
+            coordinator.request_admission
+            if coordinator is not None
+            else RequestAdmissionTracker(gpu_prefill_token_threshold)
+        )
+        self._routing_forward_id: Optional[int] = None
+        self._routing_epoch = 0
         if coordinator is not None:
             coordinator.register_layer(
                 layer_idx, num_experts, self.capacity, self.budget
@@ -790,10 +899,11 @@ class GecResidencyPlanner:
         return 0
 
     def _admit_and_mark_ready(self, expert_id: int, now_us: int) -> bool:
-        """Admit one expert and drive it to READY (evicting LRU on demand)."""
+        """Admit one expert and drive it to READY (evicting LFU on demand)."""
         eid = self._id(expert_id)
         if not self._cache.admit(eid, now_us):
             return False
+        self._pin_if_requested(expert_id)
         existing = self._cache.snapshot(eid)
         if existing is not None and existing.state in (
             self._gec.LifecycleState.LOADING,
@@ -806,7 +916,13 @@ class GecResidencyPlanner:
             for tp_rank in range(self._tp_size):
                 self._cache.mark_shard_ready(eid, tp_rank, now_us)
             self._cache.record_h2d(eid)
+            self._end_startup_protection(eid)
         return True
+
+    def _end_startup_protection(self, logical_id) -> None:
+        end = getattr(self._cache, "end_startup_protection", None)
+        if end is not None:
+            end(logical_id)
 
     def initialize_residents(self, expert_ids: Iterable[int]) -> None:
         if self._coordinator is None:
@@ -814,6 +930,44 @@ class GecResidencyPlanner:
             return
         with self._coordinator._lock:
             self._initialize_residents_locked(expert_ids)
+
+    def pin_experts(self, expert_ids: Iterable[int]) -> int:
+        """Keep fused shared experts outside ordinary LFU eviction.
+
+        The ids are remembered even when the expert is not resident yet. A
+        later admission re-applies the pin, so global capacity migration can
+        never turn a shared expert into an ordinary LFU victim.
+        """
+        pin = getattr(self._cache, "set_pinned", None)
+        if pin is None:
+            return 0
+        ids = tuple(dict.fromkeys(int(item) for item in expert_ids))
+        if any(item < 0 or item >= self.num_experts for item in ids):
+            raise ValueError("invalid pinned GEC expert")
+        lock = self._coordinator._lock if self._coordinator is not None else None
+        if lock is not None:
+            lock.acquire()
+        pinned = 0
+        try:
+            self._pinned_expert_ids.update(ids)
+            for expert_id in ids:
+                if pin(self._id(expert_id), True):
+                    pinned += 1
+        finally:
+            if lock is not None:
+                lock.release()
+        return pinned
+
+    def _pin_if_requested(self, expert_id: int) -> None:
+        if int(expert_id) not in self._pinned_expert_ids:
+            return
+        pin = getattr(self._cache, "set_pinned", None)
+        if pin is not None:
+            pin(self._id(int(expert_id)), True)
+
+    def current_resident_ids(self) -> List[int]:
+        """Return the current row set without changing admission state."""
+        return [int(item.expert_id) for item in self._resident_ids()]
 
     def _initialize_residents_locked(self, expert_ids: Iterable[int]) -> None:
         resident_ids = tuple(dict.fromkeys(int(item) for item in expert_ids))
@@ -824,28 +978,58 @@ class GecResidencyPlanner:
             logical_id = self._id(expert_id)
             snapshot = self._cache.snapshot(logical_id)
             if snapshot is not None and snapshot.state == self._gec.LifecycleState.READY:
+                self._pin_if_requested(expert_id)
                 continue
             if snapshot is not None and snapshot.state == self._gec.LifecycleState.LOADING:
                 raise RuntimeError('initial GEC resident is still loading')
             if not self._cache.admit(logical_id, now_us):
                 raise RuntimeError('global cache is full during initial GEC registration')
+            self._pin_if_requested(expert_id)
             self._cache.record_h2d(logical_id)
             self._cache.mark_scheduled(logical_id)
             self._cache.mark_loading(logical_id)
             for tp_rank in range(self._tp_size):
                 self._cache.mark_shard_ready(logical_id, tp_rank, now_us)
+            self._end_startup_protection(logical_id)
         self._prefilled = True
 
-    def plan(self, counts: List[int]) -> List[int]:
+    def request_window(self) -> RequestAdmissionWindow:
+        return self.request_admission.begin_forward(
+            published_request_layout(), published_forward_id()
+        )
+
+    def begin_router_round(self, window: RequestAdmissionWindow) -> None:
+        forward_id = (
+            int(window.forward_id)
+            if window.layout is not None or int(window.forward_id) > 0
+            else None
+        )
+        if self._coordinator is not None:
+            self._coordinator.begin_router_round(forward_id)
+            return
+        if (
+            forward_id is not None
+            and self._routing_forward_id == forward_id
+            and self._routing_epoch != 0
+        ):
+            return
+        self._routing_epoch = int(self._cache.begin_router_round())
+        self._routing_forward_id = forward_id
+
+    def plan(
+        self, counts: List[int], *, manage_background: bool = True
+    ) -> List[int]:
         # Cache admission and eviction are model-global. Serialize the
         # decision window so two concurrently executing layers cannot both
         # select the same free slot based on stale resident sets.
         if self._coordinator is None:
-            return self._plan_locked(counts)
+            return self._plan_locked(counts, manage_background)
         with self._coordinator._lock:
-            return self._plan_locked(counts)
+            return self._plan_locked(counts, manage_background)
 
-    def _plan_locked(self, counts: List[int]) -> List[int]:
+    def _plan_locked(
+        self, counts: List[int], manage_background: bool = True
+    ) -> List[int]:
         """Compute the resident set for the next round.
 
         Args:
@@ -857,14 +1041,45 @@ class GecResidencyPlanner:
             equals ``self.capacity`` so the GPU routing tables stay dense.
         """
         round_start = time.perf_counter_ns()
+        self.poll_gpu_completions()
+        self.poll_h2d_completions()
+        if not manage_background:
+            # A request below the admission threshold executes against the
+            # current layout, but contributes no LFU events and starts no
+            # background admission/eviction work.
+            self._latest_counts = [0] * self.num_experts
+            return [eid.expert_id for eid in self._resident_ids()]
+
         self._latest_counts = [
             max(0, int(counts[index])) if index < len(counts) else 0
             for index in range(self.num_experts)
         ]
-        self.poll_gpu_completions()
-        self.poll_h2d_completions()
         now_us = time.perf_counter_ns() // 1000
         cache = self._cache
+        self.begin_router_round(self.request_window())
+
+        # Snapshot history before folding this round in. The same event must
+        # not be counted both as current demand and as historical priority.
+        prior_lfu = [0] * self.num_experts
+        for expert_id, demand in enumerate(self._latest_counts):
+            if not demand:
+                continue
+            snapshot = cache.snapshot(self._id(expert_id))
+            if snapshot is not None:
+                lfu_count = getattr(snapshot, "lfu_count", None)
+                if lfu_count is None:
+                    lfu_count = getattr(snapshot, "use_count", 0)
+                prior_lfu[expert_id] = int(lfu_count)
+
+        # Effective Router demand, independent of the eventual CPU/GPU
+        # placement. This covers cache hits, newly admitted rows and CPU
+        # fallback experts that remain absent from the GPU row pool. Prefetch,
+        # H2D completion and lookup hits deliberately do not call this.
+        for expert_id, demand in enumerate(self._latest_counts):
+            if demand:
+                cache.record_router_demand(
+                    self._id(expert_id), demand, now_us
+                )
 
         if not self._prefilled and self.capacity == 0:
             self._prefilled = True
@@ -878,15 +1093,13 @@ class GecResidencyPlanner:
             order = list(range(self.num_experts))
             for expert_id in order[: self.capacity]:
                 self._admit_and_mark_ready(expert_id, now_us)
-                if counts[expert_id]:
-                    cache.record_use(self._id(expert_id), now_us)
             self._prefilled = True
         else:
             # Steady state: refresh routed residents, then admit the Top-N
             # misses within the per-round budget (doc sections 12-13).
             candidates = []
             for expert_id in range(self.num_experts):
-                demand = counts[expert_id]
+                demand = self._latest_counts[expert_id]
                 if not demand:
                     continue
                 eid = self._id(expert_id)
@@ -894,16 +1107,13 @@ class GecResidencyPlanner:
                 lookup_result = cache.lookup(eid, now_us)
                 lookup_us = (time.perf_counter_ns() - lookup_start) // 1000
                 if lookup_result == self._gec.LookupResult.HIT:
-                    cache.record_use(eid, now_us)
                     self.record_cache_wait(expert_id, lookup_us)
                     continue
                 snapshot = cache.snapshot(eid)
                 candidate = self._gec.SchedulerCandidate()
                 candidate.id = eid
                 candidate.current_demand = demand
-                candidate.historical_hit_count = (
-                    snapshot.hit_count if snapshot is not None else 0
-                )
+                candidate.historical_hit_count = prior_lfu[expert_id]
                 candidate.inflight = (
                     snapshot is not None
                     and snapshot.state == self._gec.LifecycleState.LOADING
@@ -923,8 +1133,7 @@ class GecResidencyPlanner:
                     self.layer_idx, desired
                 )
             for eid in decision.h2d_selected:
-                if self._admit_and_mark_ready(eid.expert_id, now_us):
-                    cache.record_use(eid, now_us)
+                self._admit_and_mark_ready(eid.expert_id, now_us)
             self._routed_rounds += 1
 
         self._rounds += 1
@@ -959,6 +1168,8 @@ class GecResidencyPlanner:
         for expert_id in sorted(desired):
             logical_id = self._id(expert_id)
             snapshot = self._cache.snapshot(logical_id)
+            if snapshot is not None:
+                self._pin_if_requested(expert_id)
             if snapshot is None:
                 admitted = self._cache.admit(logical_id, now_us)
                 if not admitted:
@@ -979,6 +1190,7 @@ class GecResidencyPlanner:
                     raise RuntimeError(
                         f"cannot mirror GEC resident {(self.layer_idx, expert_id)}"
                     )
+                self._pin_if_requested(expert_id)
                 self._cache.mark_scheduled(logical_id)
                 self._cache.mark_loading(logical_id)
             elif snapshot.state == self._gec.LifecycleState.Ready:
@@ -1149,7 +1361,8 @@ class GecResidencyPlanner:
                     # A concurrent model-scope planner may have evicted the
                     # logical expert; the next round will re-admit it.
                     break
-            self._cache.record_use(logical_id, now_us)
+            self._pin_if_requested(expert_id)
+            self._end_startup_protection(logical_id)
 
     def dependencies_for(
         self, expert_ids: Iterable[int]
@@ -1258,7 +1471,10 @@ class GecResidencyPlanner:
             f"GEC layer {self.layer_idx}: rounds={self._rounds} "
             f"hits={stats.hits} misses={stats.misses} "
             f"hit_rate={stats.hit_rate():.3f} admissions={stats.admissions} "
-            f"evictions={stats.evictions} reh2d={stats.reh2d}\n"
+            f"evictions={stats.evictions} reh2d={stats.reh2d} "
+            f"lfu_events={stats.lfu_events} "
+            f"lfu_aging_sweeps={stats.lfu_aging_sweeps} "
+            f"router_rounds={stats.router_rounds}\n"
             + self._telemetry.summary()
             + (
                 "\n" + self._coordinator.summary()
@@ -1293,20 +1509,15 @@ def build_gec_planner(kt_config, num_experts: int, num_gpu_experts: int, tp_rank
             "rebuild kt-kernel from this tree (the gec bindings are new)."
         )
     capacity = num_gpu_experts
-    # The default is the current layer's physical capacity, as defined by
-    # kt-layer-h2d-slots. Using the model-global capacity here turns a 256-row
-    # layer in a 2560-slot model into a 2560-expert H2D round and inflates
-    # prefill/TTFT. A zero-row layer may still use the global value so the
-    # coordinator can borrow rows from a colder layer.
-    default_budget = (
+    # Bound one update round by the current layer's physical capacity. Using
+    # the model-global capacity here turns a 256-row layer in a 2560-slot model
+    # into a 2560-expert H2D round and inflates prefill/TTFT. A zero-row layer
+    # may still use the global value so the coordinator can borrow rows from a
+    # colder layer.
+    budget = (
         capacity
         if capacity > 0 or coordinator is None
         else coordinator.capacity
-    )
-    budget = (
-        kt_config.kt_layer_h2d_slots
-        if kt_config.kt_layer_h2d_slots is not None
-        else default_budget
     )
     planner = GecResidencyPlanner(
         layer_idx=kt_config.layer_idx,
@@ -1315,19 +1526,10 @@ def build_gec_planner(kt_config, num_experts: int, num_gpu_experts: int, tp_rank
         budget=budget,
         gec_module=gec_module,
         coordinator=coordinator,
+        gpu_prefill_token_threshold=int(
+            getattr(kt_config, "gpu_prefill_token_threshold", 0) or 0
+        ),
     )
-    if planner.capacity > 0 and planner.budget >= planner.capacity:
-        logger.warning(
-            "[kt-gec] layer %d: --kt-layer-h2d-slots (%d) >= per-layer "
-            "capacity (%d); admission throttling is disabled and every update "
-            "round may replace the entire resident set (H2D churn on routing "
-            "shifts). Use a smaller budget (e.g. %d) to bound per-round "
-            "admissions.",
-            kt_config.layer_idx,
-            planner.budget,
-            planner.capacity,
-            max(1, planner.capacity // 4),
-        )
     logger.info(
         "[kt-gec] layer %d: capacity=%d budget=%d (global slots=%d, shared=%s)",
         kt_config.layer_idx,

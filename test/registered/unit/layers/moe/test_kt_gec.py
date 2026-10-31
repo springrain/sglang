@@ -15,7 +15,6 @@ def _config(**overrides):
     cfg = types.SimpleNamespace(
         layer_idx=3,
         kt_expert_gpu_slots=None,
-        kt_layer_h2d_slots=None,
         kt_enable_dynamic_expert_update=False,
     )
     for key, value in overrides.items():
@@ -463,30 +462,20 @@ class TestRuntimeContract(unittest.TestCase):
         self.assertIn("has_cpu_fallback = _kt_cpu_route_count > 0", branch)
         self.assertNotIn(".item()", branch)
 
-        manager_start = text.index("    def note_cpu_routes(")
-        manager_end = text.index("    def _record_layer_telemetry(", manager_start)
-        self.assertIn(
-            "self.telemetry.add_cpu_routes(count)", text[manager_start:manager_end]
-        )
-        # The gate hands the host-side count over without a readback.
-        self.assertIn("_mxfp4_manager.note_cpu_routes(_kt_cpu_route_count)", text)
-
     def test_layerwise_host_write_runs_one_drain_per_batch(self):
         """Doc section 20 item 8: the writer drains once for the whole staged set."""
 
         wrapper = Path(kt_gec.__file__).with_name("kt_ep_wrapper.py")
         text = wrapper.read_text(encoding="utf-8")
 
-        # The pinned host ring carries one free event per slot and spans two
-        # generations of the staging window (FreeToken's prefill shape).
+        # The pinned host ring carries one free event per slot and is split
+        # into two generations (FreeToken's prefill shape).
         self.assertIn('getattr(context, "cpu_buffer_depth", 2)', text)
-        self.assertIn(
-            "self.host_write_batch = self.staging_window or (self.host_slots // 2)",
-            text,
-        )
+        self.assertIn("self.host_slots = max(2, context_depth)", text)
+        self.assertIn("self.host_write_batch = self.host_slots // 2", text)
+        self.assertNotIn("staging_window", text)
         self.assertIn("self._host_generation ^= 1", text)
         self.assertIn("host_generation_range(", text)
-        self.assertIn("host_ring_depth(", text)
         # No batch-size knob survives anywhere on this path.
         self.assertNotIn("host_write_batches", text)
         self.assertNotIn("host_generation_slots", text)
