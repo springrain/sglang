@@ -55,9 +55,12 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
     # KTransformers keeps only GPU-resident experts in this method and remaps
     # logical expert ids into the compact weight-row space before execution.
     supports_kt_compact_expert_rows = True
+    # Both expert paths below are SM100-only. A subclass that supplies its own
+    # non-Blackwell path clears this and owns the platform decision itself.
+    requires_blackwell = True
 
     def __init__(self):
-        if not get_platform().is_blackwell:
+        if self.requires_blackwell and not get_platform().is_blackwell:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
@@ -19,7 +21,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -65,6 +67,9 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # DeepSeek-V4.1 encoder SWA replay: True if the backend floors the window and
+    # skips cached-row compression for replay rows folded into the extend.
+    folds_encoder_swa_replay: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set
@@ -89,6 +94,12 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
+    def get_fused_kv_write_buffers(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return token-major K/V buffers and physical slots for a fused writer."""
+        return None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -96,6 +107,16 @@ class AttentionBackend(ABC):
         """
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    def glue_target_verify_metadata(self) -> str:
+        """Empty if the target verify prep may be captured into the metadata glue graph
+        (reads only runner slots and backend buffers), else the reason it may not."""
+        return "the attention backend declares no host-free target verify prep"
+
+    def glue_draft_metadata(self) -> str:
+        """Empty if the draft prep may be captured into the metadata glue graph (host
+        inputs constant per replay key), else the reason it may not."""
+        return "the attention backend declares no host-free draft prep"
 
     def init_forward_metadata_out_graph(
         self,
@@ -145,6 +166,14 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    @property
+    def uses_cpu_seq_lens_out_graph(self) -> bool:
+        """Whether this backend's out-of-graph metadata prep reads host lengths.
+
+        Backends may override it when that prep needs the host mirror even
+        though the main graph path opts out of it."""
+        return self.needs_cpu_seq_lens
+
     # True for backends that preallocate per-seq extend metadata at req-pool
     # size (e.g. triton's kv_indptr): dummy extend batches must then keep
     # batch_size <= req_to_token_pool.size.
@@ -164,8 +193,15 @@ class AttentionBackend(ABC):
     # the EXTEND graph is a known serving-performance regression.
     prefer_eager_mixed_prefill_under_dp_attention: bool = False
 
+    # An idle DP rank replays the padded prefill graph without attention
+    # metadata; only backends whose replay reads none on such a rank opt in.
+    skips_prefill_metadata_on_idle_dp_rank: bool = False
+
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
+    # Replayed context limit when the user sets none; None when nothing the backend
+    # captures depends on the context length.
+    prefill_cuda_graph_default_max_seq_len: Optional[int] = None
     dllm_attention = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
@@ -175,15 +211,38 @@ class AttentionBackend(ABC):
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
 
-    def prepare_prefill_shared_read_snapshot(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
-    ) -> None:
-        """Snapshot late prefill reads before a PRE_REPLAY event is published.
+    def resolve_prefill_shared_read_ends(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        num_qo_tokens: int,
+        build_snapshot: bool = True,
+    ) -> SharedReadEnds:
+        """Return this batch's prefill read end, building a snapshot when asked.
 
-        Runners call this only after the actual eager/replay query geometry is
-        known. Backends that retain scheduler-shared reads into the model
-        forward keep the default no-op and must not declare PRE_REPLAY.
+        Spec algorithms with a later draft reader are gated at publish time.
         """
+        if (
+            envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+            or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+        ):
+            return SharedReadEnds.UNKNOWN
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return SharedReadEnds.UNKNOWN
+        if build_snapshot:
+            return self._snapshot_prefill_shared_reads(
+                forward_batch, num_qo_tokens=num_qo_tokens
+            )
+        return self.shared_read_ends(forward_batch.forward_mode)
+
+    def _snapshot_prefill_shared_reads(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> SharedReadEnds:
+        """Snapshot late shared reads; return PRE_REPLAY only if none remain.
+
+        Hook-skipping paths read ``shared_read_ends(EXTEND)``; keep it conservative.
+        """
+        return self.shared_read_ends(forward_batch.forward_mode)
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
@@ -239,6 +298,11 @@ class AttentionBackend(ABC):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
+
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Rows this rank runs from a late-layer row switch on (DeepSeek-V4.1
+        decoder SWA bounded replay); None for backends without one."""
+        return None
 
     def on_after_cuda_graph_warmup(self):
         """Hook between cuda graph warmup pass and the actual capture.

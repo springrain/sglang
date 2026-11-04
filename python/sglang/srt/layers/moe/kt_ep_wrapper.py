@@ -6925,6 +6925,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # must see the real runner here.
         self.runner = self.gpu_method.runner
 
+    def get_moe_runner_backend(self, layer):
+        # create_moe_runner() leaves the wrapped method unconfigured when the
+        # compact GPU row set is empty. There is no backend runner to expose
+        # in that CPU-only configuration.
+        if self._uses_compact_gpu_expert_rows and self.num_gpu_experts == 0:
+            return None
+        return self.gpu_method.get_moe_runner_backend(layer)
+
+    def get_moe_routing_method_type(self, layer, requested_method):
+        return self.gpu_method.get_moe_routing_method_type(layer, requested_method)
+
     def get_triton_quant_info(self, layer: torch.nn.Module):
         """Expose the wrapped GPU method's Triton quantization metadata."""
 
@@ -7111,6 +7122,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 self.kt_config.layer_idx, self.gpu_experts_mask_cuda
             )
             self._kt_trace(trace_id, trace_started_ns, "distribution_record_end")
+
+        topk_output = materialize_kt_topk_output(
+            dispatch_output.topk_output, self.kt_config.layer_idx
+        )
+        if topk_output is not dispatch_output.topk_output:
+            dispatch_output = dispatch_output._replace(topk_output=topk_output)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

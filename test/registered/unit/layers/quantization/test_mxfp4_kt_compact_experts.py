@@ -193,6 +193,19 @@ def test_kt_runner_uses_compact_mxfp4_geometry(resident_experts):
         assert captured[0].routed_scaling_factor is None
 
 
+def test_kt_zero_resident_experts_skip_uninitialized_runner_backend():
+    class _GpuMethod:
+        def get_moe_runner_backend(self, layer):
+            return self.runner.runner_backend
+
+    wrapper = KTEPWrapperMethod.__new__(KTEPWrapperMethod)
+    wrapper.gpu_method = _GpuMethod()
+    wrapper.num_gpu_experts = 0
+    wrapper._uses_compact_gpu_expert_rows = True
+
+    assert wrapper.get_moe_runner_backend(object()) is None
+
+
 def test_kt_wrapper_propagates_compact_capability_to_delegated_scheme():
     scheme = SimpleNamespace(supports_kt_compact_expert_rows=True)
     wrapper = KTEPWrapperMethod.__new__(KTEPWrapperMethod)
